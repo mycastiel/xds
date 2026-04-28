@@ -29,7 +29,7 @@ u64 g_time = 0;
 u64 g_count = 0;
 u64 g_size = 0;
 
-strcut p2p_io_context {
+struct p2p_io_context {
     struct block_device *bdev;
     unsigned int nsid;
     unsigned int pa_num;
@@ -59,7 +59,7 @@ struct p2p_batch {
 
 #define RQF_NVME_PT ((__force req_flags_t)(1 << 31))
 
-struct request *nvme_alloc_request(struct request_queue *q, struct nvme_command *cmd, blk_mq_req_flags flags, int qid);
+struct request *nvme_alloc_request(struct request_queue *q, struct nvme_command *cmd, blk_mq_req_flags_t flags, int qid);
 
 dev_t dev = 0;
 static struct class *dev_class;
@@ -75,14 +75,14 @@ static DEFINE_IDR(batch_tree);
 
 static int p2p_open(struct inode *inode, struct file *file);
 static int p2p_release(struct inode *inode, struct file *file);
-static int p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 static int p2p_drain_read(struct p2p_batch *batch);
 
 static struct file_operations fops = {
     .owner = THIS_MODULE,
     .open = p2p_open,
     .release = p2p_release,
-    .ioctl = p2p_ioctl,
+    .unlocked_ioctl = p2p_ioctl,
 };
 
 static int p2p_open(struct inode *inode, struct file *file)
@@ -360,7 +360,7 @@ static struct p2p_io_context *new_io_ctx(struct block_device *bdev, const struct
     io_ctx->pa_num = pa_num;
     io_ctx->pa_list = pa_list;
     io_ctx->pa_size = pa_size;
-    io_ctx->data_size = desc->data_size;
+    io_ctx->data_size = data_size;
 
     atomic_set(&io_ctx->io_ref, 1);
     INIT_LIST_HEAD(&io_ctx->io_list);
@@ -389,9 +389,9 @@ static struct p2p_io_context *new_io_ctx_batch(struct block_device *bdev, const 
     io_ctx->pa_num = pa_num;
     io_ctx->pa_list = pa_list;
     io_ctx->pa_size = pa_size;
-    io_ctx->cmd_list = kzalloc(sizeof(nvme_command) * count, GFP_KERNEL);
+    io_ctx->cmd_list = kzalloc(sizeof(struct nvme_command) * count, GFP_KERNEL);
     io_ctx->start_time = ktime_get_ns();
-    io_ctx->data_size = desc->data_size;
+    io_ctx->data_size = data_size;
     io_ctx->count = count;
 
     atomic_set(&io_ctx->io_ref, 1);
@@ -403,11 +403,11 @@ static struct p2p_io_context *new_io_ctx_batch(struct block_device *bdev, const 
 
 static void hook_nvme_setup_cmd(void *ignore, struct request *rq, struct nvme_command *cmd)
 {
-    if (!(rq->rq_flag & RQF_NVME_PT)) {
+    if (!(rq->rq_flags & RQF_NVME_PT)) {
         return;
     }
 
-    cmd->rw.flags = NVME_CMD_SGL_NETABUF;
+    cmd->rw.flags = NVME_CMD_SGL_METABUF;
 }
 
 static int register_nvme_setup_cmd_hook(void)
@@ -424,7 +424,7 @@ static void end_read_io(struct request *req, blk_status_t status)
         cmpxchg(&io_ctx->io_err, 0, status);
 
     blk_mq_free_request(req);
-    ctx->end_time = ktime_get_ns();
+    io_ctx->end_time = ktime_get_ns();
     if (!atomic_dec_and_test(&io_ctx->io_ref)) {
         return;
     }
@@ -440,8 +440,8 @@ static int do_read_io(struct p2p_io_context *io_ctx, unsigned long long sector, 
     struct request_queue *queue = disk->queue;
     struct request *req;
     struct nvme_command *cmd = &io_ctx->cmd_list[io_ctx->cmd_id];
-    if (ctx->cmd_id >= ctx->count) {
-        pr_err("cmd_id %d >= count %d\n", ctx->cmd_id, ctx->count);
+    if (io_ctx->cmd_id >= io_ctx->count) {
+        pr_err("cmd_id %d >= count %d\n", io_ctx->cmd_id, io_ctx->count);
         return -EINVAL;
     }
 
@@ -465,7 +465,7 @@ static int do_read_io(struct p2p_io_context *io_ctx, unsigned long long sector, 
         return -ENOMEM;
     }
 
-    req->rq_flag |= RQF_NVME_PT;
+    req->rq_flags |= RQF_NVME_PT;
     req->end_io_data = io_ctx;
     atomic_inc(&io_ctx->io_ref);
     
@@ -546,7 +546,7 @@ out:
     return err;
 }
 
-static int do_read_ios_batch(struct p2p_io_context *io_ctx, struct fiemap_extent *extents, unsigned int nr
+static int do_read_ios_batch(struct p2p_io_context *io_ctx, struct fiemap_extent *extents, unsigned int nr,
        int *addr_off, int *align_size)
 {
     unsigned int i;
@@ -666,7 +666,7 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
         goto put_reg_file_out;
     }
     bdev_inode = bdev_file->f_mapping->host;
-    if (!IS_BLK(bdev_inode->i_mode)) {
+    if (!S_ISBLK(bdev_inode->i_mode)) {
         err = -EINVAL;
         goto put_bdev_file_out;
     }
@@ -698,7 +698,7 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
     pa_list = NULL;
     io_ctx->pa_offset = addr_off;
 
-    io_ctx->issue_err = do_read_ios(io_ctx, extents, ext_num,);
+    io_ctx->issue_err = do_read_ios(io_ctx, extents, ext_num);
     
     spin_lock(&batch_lock);
     batch->io_cnt++;
@@ -718,7 +718,7 @@ free_pa_out:
 
 static int p2p_drain_read(struct p2p_batch *batch)
 {
-    struct p2p_io_context *io_ctx, *new_io_ctx;
+    struct p2p_io_context *io_ctx, *next_io_ctx;
     unsigned int total_cnt;
     unsigned int got_cnt;
     unsigned int err_cnt;
@@ -740,15 +740,15 @@ static int p2p_drain_read(struct p2p_batch *batch)
 
     err_cnt = 0;
     got_cnt = 0;
-    list_for_each_entry_safe(io_ctx, next_io_cxt, &tmp, io_list) {
+    list_for_each_entry_safe(io_ctx, next_io_ctx, &tmp, io_list) {
         int err, io_err;
 
         got_cnt++;
         err = io_ctx->issue_err;
         io_err = wait_io_done(io_ctx);
-        
+
         if (io_err && !err) {
-            pr_err("got io err %d %d %d\n", io_err, blkio_status_to_errno(io_err), io_ctx->nsid);
+            pr_err("got io err %d %d %d\n", io_err, blk_status_to_errno(io_err), io_ctx->nsid);
             err = io_err;
         }
 
@@ -783,7 +783,7 @@ static int p2p_read_file_batch(struct p2p_batch *batch, void __user *arg)
     struct read_desc_ba __user *user_desc = arg;
     struct fiemap_extent *extents;
     unsigned long *kaddr, *kaddr1;
-    struct read_desc desc;
+    struct read_desc_ba desc;
     struct file *reg_file;
     struct file *bdev_file;
     struct inode *bdev_inode;
@@ -839,7 +839,7 @@ static int p2p_read_file_batch(struct p2p_batch *batch, void __user *arg)
         goto put_reg_file_out;
     }
     bdev_inode = bdev_file->f_mapping->host;
-    if (!IS_BLK(bdev_inode->i_mode)) {
+    if (!S_ISBLK(bdev_inode->i_mode)) {
         err = -EINVAL;
         goto put_bdev_file_out;
     }
@@ -927,7 +927,7 @@ static int __init p2p_drv_init(void)
 
     if (!tp_nvme_setup_cmd_addr) {
         pr_err("set tp_block_rq_issue_addr=???\n");
-        return -EINVAL:
+        return -EINVAL;
     }
 
     err = alloc_chrdev_region(&dev, 0, 1, "p2p_device");
@@ -970,9 +970,9 @@ static int __init p2p_drv_init(void)
 
 del_dev:
     device_destroy(dev_class, dev);
-dev_cls:
+del_cls:
     class_destroy(dev_class);
-dev_cdev:
+del_cdev:
     cdev_del(&p2p_cdev);
 free_dev:
     unregister_chrdev_region(dev, 1);
