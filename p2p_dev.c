@@ -493,7 +493,7 @@ static void cur_pa_advance_sector(struct p2p_io_context *io_ctx, unsigned int se
     io_ctx->pa_offset += (sector << SECTOR_SHIFT);
     if (io_ctx->pa_offset >= io_ctx->pa_size) {
         if (io_ctx->pa_offset > io_ctx->pa_size) {
-            pr_warn("bad pa_offset %llu > pa_size %llu\n", io_ctx->pa_offset, io_ctx->pa_size);
+            pr_warn("bad pa_offset %u > pa_size %u\n", io_ctx->pa_offset, io_ctx->pa_size);
         }
         io_ctx->pa_offset = 0;
         io_ctx->pa_idx++;
@@ -722,8 +722,6 @@ static int p2p_drain_read(struct p2p_batch *batch)
     unsigned int total_cnt;
     unsigned int got_cnt;
     unsigned int err_cnt;
-    u64 time = 1;
-    u64 size = 0;
     LIST_HEAD(tmp);
 
     if (!READ_ONCE(batch->io_cnt))
@@ -770,7 +768,7 @@ static int p2p_drain_read(struct p2p_batch *batch)
     }
 
     if (g_count >= 1000) {
-        pr_info("end drain %d read got cnt %d/%d/%d io %lu/%lu bandwidth %lu\n", batch->batch_id, got_cnt, err_cnt, g_count, g_size, g_time, g_size/g_time);
+        pr_info("end drain %d read got cnt %d/%d/%llu io %llu/%llu bandwidth %llu\n", batch->batch_id, got_cnt, err_cnt, g_count, g_size, g_time, g_size/g_time);
         g_time = 0;
         g_size = 0;
         g_count = 0;
