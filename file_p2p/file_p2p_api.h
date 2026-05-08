@@ -2,13 +2,13 @@
 #define __FILE_P2P_API_H__
 
 struct read_parameter {
-    const char *file_name;
-    const char *bdev_name;
-    unsigned long bdev_offset;
-    unsigned short devid;
-    unsigned short vfid;
-    unsigned int size;
-    unsigned long addr;
+	const char *file_name;
+	const char *bdev_name;
+	unsigned long bdev_offset;
+	unsigned short devid;
+	unsigned short vfid;
+	unsigned int size;
+	unsigned long addr;
 };
 
 int new_p2p_fd(void);
