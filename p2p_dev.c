@@ -364,7 +364,7 @@ static int dump_pa(void __user *arg)
 
 static void free_io_ctx(struct p2p_io_context *io_ctx)
 {
-	kfree(io_ctx->cmd_list);
+	kvfree(io_ctx->cmd_list);
 	kvfree(io_ctx->pa_list);
 	kfree(io_ctx);
 }
@@ -429,7 +429,11 @@ new_io_ctx_batch(struct block_device *bdev, const struct read_desc_ba *desc,
 	io_ctx->pa_list = pa_list;
 	io_ctx->pa_size = pa_size;
 	io_ctx->cmd_list =
-		kzalloc(sizeof(struct nvme_command) * count, GFP_KERNEL);
+		kvmalloc_array(count, sizeof(struct nvme_command), GFP_KERNEL);
+	if (!io_ctx->cmd_list) {
+		kfree(io_ctx);
+		return ERR_PTR(-ENOMEM);
+	}
 	io_ctx->start_time = ktime_get_ns();
 	io_ctx->data_size = data_size;
 	io_ctx->count = count;
