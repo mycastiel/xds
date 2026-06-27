@@ -397,6 +397,7 @@ static struct p2p_io_context *new_io_ctx(struct block_device *bdev,
 	io_ctx->pa_list = pa_list;
 	io_ctx->pa_size = pa_size;
 	io_ctx->data_size = data_size;
+	io_ctx->count = nr;
 
 	atomic_set(&io_ctx->io_ref, 1);
 	INIT_LIST_HEAD(&io_ctx->io_list);
