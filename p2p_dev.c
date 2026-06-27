@@ -636,6 +636,12 @@ static int do_read_ios_batch(struct p2p_io_context *io_ctx,
 				}
 				io_ctx->pa_idx++;
 				idx++;
+				if (idx >= io_ctx->pa_num) {
+					pr_err("batch VA boundary overrun: idx %u >= pa_num %u\n",
+					       idx, io_ctx->pa_num);
+					err = -EINVAL;
+					goto out;
+				}
 				io_ctx->pa_offset = addr_off[idx];
 				size = align_size[idx] >> SECTOR_SHIFT;
 				count = 0;
@@ -655,6 +661,12 @@ static int do_read_ios_batch(struct p2p_io_context *io_ctx,
 			if (count >= size) {
 				io_ctx->pa_idx++;
 				idx++;
+				if (idx >= io_ctx->pa_num) {
+					pr_err("batch VA boundary overrun: idx %u >= pa_num %u\n",
+					       idx, io_ctx->pa_num);
+					err = -EINVAL;
+					goto out;
+				}
 				io_ctx->pa_offset = addr_off[idx];
 				size = align_size[idx] >> SECTOR_SHIFT;
 				count = 0;
