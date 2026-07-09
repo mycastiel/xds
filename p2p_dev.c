@@ -59,9 +59,7 @@ struct p2p_batch {
 
 #define RQF_NVME_PT ((__force req_flags_t)(1 << 31))
 
-struct request *nvme_alloc_request(struct request_queue *q,
-				   struct nvme_command *cmd,
-				   blk_mq_req_flags_t flags, int qid);
+void nvme_init_request(struct request *req, struct nvme_command *cmd);
 
 dev_t dev = 0;
 static struct class *dev_class;
@@ -463,19 +461,19 @@ static int register_nvme_setup_cmd_hook(void)
 					 NULL);
 }
 
-static void end_read_io(struct request *req, blk_status_t status)
+static enum rq_end_io_ret end_read_io(struct request *req, blk_status_t status)
 {
 	struct p2p_io_context *io_ctx = req->end_io_data;
 	if (status)
 		cmpxchg(&io_ctx->io_err, 0, status);
 
-	blk_mq_free_request(req);
 	io_ctx->end_time = ktime_get_ns();
 	if (!atomic_dec_and_test(&io_ctx->io_ref)) {
-		return;
+		return RQ_END_IO_FREE;
 	}
 
 	complete(&io_ctx->io_done);
+	return RQ_END_IO_FREE;
 }
 
 #define THRESH_NS (1000000UL)
@@ -508,17 +506,19 @@ static int do_read_io(struct p2p_io_context *io_ctx, unsigned long long sector,
 	cmd->rw.dptr.sgl.type = NVME_SGL_FMT_DATA_DESC << 4;
 	io_ctx->cmd_id++;
 
-	req = nvme_alloc_request(queue, cmd, 0, -1);
+	req = blk_mq_alloc_request(queue, REQ_OP_DRV_IN, 0);
 	if (IS_ERR(req)) {
 		pr_err("Failed to alloc request\n");
 		return -ENOMEM;
 	}
+	nvme_init_request(req, cmd);
 
 	req->rq_flags |= RQF_NVME_PT;
 	req->end_io_data = io_ctx;
+	req->end_io = end_read_io;
 	atomic_inc(&io_ctx->io_ref);
 
-	blk_execute_rq_nowait(queue, disk, req, true, end_read_io);
+	blk_execute_rq_nowait(req, true);
 
 	return 0;
 }
@@ -1033,7 +1033,7 @@ static int __init p2p_drv_init(void)
 		goto free_dev;
 	}
 
-	dev_class = class_create(THIS_MODULE, "p2p_class");
+	dev_class = class_create("p2p_class");
 	if (IS_ERR(dev_class)) {
 		err = PTR_ERR(dev_class);
 		pr_err("p2p Driver: Cannot create the struct class\n");

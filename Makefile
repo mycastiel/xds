@@ -1,4 +1,6 @@
 KSRC ?= /lib/modules/$(shell uname -r)/build
+KSRC = /home/begin/code/oe_knl/
+
 
 .PHONY: all clean
 
