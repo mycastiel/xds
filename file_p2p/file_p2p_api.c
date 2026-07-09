@@ -8,12 +8,16 @@
 #include <sys/ioctl.h>
 #include <time.h>
 #include <errno.h>
+#include <limits.h>
 
 #include <linux/fiemap.h>
 #include <linux/fs.h>
 
 #include "p2p_dev_uapi.h"
 #include "file_p2p_api.h"
+
+#define FILE_P2P_SECTOR_SIZE 512U
+#define FILE_P2P_DEFAULT_BLOCK_SIZE 4096U
 
 long long timespec_diff_ms(const struct timespec *start,
 			   const struct timespec *end)
@@ -43,17 +47,170 @@ int new_p2p_fd(void)
 	return dev_fd;
 }
 
+static int is_power_of_two(unsigned int value)
+{
+	return value && !(value & (value - 1));
+}
+
+static unsigned int get_fiemap_block_size(int file_fd)
+{
+	int block_size = 0;
+
+	if (!ioctl(file_fd, FIGETBSZ, &block_size) &&
+	    block_size >= (int)FILE_P2P_SECTOR_SIZE &&
+	    is_power_of_two((unsigned int)block_size))
+		return block_size;
+
+	return FILE_P2P_DEFAULT_BLOCK_SIZE;
+}
+
+static unsigned long long align_down_u64(unsigned long long value,
+					 unsigned int alignment)
+{
+	return value & ~((unsigned long long)alignment - 1);
+}
+
+static unsigned long long align_up_u64(unsigned long long value,
+				       unsigned int alignment)
+{
+	return (value + alignment - 1) & ~((unsigned long long)alignment - 1);
+}
+
+static int calc_fiemap_extent_count(unsigned long offset, unsigned long size,
+				    unsigned int block_size,
+				    unsigned int *count)
+{
+	unsigned long long block_offset = offset & (block_size - 1);
+	unsigned long long blocks;
+
+	blocks = align_up_u64(block_offset + size, block_size) / block_size;
+	if (!blocks)
+		blocks = 1;
+	if (blocks > UINT_MAX)
+		return -E2BIG;
+
+	*count = blocks;
+	return 0;
+}
+
+static struct fiemap *alloc_fiemap(unsigned int extent_count)
+{
+	return calloc(1, sizeof(struct fiemap) +
+		      extent_count * sizeof(struct fiemap_extent));
+}
+
+static unsigned int trim_fiemap_extents(struct fiemap_extent *extents,
+					unsigned int ext_num,
+					unsigned long offset,
+					unsigned long size,
+					unsigned long long *total_size)
+{
+	unsigned long long request_start = offset;
+	unsigned long long request_end = request_start + size;
+	unsigned long long total = 0;
+	unsigned int out = 0;
+	unsigned int i;
+
+	for (i = 0; i < ext_num; i++) {
+		struct fiemap_extent extent = extents[i];
+		unsigned long long extent_start = extent.fe_logical;
+		unsigned long long extent_end = extent_start + extent.fe_length;
+		unsigned long long trim_start;
+		unsigned long long trim_end;
+
+		if (extent_end <= request_start || extent_start >= request_end)
+			continue;
+
+		trim_start = extent_start > request_start ?
+			     extent_start : request_start;
+		trim_end = extent_end < request_end ? extent_end : request_end;
+		if (trim_end <= trim_start)
+			continue;
+
+		extent.fe_physical += trim_start - extent_start;
+		extent.fe_logical = trim_start;
+		extent.fe_length = trim_end - trim_start;
+		extents[out++] = extent;
+		total += extent.fe_length;
+	}
+
+	*total_size = total;
+	return out;
+}
+
+static int prepare_read_extents(int file_fd, const struct stat *file_stat,
+				unsigned long offset, unsigned long size,
+				struct fiemap **exts_out,
+				unsigned int *ext_num_out,
+				unsigned long long *total_size_out)
+{
+	struct fiemap *exts;
+	unsigned int block_size;
+	unsigned int max_num;
+	unsigned long long query_start;
+	unsigned long long query_offset;
+	unsigned long long query_length;
+	int err;
+
+	if (S_ISBLK(file_stat->st_mode)) {
+		exts = alloc_fiemap(1);
+		if (!exts)
+			return -ENOMEM;
+
+		exts->fm_extents[0].fe_logical = offset;
+		exts->fm_extents[0].fe_physical = offset;
+		exts->fm_extents[0].fe_length = size;
+		*exts_out = exts;
+		*ext_num_out = 1;
+		*total_size_out = size;
+		return 0;
+	}
+
+	if (!S_ISREG(file_stat->st_mode))
+		return -EINVAL;
+
+	block_size = get_fiemap_block_size(file_fd);
+	err = calc_fiemap_extent_count(offset, size, block_size, &max_num);
+	if (err)
+		return err;
+
+	exts = alloc_fiemap(max_num);
+	if (!exts)
+		return -ENOMEM;
+
+	query_start = align_down_u64(offset, block_size);
+	query_offset = offset - query_start;
+	query_length = align_up_u64(query_offset + size, block_size);
+
+	exts->fm_start = query_start;
+	exts->fm_length = query_length;
+	exts->fm_flags = 0;
+	exts->fm_extent_count = max_num;
+
+	err = ioctl(file_fd, FS_IOC_FIEMAP, exts);
+	if (err) {
+		err = -errno;
+		fprintf(stderr, "ioctl FS_IOC_FIEMAP failed, errno: %d\n", err);
+		free(exts);
+		return err;
+	}
+
+	*ext_num_out = trim_fiemap_extents(exts->fm_extents,
+					   exts->fm_mapped_extents,
+					   offset, size, total_size_out);
+	*exts_out = exts;
+	return 0;
+}
+
 int read_file(int dev_fd, struct read_parameter *param)
 {
 	struct read_desc *read;
 	struct fiemap *exts;
 	struct stat file_stat;
 	unsigned long max_size;
-	unsigned long total_size;
-	unsigned int max_num;
+	unsigned long long total_size;
 	unsigned int ext_num;
 	const char *name;
-	unsigned int i;
 	int file_fd = -1;
 	int err = 0;
 
@@ -73,64 +230,20 @@ int read_file(int dev_fd, struct read_parameter *param)
 	}
 
 	max_size = param->size;
-	if ((file_stat.st_mode & S_IFMT) == S_IFBLK)
-		max_num = 1;
-	else
-		max_num = max_size >> 12;
-
-	exts = malloc(sizeof(*exts) + max_num * sizeof(exts->fm_extents[0]));
-	if (exts == NULL) {
-		err = -ENOMEM;
-		fprintf(stderr, "malloc fiemap failed, errno: %d\n", err);
-		goto close_fds_out;
-	}
-
-	if ((file_stat.st_mode & S_IFMT) == S_IFBLK) {
-		exts->fm_extents[0].fe_physical = param->bdev_offset;
-		exts->fm_extents[0].fe_length = max_size;
-		ext_num = 1;
-		total_size = max_size;
-		goto to_read;
-	}
-
-	exts->fm_start = param->bdev_offset;
-	exts->fm_length = max_size;
-	exts->fm_flags = 0;
-	exts->fm_extent_count = max_num;
-
-	err = ioctl(file_fd, FS_IOC_FIEMAP, exts);
+	err = prepare_read_extents(file_fd, &file_stat, param->bdev_offset,
+				   max_size, &exts, &ext_num, &total_size);
 	if (err) {
-		err = -errno;
-		fprintf(stderr, "ioctl FS_IOC_FIEMAP failed, errno: %d\n", err);
-		goto free_ext_out;
-	}
-
-	total_size = 0;
-	ext_num = exts->fm_mapped_extents;
-	exts->fm_extents[0].fe_physical += param->bdev_offset % 4096;
-	exts->fm_extents[0].fe_length -= param->bdev_offset % 4096;
-
-	for (i = 0; i < ext_num; i++) {
-		if (total_size + exts->fm_extents[i].fe_length > param->size) {
-			printf("noooo %ld %ld\n", total_size,
-			       exts->fm_extents[i].fe_length);
-			exts->fm_extents[i].fe_length =
-				param->size - total_size;
-			total_size += exts->fm_extents[i].fe_length;
-			ext_num = i + 1;
-			break;
-		}
-		total_size += exts->fm_extents[i].fe_length;
+		fprintf(stderr, "prepare extents failed, errno: %d\n", err);
+		goto close_fds_out;
 	}
 
 	if (total_size > param->size) {
 		err = -EINVAL;
-		fprintf(stderr, "total_size %ld > param->size %ld\n",
+		fprintf(stderr, "total_size %llu > param->size %u\n",
 			total_size, param->size);
 		goto free_ext_out;
 	}
 
-to_read:
 	read = malloc(sizeof(*read) + ext_num * sizeof(read->extents[0]));
 	if (read == NULL) {
 		err = -ENOMEM;
@@ -172,12 +285,11 @@ int read_file_batch(int dev_fd, struct read_parameter *param, int param_num)
 {
 	struct read_desc_ba *read;
 	struct fiemap *exts;
+	struct stat file_stat;
 	unsigned long max_size;
-	unsigned long total_size;
-	unsigned int max_num;
+	unsigned long long total_size;
 	unsigned int ext_num;
 	const char *name;
-	unsigned int i;
 	int j;
 	int file_fd = -1;
 	int err = 0;
@@ -190,54 +302,29 @@ int read_file_batch(int dev_fd, struct read_parameter *param, int param_num)
 		goto close_fds_out;
 	}
 
-	max_size = param[0].size * param_num;
-	max_num = max_size >> 12;
-
-	exts = malloc(sizeof(*exts) + max_num * sizeof(exts->fm_extents[0]));
-	if (exts == NULL) {
-		err = -ENOMEM;
-		fprintf(stderr, "malloc fiemap failed, errno: %d\n", err);
+	err = fstat(file_fd, &file_stat);
+	if (err < 0) {
+		err = -errno;
+		fprintf(stderr, "fstat %s failed, errno: %d\n", name, err);
 		goto close_fds_out;
 	}
 
-	exts->fm_start = param[0].bdev_offset;
-	exts->fm_length = max_size;
-	exts->fm_flags = 0;
-	exts->fm_extent_count = max_num;
-
-	err = ioctl(file_fd, FS_IOC_FIEMAP, exts);
+	max_size = (unsigned long)param[0].size * param_num;
+	err = prepare_read_extents(file_fd, &file_stat, param[0].bdev_offset,
+				   max_size, &exts, &ext_num, &total_size);
 	if (err) {
-		err = -errno;
-		fprintf(stderr, "ioctl FS_IOC_FIEMAP failed, errno: %d\n", err);
-		goto free_ext_out;
-	}
-
-	total_size = 0;
-	ext_num = exts->fm_mapped_extents;
-	exts->fm_extents[0].fe_physical += param[0].bdev_offset % 4096;
-	exts->fm_extents[0].fe_length -= param[0].bdev_offset % 4096;
-
-	for (i = 0; i < ext_num; i++) {
-		if (total_size + exts->fm_extents[i].fe_length > max_size) {
-			printf("noooo %ld %ld\n", total_size,
-			       exts->fm_extents[i].fe_length);
-			fflush(stdout);
-			exts->fm_extents[i].fe_length = max_size - total_size;
-			total_size += exts->fm_extents[i].fe_length;
-			ext_num = i + 1;
-			break;
-		}
-		total_size += exts->fm_extents[i].fe_length;
+		fprintf(stderr, "prepare extents failed, errno: %d\n", err);
+		goto close_fds_out;
 	}
 
 	if (total_size > max_size) {
 		err = -EINVAL;
-		fprintf(stderr, "total_size %ld > max_size %ld\n", total_size,
+		fprintf(stderr, "total_size %llu > max_size %lu\n", total_size,
 			max_size);
 		goto free_ext_out;
 	}
 
-	read = malloc(sizeof(*read) + ext_num * sizeof(read->extents[0]));
+	read = calloc(1, sizeof(*read) + ext_num * sizeof(read->extents[0]));
 	if (read == NULL) {
 		err = -ENOMEM;
 		fprintf(stderr, "malloc read_desc failed, errno: %d\n", err);

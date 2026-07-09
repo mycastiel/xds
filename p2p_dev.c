@@ -728,7 +728,7 @@ static int do_read_ios(struct p2p_io_context *io_ctx,
 	int err = 0;
 
 	for (i = 0; i < nr; i++) {
-		unsigned long long sector = extents[i].fe_logical >>
+		unsigned long long sector = extents[i].fe_physical >>
 					    SECTOR_SHIFT;
 		unsigned int left = extents[i].fe_length >> SECTOR_SHIFT;
 		unsigned int to_read;
@@ -767,7 +767,7 @@ static int do_read_ios_batch(struct p2p_io_context *io_ctx,
 	io_ctx->pa_offset = addr_off[0];
 
 	for (i = 0; i < nr; i++) {
-		unsigned long long sector = extents[i].fe_logical >>
+		unsigned long long sector = extents[i].fe_physical >>
 					    SECTOR_SHIFT;
 		unsigned int left = extents[i].fe_length >> SECTOR_SHIFT;
 		unsigned int to_read;
