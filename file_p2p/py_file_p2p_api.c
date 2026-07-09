@@ -11,14 +11,12 @@ static PyObject *py_read_file(PyObject *self, PyObject *args)
 	const char *file_name = NULL;
 	const char *bdev_name = NULL;
 	unsigned long bdev_offset = 0;
-	unsigned short devid = 0;
-	unsigned short vfid = 0;
 	unsigned int size = 0;
 	unsigned long addr = 0;
 	int ret = 0;
 
-	if (!PyArg_ParseTuple(args, "isskkIHH", &dev_fd, &file_name, &bdev_name,
-			      &bdev_offset, &addr, &size, &devid, &vfid)) {
+	if (!PyArg_ParseTuple(args, "isskkI", &dev_fd, &file_name, &bdev_name,
+			      &bdev_offset, &addr, &size)) {
 		return NULL;
 	}
 
@@ -26,8 +24,6 @@ static PyObject *py_read_file(PyObject *self, PyObject *args)
 		.file_name = file_name,
 		.bdev_name = bdev_name,
 		.bdev_offset = bdev_offset,
-		.devid = devid,
-		.vfid = vfid,
 		.size = size,
 		.addr = addr,
 	};
@@ -44,8 +40,6 @@ static PyObject *py_read_file_batch(PyObject *self, PyObject *args)
 	const char *file_name = NULL;
 	const char *bdev_name = NULL;
 	PyObject *py_list = NULL;
-	unsigned short devid = 0;
-	unsigned short vfid = 0;
 	int ret = 0;
 
 	if (!PyArg_ParseTuple(args, "issO", &dev_fd, &file_name, &bdev_name,
@@ -102,8 +96,6 @@ static PyObject *py_read_file_batch(PyObject *self, PyObject *args)
 
 		params[i].file_name = file_name;
 		params[i].bdev_name = bdev_name;
-		params[i].devid = devid;
-		params[i].vfid = vfid;
 		params[i].bdev_offset = PyLong_AsUnsignedLongLong(items[0]);
 		params[i].addr = PyLong_AsUnsignedLongLong(items[1]);
 		params[i].size = PyLong_AsUnsignedLongLong(items[2]);
@@ -155,7 +147,7 @@ static PyObject *py_close_p2p_fd(PyObject *self, PyObject *args)
 
 static PyMethodDef FileP2PMethods[] = {
 	{ "read_file", py_read_file, METH_VARARGS,
-	  "read_file(dev_fd, file_name, bdev_name, bdev_offset, addr, size, devid, vfid) -> int\n\n"
+	  "read_file(dev_fd, file_name, bdev_name, bdev_offset, addr, size) -> int\n\n"
 	  "Read file from p2p device.\n"
 	  "\n"
 	  "Parameters:\n"
@@ -165,24 +157,18 @@ static PyMethodDef FileP2PMethods[] = {
 	  "    bdev_offset (int): Offset in block device to read.\n"
 	  "    addr (int): Address in host memory to read.\n"
 	  "    size (int): Size in bytes to read.\n"
-	  "    devid (int): Device ID.\n"
-	  "    vfid (int): Virtual function ID.\n"
 	  "\n"
 	  "Returns:\n"
 	  "    int: 0 on success, non-zero on error.\n" },
 	{ "read_file_batch", py_read_file_batch, METH_VARARGS,
-	  "read_file_batch(dev_fd, file_name, bdev_name, bdev_offset, addr, size, devid, vfid) -> int\n\n"
+	  "read_file_batch(dev_fd, file_name, bdev_name, entries) -> int\n\n"
 	  "Read file batch from p2p device.\n"
 	  "\n"
 	  "Parameters:\n"
 	  "    dev_fd (int): File descriptor of p2p device.\n"
 	  "    file_name (str): Name of file to read.\n"
 	  "    bdev_name (str): Name of block device to read.\n"
-	  "    bdev_offset (int): Offset in block device to read.\n"
-	  "    addr (int): Address in host memory to read.\n"
-	  "    size (int): Size in bytes to read.\n"
-	  "    devid (int): Device ID.\n"
-	  "    vfid (int): Virtual function ID.\n"
+	  "    entries (list): Tuples of (bdev_offset, addr, size).\n"
 	  "\n"
 	  "Returns:\n"
 	  "    int: 0 on success, non-zero on error.\n" },

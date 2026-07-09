@@ -150,8 +150,6 @@ static void init_process_id(const struct va_desc *desc,
 	rcu_read_lock();
 	process_id->host_pid = pid_nr(find_vpid(desc->hostpid));
 	rcu_read_unlock();
-	process_id->devid = desc->devid;
-	process_id->vfid = desc->vfid;
 }
 
 static void init_process_id_batch(const struct va_desc_ba *desc,
@@ -161,8 +159,6 @@ static void init_process_id_batch(const struct va_desc_ba *desc,
 	rcu_read_lock();
 	process_id->host_pid = pid_nr(find_vpid(desc->hostpid));
 	rcu_read_unlock();
-	process_id->devid = desc->devid;
-	process_id->vfid = desc->vfid;
 }
 
 #ifdef DUMP_CONTENT

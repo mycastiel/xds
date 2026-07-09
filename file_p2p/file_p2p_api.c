@@ -252,8 +252,6 @@ int read_file(int dev_fd, struct read_parameter *param)
 	}
 
 	read->desc.hostpid = getpid();
-	read->desc.devid = param->devid;
-	read->desc.vfid = param->vfid;
 	read->desc.addr = param->addr;
 	read->desc.size = param->size;
 	read->nsid = 1;
@@ -332,8 +330,6 @@ int read_file_batch(int dev_fd, struct read_parameter *param, int param_num)
 	}
 
 	read->desc.hostpid = getpid();
-	read->desc.devid = param->devid;
-	read->desc.vfid = param->vfid;
 	read->desc.count = param_num;
 	read->nsid = 1;
 	read->file_fd = file_fd;

@@ -6,8 +6,6 @@
 
 struct va_desc {
 	int hostpid;
-	unsigned short devid;
-	unsigned short vfid;
 	unsigned long addr;
 	unsigned long size;
 };
@@ -22,8 +20,6 @@ struct read_desc {
 
 struct va_desc_ba {
 	int hostpid;
-	unsigned short devid;
-	unsigned short vfid;
 	unsigned long *addr;
 	unsigned long *size;
 	int count;
