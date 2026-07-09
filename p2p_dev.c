@@ -12,6 +12,7 @@
 #include <linux/ktime.h>
 #include <linux/idr.h>
 #include <linux/notifier.h>
+#include <linux/namei.h>
 #include <linux/tracepoint.h>
 
 #include <linux/nvme.h>
@@ -26,6 +27,7 @@
 #include "p2p_mem_query.h"
 
 #define HW_LIMIT_SIZE (128U << 10)
+#define P2P_SYSFS_BDEV_PATH_MAX 48
 
 u64 g_time = 0;
 u64 g_count = 0;
@@ -826,6 +828,42 @@ static unsigned long long calc_data_size(struct fiemap_extent *extents,
 	return size;
 }
 
+static bool p2p_sysfs_bdev_attr_exists(dev_t devt, const char *attr)
+{
+	char name[P2P_SYSFS_BDEV_PATH_MAX];
+	struct path path;
+	int len;
+	int err;
+
+	len = snprintf(name, sizeof(name), "/sys/dev/block/%u:%u/device/%s",
+		       MAJOR(devt), MINOR(devt), attr);
+	WARN_ON_ONCE(len >= (int)sizeof(name));
+
+	err = kern_path(name, LOOKUP_FOLLOW, &path);
+	if (err)
+		return false;
+	path_put(&path);
+	return true;
+}
+
+static int p2p_validate_nvme_bdev(struct block_device *bdev)
+{
+	dev_t devt = bdev->bd_dev;
+
+	if (p2p_sysfs_bdev_attr_exists(devt, "subsysnqn")) {
+		if (p2p_sysfs_bdev_attr_exists(devt, "iopolicy")) {
+			pr_err("p2p: NVMe multipath head %u:%u is unsupported\n",
+			       MAJOR(devt), MINOR(devt));
+			return -EOPNOTSUPP;
+		}
+		return 0;
+	}
+
+	pr_err("p2p: bdev %u:%u is not a supported NVMe namespace\n",
+	       MAJOR(devt), MINOR(devt));
+	return -ENODEV;
+}
+
 static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 {
 	struct read_desc __user *user_desc = arg;
@@ -871,6 +909,10 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 		goto put_bdev_file_out;
 	}
 	bdev = I_BDEV(bdev_inode);
+
+	err = p2p_validate_nvme_bdev(bdev);
+	if (err)
+		goto put_bdev_file_out;
 
 	ext_num = desc.ext_num;
 	extents = kvmalloc(ext_num * sizeof(*extents), GFP_KERNEL);
@@ -1054,6 +1096,10 @@ static int p2p_read_file_batch(struct p2p_batch *batch, void __user *arg)
 		goto put_bdev_file_out;
 	}
 	bdev = I_BDEV(bdev_inode);
+
+	err = p2p_validate_nvme_bdev(bdev);
+	if (err)
+		goto put_bdev_file_out;
 
 	ext_num = desc.ext_num;
 	extents = kvmalloc(ext_num * sizeof(*extents), GFP_KERNEL);
