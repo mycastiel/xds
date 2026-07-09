@@ -14,6 +14,7 @@
 #include <linux/notifier.h>
 #include <linux/namei.h>
 #include <linux/tracepoint.h>
+#include <linux/limits.h>
 
 #include <linux/nvme.h>
 #include <linux/blk_types.h>
@@ -26,7 +27,7 @@
 #include "p2p_dev_uapi.h"
 #include "p2p_mem_query.h"
 
-#define HW_LIMIT_SIZE (128U << 10)
+#define P2P_NVME_MAX_RW_SECTORS ((1U << 20) >> SECTOR_SHIFT)
 #define P2P_SYSFS_BDEV_PATH_MAX 48
 
 u64 g_time = 0;
@@ -42,17 +43,18 @@ struct p2p_io_context {
 	unsigned int pa_offset;
 	u64 *pa_list;
 	unsigned int pa_size;
-	unsigned int data_size;
+	u64 data_size;
+	unsigned int max_sectors;
 	struct completion io_done;
 	atomic_t io_ref;
 	int io_err;
 	int issue_err;
 	struct list_head io_list;
 	struct nvme_command *cmd_list;
-	int cmd_id;
+	unsigned int cmd_id;
+	unsigned int count;
 	u64 start_time;
 	u64 end_time;
-	int count;
 };
 
 struct p2p_batch {
@@ -374,22 +376,35 @@ static void free_io_ctx(struct p2p_io_context *io_ctx)
 	kfree(io_ctx);
 }
 
+static inline unsigned int p2p_queue_max_sectors(struct block_device *bdev)
+{
+	unsigned int max_sectors;
+
+	max_sectors = queue_max_sectors(bdev_get_queue(bdev));
+
+	return min(max_sectors, P2P_NVME_MAX_RW_SECTORS);
+}
+
 static struct p2p_io_context *new_io_ctx(struct block_device *bdev,
 					 struct file *file,
 					 const struct read_desc *desc,
 					 u64 *pa_list, unsigned int pa_num,
 					 unsigned int pa_size,
-					 unsigned int data_size)
+					 u64 data_size)
 {
 	struct p2p_io_context *io_ctx;
+	unsigned int max_sectors;
+	unsigned int max_bytes;
 	unsigned int nr;
 
-	io_ctx = kzalloc(sizeof(*io_ctx), GFP_KERNEL);
-	if (!io_ctx) {
-		return ERR_PTR(-ENOMEM);
-	}
+	max_sectors = p2p_queue_max_sectors(bdev);
+	max_bytes = max_sectors << SECTOR_SHIFT;
+	nr = round_up(data_size, max_bytes) / max_bytes * 10;
 
-	nr = round_up(data_size, HW_LIMIT_SIZE) / HW_LIMIT_SIZE * 10;
+	io_ctx = kzalloc(sizeof(*io_ctx), GFP_KERNEL);
+	if (!io_ctx)
+		return ERR_PTR(-ENOMEM);
+
 	io_ctx->cmd_list =
 		kvmalloc_array(nr, sizeof(*io_ctx->cmd_list), GFP_KERNEL);
 	if (!io_ctx->cmd_list) {
@@ -404,6 +419,7 @@ static struct p2p_io_context *new_io_ctx(struct block_device *bdev,
 	io_ctx->pa_list = pa_list;
 	io_ctx->pa_size = pa_size;
 	io_ctx->data_size = data_size;
+	io_ctx->max_sectors = max_sectors;
 	io_ctx->count = nr;
 
 	atomic_set(&io_ctx->io_ref, 1);
@@ -417,19 +433,20 @@ static struct p2p_io_context *
 new_io_ctx_batch(struct block_device *bdev, struct file *file,
 		 const struct read_desc_ba *desc,
 		 u64 *pa_list, unsigned int pa_num, unsigned int pa_size,
-		 unsigned int data_size)
+		 u64 data_size)
 {
 	struct p2p_io_context *io_ctx;
+	unsigned int max_sectors;
+	unsigned int max_bytes;
+	unsigned int count;
 
-	int count = round_up(data_size, HW_LIMIT_SIZE) / HW_LIMIT_SIZE * 10;
-	if (count < desc->desc.count) {
-		count = desc->desc.count;
-	}
+	max_sectors = p2p_queue_max_sectors(bdev);
+	max_bytes = max_sectors << SECTOR_SHIFT;
+	count = round_up(data_size, max_sectors) / max_sectors * 10;
 
 	io_ctx = kzalloc(sizeof(*io_ctx), GFP_KERNEL);
-	if (!io_ctx) {
+	if (!io_ctx)
 		return ERR_PTR(-ENOMEM);
-	}
 
 	io_ctx->bdev = bdev;
 	io_ctx->file = file;
@@ -437,6 +454,7 @@ new_io_ctx_batch(struct block_device *bdev, struct file *file,
 	io_ctx->pa_num = pa_num;
 	io_ctx->pa_list = pa_list;
 	io_ctx->pa_size = pa_size;
+	io_ctx->max_sectors = max_sectors;
 	io_ctx->cmd_list =
 		kvmalloc_array(count, sizeof(struct nvme_command), GFP_KERNEL);
 	if (!io_ctx->cmd_list) {
@@ -621,7 +639,7 @@ static int do_read_io(struct p2p_io_context *io_ctx, unsigned long long sector,
 	struct request *req;
 	struct nvme_command *cmd = &io_ctx->cmd_list[io_ctx->cmd_id];
 	if (io_ctx->cmd_id >= io_ctx->count) {
-		pr_err("cmd_id %d >= count %d\n", io_ctx->cmd_id,
+		pr_err("cmd_id %u >= count %u\n", io_ctx->cmd_id,
 		       io_ctx->count);
 		return -EINVAL;
 	}
@@ -690,7 +708,7 @@ static void cur_pa_advance_sector(struct p2p_io_context *io_ctx,
 static unsigned int calc_read_size(struct p2p_io_context *io_ctx,
 				   unsigned int left)
 {
-	const unsigned int limit = (128 << 10) >> SECTOR_SHIFT;
+	unsigned int limit = io_ctx->max_sectors;
 	unsigned int to_read = left;
 	unsigned int pa_left;
 
@@ -1024,7 +1042,7 @@ static int p2p_drain_read(struct p2p_batch *batch)
 			g_size += io_ctx->data_size;
 			g_count++;
 		} else {
-			pr_info("cmd_id 0 io_cnt %d\n", io_ctx->cmd_id);
+			pr_info("cmd_id %u\n", io_ctx->cmd_id);
 		}
 
 		list_del_init(&io_ctx->io_list);
