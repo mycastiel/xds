@@ -14,7 +14,6 @@ struct va_desc {
 
 struct read_desc {
 	struct va_desc desc;
-	int bdev_fd;
 	unsigned int nsid;
 	int file_fd;
 	unsigned int ext_num;
@@ -32,7 +31,6 @@ struct va_desc_ba {
 
 struct read_desc_ba {
 	struct va_desc_ba desc;
-	int bdev_fd;
 	unsigned int nsid;
 	int file_fd;
 	unsigned int ext_num;

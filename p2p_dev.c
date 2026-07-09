@@ -35,6 +35,7 @@ u64 g_size = 0;
 
 struct p2p_io_context {
 	struct block_device *bdev;
+	struct file *file;
 	unsigned int nsid;
 	unsigned int pa_num;
 	unsigned int pa_idx;
@@ -369,10 +370,12 @@ static void free_io_ctx(struct p2p_io_context *io_ctx)
 {
 	kvfree(io_ctx->cmd_list);
 	kvfree(io_ctx->pa_list);
+	fput(io_ctx->file);
 	kfree(io_ctx);
 }
 
 static struct p2p_io_context *new_io_ctx(struct block_device *bdev,
+					 struct file *file,
 					 const struct read_desc *desc,
 					 u64 *pa_list, unsigned int pa_num,
 					 unsigned int pa_size,
@@ -395,6 +398,7 @@ static struct p2p_io_context *new_io_ctx(struct block_device *bdev,
 	}
 
 	io_ctx->bdev = bdev;
+	io_ctx->file = file;
 	io_ctx->nsid = desc->nsid;
 	io_ctx->pa_num = pa_num;
 	io_ctx->pa_list = pa_list;
@@ -410,7 +414,8 @@ static struct p2p_io_context *new_io_ctx(struct block_device *bdev,
 }
 
 static struct p2p_io_context *
-new_io_ctx_batch(struct block_device *bdev, const struct read_desc_ba *desc,
+new_io_ctx_batch(struct block_device *bdev, struct file *file,
+		 const struct read_desc_ba *desc,
 		 u64 *pa_list, unsigned int pa_num, unsigned int pa_size,
 		 unsigned int data_size)
 {
@@ -427,6 +432,7 @@ new_io_ctx_batch(struct block_device *bdev, const struct read_desc_ba *desc,
 	}
 
 	io_ctx->bdev = bdev;
+	io_ctx->file = file;
 	io_ctx->nsid = desc->nsid;
 	io_ctx->pa_num = pa_num;
 	io_ctx->pa_list = pa_list;
@@ -828,6 +834,24 @@ static unsigned long long calc_data_size(struct fiemap_extent *extents,
 	return size;
 }
 
+static struct block_device *p2p_bdev_from_file(struct file *file)
+{
+	struct inode *inode = file_inode(file);
+	struct super_block *sb;
+
+	if (S_ISBLK(inode->i_mode))
+		return I_BDEV(inode);
+
+	if (!S_ISREG(inode->i_mode))
+		return ERR_PTR(-EINVAL);
+
+	sb = inode->i_sb;
+	if (!sb || !sb->s_bdev)
+		return ERR_PTR(-EOPNOTSUPP);
+
+	return sb->s_bdev;
+}
+
 static bool p2p_sysfs_bdev_attr_exists(dev_t devt, const char *attr)
 {
 	char name[P2P_SYSFS_BDEV_PATH_MAX];
@@ -870,8 +894,6 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 	struct fiemap_extent *extents;
 	struct read_desc desc;
 	struct file *reg_file;
-	struct file *bdev_file;
-	struct inode *bdev_inode;
 	struct block_device *bdev;
 	struct p2p_io_context *io_ctx;
 	u64 *pa_list;
@@ -898,27 +920,21 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 		goto free_pa_out;
 	}
 
-	bdev_file = fget(desc.bdev_fd);
-	if (!bdev_file) {
-		err = -EBADF;
+	bdev = p2p_bdev_from_file(reg_file);
+	if (IS_ERR(bdev)) {
+		err = PTR_ERR(bdev);
 		goto put_reg_file_out;
 	}
-	bdev_inode = bdev_file->f_mapping->host;
-	if (!S_ISBLK(bdev_inode->i_mode)) {
-		err = -EINVAL;
-		goto put_bdev_file_out;
-	}
-	bdev = I_BDEV(bdev_inode);
 
 	err = p2p_validate_nvme_bdev(bdev);
 	if (err)
-		goto put_bdev_file_out;
+		goto put_reg_file_out;
 
 	ext_num = desc.ext_num;
 	extents = kvmalloc(ext_num * sizeof(*extents), GFP_KERNEL);
 	if (!extents) {
 		err = -ENOMEM;
-		goto put_bdev_file_out;
+		goto put_reg_file_out;
 	}
 	if (copy_from_user(extents, user_desc->extents,
 			   ext_num * sizeof(*extents))) {
@@ -934,11 +950,13 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 		goto free_ext_out;
 	}
 
-	io_ctx = new_io_ctx(bdev, &desc, pa_list, pa_num, pa_size, data_size);
+	io_ctx = new_io_ctx(bdev, reg_file, &desc, pa_list, pa_num, pa_size,
+			    data_size);
 	if (IS_ERR(io_ctx)) {
 		err = PTR_ERR(io_ctx);
 		goto free_ext_out;
 	}
+	reg_file = NULL;
 	pa_list = NULL;
 	io_ctx->pa_offset = addr_off;
 
@@ -951,10 +969,9 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 
 free_ext_out:
 	kvfree(extents);
-put_bdev_file_out:
-	fput(bdev_file);
 put_reg_file_out:
-	fput(reg_file);
+	if (reg_file)
+		fput(reg_file);
 free_pa_out:
 	kvfree(pa_list);
 	return err;
@@ -1032,8 +1049,6 @@ static int p2p_read_file_batch(struct p2p_batch *batch, void __user *arg)
 	unsigned long *kaddr, *kaddr1;
 	struct read_desc_ba desc;
 	struct file *reg_file;
-	struct file *bdev_file;
-	struct inode *bdev_inode;
 	struct block_device *bdev;
 	struct p2p_io_context *io_ctx;
 	u64 *pa_list;
@@ -1085,27 +1100,21 @@ static int p2p_read_file_batch(struct p2p_batch *batch, void __user *arg)
 		goto free_pa_out;
 	}
 
-	bdev_file = fget(desc.bdev_fd);
-	if (!bdev_file) {
-		err = -EBADF;
+	bdev = p2p_bdev_from_file(reg_file);
+	if (IS_ERR(bdev)) {
+		err = PTR_ERR(bdev);
 		goto put_reg_file_out;
 	}
-	bdev_inode = bdev_file->f_mapping->host;
-	if (!S_ISBLK(bdev_inode->i_mode)) {
-		err = -EINVAL;
-		goto put_bdev_file_out;
-	}
-	bdev = I_BDEV(bdev_inode);
 
 	err = p2p_validate_nvme_bdev(bdev);
 	if (err)
-		goto put_bdev_file_out;
+		goto put_reg_file_out;
 
 	ext_num = desc.ext_num;
 	extents = kvmalloc(ext_num * sizeof(*extents), GFP_KERNEL);
 	if (!extents) {
 		err = -ENOMEM;
-		goto put_bdev_file_out;
+		goto put_reg_file_out;
 	}
 	if (copy_from_user(extents, user_desc->extents,
 			   ext_num * sizeof(*extents))) {
@@ -1121,12 +1130,13 @@ static int p2p_read_file_batch(struct p2p_batch *batch, void __user *arg)
 		goto free_ext_out;
 	}
 
-	io_ctx = new_io_ctx_batch(bdev, &desc, pa_list, pa_num, pa_size,
-				  data_size);
+	io_ctx = new_io_ctx_batch(bdev, reg_file, &desc, pa_list, pa_num,
+				  pa_size, data_size);
 	if (IS_ERR(io_ctx)) {
 		err = PTR_ERR(io_ctx);
 		goto free_ext_out;
 	}
+	reg_file = NULL;
 	pa_list = NULL;
 
 	io_ctx->issue_err = do_read_ios_batch(io_ctx, extents, ext_num,
@@ -1139,10 +1149,9 @@ static int p2p_read_file_batch(struct p2p_batch *batch, void __user *arg)
 
 free_ext_out:
 	kvfree(extents);
-put_bdev_file_out:
-	fput(bdev_file);
 put_reg_file_out:
-	fput(reg_file);
+	if (reg_file)
+		fput(reg_file);
 free_pa_out:
 	kvfree(pa_list);
 	kvfree(addr_off);

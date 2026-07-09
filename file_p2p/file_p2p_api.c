@@ -22,9 +22,9 @@ long long timespec_diff_ms(const struct timespec *start,
 	       (end->tv_nsec - start->tv_nsec) / 1000000LL;
 }
 
-void close_p2p_fd(int dev_fd)
+int close_p2p_fd(int dev_fd)
 {
-	close(dev_fd);
+	return close(dev_fd);
 }
 
 int new_p2p_fd(void)
@@ -55,7 +55,6 @@ int read_file(int dev_fd, struct read_parameter *param)
 	const char *name;
 	unsigned int i;
 	int file_fd = -1;
-	int bdev_fd = -1;
 	int err = 0;
 
 	name = param->file_name;
@@ -70,14 +69,6 @@ int read_file(int dev_fd, struct read_parameter *param)
 	if (err < 0) {
 		err = -errno;
 		fprintf(stderr, "fstat %s failed, errno: %d\n", name, err);
-		goto close_fds_out;
-	}
-
-	bdev_fd = open(param->bdev_name, O_RDONLY);
-	if (bdev_fd < 0) {
-		err = -errno;
-		fprintf(stderr, "open %s failed, errno: %d\n", param->bdev_name,
-			err);
 		goto close_fds_out;
 	}
 
@@ -152,7 +143,6 @@ to_read:
 	read->desc.vfid = param->vfid;
 	read->desc.addr = param->addr;
 	read->desc.size = param->size;
-	read->bdev_fd = bdev_fd;
 	read->nsid = 1;
 	read->file_fd = file_fd;
 	read->ext_num = ext_num;
@@ -174,8 +164,6 @@ free_ext_out:
 close_fds_out:
 	if (file_fd >= 0)
 		close(file_fd);
-	if (bdev_fd >= 0)
-		close(bdev_fd);
 
 	return err;
 }
@@ -192,7 +180,6 @@ int read_file_batch(int dev_fd, struct read_parameter *param, int param_num)
 	unsigned int i;
 	int j;
 	int file_fd = -1;
-	int bdev_fd = -1;
 	int err = 0;
 
 	name = param[0].file_name;
@@ -200,14 +187,6 @@ int read_file_batch(int dev_fd, struct read_parameter *param, int param_num)
 	if (file_fd < 0) {
 		err = -errno;
 		fprintf(stderr, "open %s failed, errno: %d\n", name, err);
-		goto close_fds_out;
-	}
-
-	bdev_fd = open(param[0].bdev_name, O_RDONLY);
-	if (bdev_fd < 0) {
-		err = -errno;
-		fprintf(stderr, "open %s failed, errno: %d\n",
-			param[0].bdev_name, err);
 		goto close_fds_out;
 	}
 
@@ -269,7 +248,6 @@ int read_file_batch(int dev_fd, struct read_parameter *param, int param_num)
 	read->desc.devid = param->devid;
 	read->desc.vfid = param->vfid;
 	read->desc.count = param_num;
-	read->bdev_fd = bdev_fd;
 	read->nsid = 1;
 	read->file_fd = file_fd;
 	read->ext_num = ext_num;
@@ -309,8 +287,6 @@ free_ext_out:
 close_fds_out:
 	if (file_fd >= 0)
 		close(file_fd);
-	if (bdev_fd >= 0)
-		close(bdev_fd);
 
 	return err;
 }

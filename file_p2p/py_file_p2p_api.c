@@ -44,6 +44,9 @@ static PyObject *py_read_file_batch(PyObject *self, PyObject *args)
 	const char *file_name = NULL;
 	const char *bdev_name = NULL;
 	PyObject *py_list = NULL;
+	unsigned short devid = 0;
+	unsigned short vfid = 0;
+	int ret = 0;
 
 	if (!PyArg_ParseTuple(args, "issO", &dev_fd, &file_name, &bdev_name,
 			      &py_list)) {
@@ -62,7 +65,7 @@ static PyObject *py_read_file_batch(PyObject *self, PyObject *args)
 		return PyLong_FromLong((long)-1);
 	}
 
-	struct read_params *params = malloc(n * sizeof(struct read_params));
+	struct read_parameter *params = malloc(n * sizeof(*params));
 	if (params == NULL) {
 		PyErr_SetString(PyExc_MemoryError, "malloc read_params failed");
 		return PyLong_FromLong((long)-1);
@@ -112,7 +115,7 @@ static PyObject *py_read_file_batch(PyObject *self, PyObject *args)
 	Py_END_ALLOW_THREADS
 
 		free(params);
-	return PyLong_FromLong((long)0);
+	return PyLong_FromLong((long)ret);
 }
 
 static PyObject *py_drain_read(PyObject *self, PyObject *args)
