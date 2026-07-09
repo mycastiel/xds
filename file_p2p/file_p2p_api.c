@@ -18,6 +18,11 @@
 
 #define FILE_P2P_SECTOR_SIZE 512U
 #define FILE_P2P_DEFAULT_BLOCK_SIZE 4096U
+#define FILE_P2P_UNSUPPORTED_FIEMAP_FLAGS \
+	(FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC | \
+	 FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED | \
+	 FIEMAP_EXTENT_NOT_ALIGNED | FIEMAP_EXTENT_DATA_INLINE | \
+	 FIEMAP_EXTENT_DATA_TAIL | FIEMAP_EXTENT_UNWRITTEN)
 
 long long timespec_diff_ms(const struct timespec *start,
 			   const struct timespec *end)
@@ -99,17 +104,24 @@ static struct fiemap *alloc_fiemap(unsigned int extent_count)
 		      extent_count * sizeof(struct fiemap_extent));
 }
 
-static unsigned int trim_fiemap_extents(struct fiemap_extent *extents,
-					unsigned int ext_num,
-					unsigned long offset,
-					unsigned long size,
-					unsigned long long *total_size)
+static int is_sector_aligned(unsigned long long value)
+{
+	return !(value & (FILE_P2P_SECTOR_SIZE - 1));
+}
+
+static int trim_fiemap_extents(struct fiemap_extent *extents,
+			       unsigned int ext_num, unsigned long offset,
+			       unsigned long size, unsigned int *trimmed_ext_num,
+			       unsigned long long *total_size)
 {
 	unsigned long long request_start = offset;
 	unsigned long long request_end = request_start + size;
 	unsigned long long total = 0;
 	unsigned int out = 0;
 	unsigned int i;
+
+	if (request_end < request_start)
+		return -EOVERFLOW;
 
 	for (i = 0; i < ext_num; i++) {
 		struct fiemap_extent extent = extents[i];
@@ -118,8 +130,16 @@ static unsigned int trim_fiemap_extents(struct fiemap_extent *extents,
 		unsigned long long trim_start;
 		unsigned long long trim_end;
 
+		if (extent_end < extent_start)
+			return -EOVERFLOW;
 		if (extent_end <= request_start || extent_start >= request_end)
 			continue;
+		if (extent.fe_flags & FILE_P2P_UNSUPPORTED_FIEMAP_FLAGS) {
+			fprintf(stderr,
+				"unsupported FIEMAP extent flags 0x%x at extent %u\n",
+				extent.fe_flags, i);
+			return -EOPNOTSUPP;
+		}
 
 		trim_start = extent_start > request_start ?
 			     extent_start : request_start;
@@ -130,12 +150,22 @@ static unsigned int trim_fiemap_extents(struct fiemap_extent *extents,
 		extent.fe_physical += trim_start - extent_start;
 		extent.fe_logical = trim_start;
 		extent.fe_length = trim_end - trim_start;
+		if (!is_sector_aligned(extent.fe_logical) ||
+		    !is_sector_aligned(extent.fe_physical) ||
+		    !is_sector_aligned(extent.fe_length)) {
+			fprintf(stderr,
+				"unaligned FIEMAP extent logical 0x%llx physical 0x%llx length 0x%llx\n",
+				extent.fe_logical, extent.fe_physical,
+				extent.fe_length);
+			return -EINVAL;
+		}
 		extents[out++] = extent;
 		total += extent.fe_length;
 	}
 
+	*trimmed_ext_num = out;
 	*total_size = total;
-	return out;
+	return 0;
 }
 
 static int prepare_read_extents(int file_fd, const struct stat *file_stat,
@@ -153,6 +183,9 @@ static int prepare_read_extents(int file_fd, const struct stat *file_stat,
 	int err;
 
 	if (S_ISBLK(file_stat->st_mode)) {
+		if (!is_sector_aligned(offset) || !is_sector_aligned(size))
+			return -EINVAL;
+
 		exts = alloc_fiemap(1);
 		if (!exts)
 			return -ENOMEM;
@@ -195,9 +228,12 @@ static int prepare_read_extents(int file_fd, const struct stat *file_stat,
 		return err;
 	}
 
-	*ext_num_out = trim_fiemap_extents(exts->fm_extents,
-					   exts->fm_mapped_extents,
-					   offset, size, total_size_out);
+	err = trim_fiemap_extents(exts->fm_extents, exts->fm_mapped_extents,
+				  offset, size, ext_num_out, total_size_out);
+	if (err) {
+		free(exts);
+		return err;
+	}
 	*exts_out = exts;
 	return 0;
 }
