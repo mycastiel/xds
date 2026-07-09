@@ -11,6 +11,8 @@
 #include <linux/vmalloc.h>
 #include <linux/ktime.h>
 #include <linux/idr.h>
+#include <linux/notifier.h>
+#include <linux/tracepoint.h>
 
 #include <linux/nvme.h>
 #include <linux/blk_types.h>
@@ -59,16 +61,17 @@ struct p2p_batch {
 
 #define RQF_NVME_PT ((__force req_flags_t)(1 << 31))
 
-void nvme_init_request(struct request *req, struct nvme_command *cmd);
+extern void nvme_init_request(struct request *req, struct nvme_command *cmd);
+
+static void p2p_tp_hook_exit(void);
 
 dev_t dev = 0;
 static struct class *dev_class;
 static struct cdev p2p_cdev;
 
-static struct tracepoint *tp_nvme_setup_cmd;
-
-unsigned long tp_nvme_setup_cmd_addr;
-module_param(tp_nvme_setup_cmd_addr, ulong, 0400);
+static struct tracepoint *p2p_tp;
+static DEFINE_MUTEX(p2p_tp_lock);
+static struct module *p2p_tp_mod;
 
 static DEFINE_SPINLOCK(batch_lock);
 static DEFINE_IDR(batch_tree);
@@ -443,22 +446,146 @@ new_io_ctx_batch(struct block_device *bdev, const struct read_desc_ba *desc,
 	return io_ctx;
 }
 
-static void hook_nvme_setup_cmd(void *ignore, struct request *rq,
-				struct nvme_command *cmd)
+static void p2p_hook_nvme_setup_cmd(void *ignore, struct request *rq,
+				    struct nvme_command *cmd)
 {
-	if (!(rq->rq_flags & RQF_NVME_PT)) {
+	if (!(rq->rq_flags & RQF_NVME_PT))
 		return;
-	}
 
 	cmd->rw.flags = NVME_CMD_SGL_METABUF;
 }
 
-static int register_nvme_setup_cmd_hook(void)
+static bool is_nvme_setup_cmd_tp(struct tracepoint *tp)
 {
-	tp_nvme_setup_cmd = (void *)tp_nvme_setup_cmd_addr;
+	return !strcmp(tp->name, "nvme_setup_cmd");
+}
 
-	return tracepoint_probe_register(tp_nvme_setup_cmd, hook_nvme_setup_cmd,
-					 NULL);
+static int p2p_register_tp_hook(struct tracepoint *tp)
+{
+	int err;
+
+	err = tracepoint_probe_register(tp, p2p_hook_nvme_setup_cmd, NULL);
+	if (!err) {
+		p2p_tp = tp;
+		pr_info("p2p: registered nvme_setup_cmd tp hook\n");
+		return 0;
+	}
+
+	pr_warn("p2p: register tp hook err %d\n", err);
+	return err;
+}
+
+static void p2p_find_builtin_tp(struct tracepoint *tp, void *priv)
+{
+	struct tracepoint **found = priv;
+
+	if (!*found && is_nvme_setup_cmd_tp(tp))
+		*found = tp;
+}
+
+#ifdef CONFIG_MODULES
+static void p2p_register_tp_from_module(struct tp_module *module_tp)
+{
+	struct module *mod = module_tp->mod;
+	unsigned int i;
+	int err;
+
+	for (i = 0; i < mod->num_tracepoints; i++) {
+		struct tracepoint *tp;
+
+		tp = tracepoint_ptr_deref(&mod->tracepoints_ptrs[i]);
+		if (!is_nvme_setup_cmd_tp(tp))
+			continue;
+
+		if (!try_module_get(mod)) {
+			pr_warn("p2p: failed to pin module\n");
+			return;
+		}
+
+		err = p2p_register_tp_hook(tp);
+		if (!err) {
+			p2p_tp_mod = mod;
+			return;
+		}
+		module_put(mod);
+		return;
+	}
+}
+#endif
+
+static int p2p_tp_module_notify(struct notifier_block *nb, unsigned long val,
+				void *data)
+{
+#ifdef CONFIG_MODULES
+	struct tp_module *tp_mod = data;
+
+	mutex_lock(&p2p_tp_lock);
+	switch (val) {
+	case MODULE_STATE_COMING:
+		if (!p2p_tp)
+			p2p_register_tp_from_module(tp_mod);
+		break;
+	default:
+		break;
+	}
+	mutex_unlock(&p2p_tp_lock);
+#endif
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block p2p_tp_module_nb = {
+	.notifier_call = p2p_tp_module_notify,
+};
+
+static int p2p_tp_hook_init(void)
+{
+	struct tracepoint *tp = NULL;
+	int err;
+
+	for_each_kernel_tracepoint(p2p_find_builtin_tp, &tp);
+	if (tp)
+		return p2p_register_tp_hook(tp);
+
+	err = register_tracepoint_module_notifier(&p2p_tp_module_nb);
+	if (err) {
+		pr_err("p2p: register tp module notifier err %d\n", err);
+		return err;
+	}
+
+	mutex_lock(&p2p_tp_lock);
+	err = p2p_tp ? 0 : -ENOENT;
+	mutex_unlock(&p2p_tp_lock);
+
+	unregister_tracepoint_module_notifier(&p2p_tp_module_nb);
+
+	if (err) {
+		pr_err("p2p: tp not found\n");
+		/*
+		 * Notifier registration can synchronously invoke COMING
+		 * callbacks, so use the shared exit path to undo any hook or
+		 * module pin installed before this validation failed.
+		 */
+		p2p_tp_hook_exit();
+	}
+
+	return err;
+}
+
+static void p2p_tp_hook_exit(void)
+{
+	int err;
+
+	if (!p2p_tp)
+		return;
+
+	err = tracepoint_probe_unregister(p2p_tp, p2p_hook_nvme_setup_cmd, NULL);
+	if (err)
+		pr_warn("p2p: unregister tp hook err %d\n", err);
+
+	tracepoint_synchronize_unregister();
+
+	module_put(p2p_tp_mod);
 }
 
 static enum rq_end_io_ret end_read_io(struct request *req, blk_status_t status)
@@ -1012,71 +1139,65 @@ static int __init p2p_drv_init(void)
 	struct device *device;
 	int err;
 
-	if (!tp_nvme_setup_cmd_addr) {
-		pr_err("set tp_block_rq_issue_addr=???\n");
-		return -EINVAL;
+	err = p2p_tp_hook_init();
+	if (err) {
+		pr_err("p2p: register tp hook err %d\n", err);
+		return err;
 	}
 
 	err = alloc_chrdev_region(&dev, 0, 1, "p2p_device");
 	if (err < 0) {
-		pr_err("p2p Driver: cannot allocate major number err %d\n",
+		pr_err("p2p: cannot allocate major number err %d\n",
 		       err);
-		return err;
+		goto unregister_hook;
 	}
 
-	pr_info("p2p Driver: Major = %d Minor = %d \n", MAJOR(dev), MINOR(dev));
+	pr_info("p2p: Major = %d Minor = %d \n", MAJOR(dev), MINOR(dev));
 	cdev_init(&p2p_cdev, &fops);
 
 	err = cdev_add(&p2p_cdev, dev, 1);
 	if (err < 0) {
-		pr_err("p2p Driver: Cannot add the device to the system. \n");
+		pr_err("p2p: Cannot add the device to the system. \n");
 		goto free_dev;
 	}
 
 	dev_class = class_create("p2p_class");
 	if (IS_ERR(dev_class)) {
 		err = PTR_ERR(dev_class);
-		pr_err("p2p Driver: Cannot create the struct class\n");
+		pr_err("p2p: Cannot create the struct class\n");
 		goto del_cdev;
 	}
 
 	device = device_create(dev_class, NULL, dev, NULL, "p2p_device");
 	if (IS_ERR(device)) {
 		err = PTR_ERR(device);
-		pr_err("p2p Driver: Cannot create the device\n");
+		pr_err("p2p: Cannot create the device\n");
 		goto del_cls;
 	}
 
-	err = register_nvme_setup_cmd_hook();
-	if (err) {
-		pr_err("p2p Driver: register rq_issue hook err %d\n", err);
-		goto del_dev;
-	}
-
-	pr_info("p2p Driver: Device Driver Inserted Done\n");
+	pr_info("p2p: Device Driver Inserted Done\n");
 	return 0;
 
-del_dev:
-	device_destroy(dev_class, dev);
 del_cls:
 	class_destroy(dev_class);
 del_cdev:
 	cdev_del(&p2p_cdev);
 free_dev:
 	unregister_chrdev_region(dev, 1);
+unregister_hook:
+	p2p_tp_hook_exit();
 	return err;
 }
 
 static void __exit p2p_drv_exit(void)
 {
-	tracepoint_probe_unregister(tp_nvme_setup_cmd, hook_nvme_setup_cmd,
-				    NULL);
+	p2p_tp_hook_exit();
 
 	device_destroy(dev_class, dev);
 	class_destroy(dev_class);
 	cdev_del(&p2p_cdev);
 	unregister_chrdev_region(dev, 1);
-	pr_info("p2p Driver: Device Driver Removed Done\n");
+	pr_info("p2p: Device Driver Removed Done\n");
 }
 
 module_init(p2p_drv_init);
