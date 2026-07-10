@@ -7,7 +7,7 @@ def test_read(name):
         print("new_p2p_fd failed, errno: %d" % -dev_fd)
         return
 
-    err = file_p2p.read_file(dev_fd, name, "/dev/nvme0n1", 4096, 0, 8 << 20)
+    err = file_p2p.read_file(dev_fd, name, 4096, [(0, 8 << 20)])
     if err < 0:
         print("read_file failed, errno: %d" % -err)
         return

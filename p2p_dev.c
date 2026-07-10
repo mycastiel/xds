@@ -15,6 +15,7 @@
 #include <linux/namei.h>
 #include <linux/tracepoint.h>
 #include <linux/limits.h>
+#include <linux/overflow.h>
 
 #include <linux/nvme.h>
 #include <linux/blk_types.h>
@@ -29,10 +30,17 @@
 
 #define P2P_NVME_MAX_RW_SECTORS ((1U << 20) >> SECTOR_SHIFT)
 #define P2P_SYSFS_BDEV_PATH_MAX 48
+#define P2P_MAX_IOV 65536U
+#define P2P_MAX_EXTENTS 1048576U
 
 u64 g_time = 0;
 u64 g_count = 0;
 u64 g_size = 0;
+
+struct p2p_pa_segment {
+	u64 addr;
+	u64 len;
+};
 
 struct p2p_io_context {
 	struct block_device *bdev;
@@ -40,9 +48,8 @@ struct p2p_io_context {
 	unsigned int nsid;
 	unsigned int pa_num;
 	unsigned int pa_idx;
-	unsigned int pa_offset;
-	u64 *pa_list;
-	unsigned int pa_size;
+	u64 pa_offset;
+	struct p2p_pa_segment *pa_segments;
 	u64 data_size;
 	unsigned int max_sectors;
 	struct completion io_done;
@@ -143,28 +150,19 @@ static int p2p_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static void init_process_id(const struct va_desc *desc,
+static void init_process_id(int host_pid,
 			    struct devmm_svm_process_id *process_id)
 {
 	memset(process_id, 0, sizeof(*process_id));
 	rcu_read_lock();
-	process_id->host_pid = pid_nr(find_vpid(desc->hostpid));
-	rcu_read_unlock();
-}
-
-static void init_process_id_batch(const struct va_desc_ba *desc,
-				  struct devmm_svm_process_id *process_id)
-{
-	memset(process_id, 0, sizeof(*process_id));
-	rcu_read_lock();
-	process_id->host_pid = pid_nr(find_vpid(desc->hostpid));
+	process_id->host_pid = pid_nr(find_vpid(host_pid));
 	rcu_read_unlock();
 }
 
 #ifdef DUMP_CONTENT
-static void dump_pa_content(unsigned long pa, unsigned int size)
+static void dump_pa_content(u64 pa, u64 size)
 {
-	unsigned int data_len = min(size, 16U << 10);
+	unsigned int data_len = min_t(u64, size, 16U << 10);
 	void *addr;
 
 	addr = ioremap(pa, data_len);
@@ -178,196 +176,157 @@ static void dump_pa_content(unsigned long pa, unsigned int size)
 	iounmap(addr);
 }
 #else
-static void dump_pa_content(unsigned long pa, unsigned int size)
+static void dump_pa_content(u64 pa, u64 size)
 {
 }
 #endif
 
-static int get_pa_list(const struct va_desc *desc, u64 **_pa_list,
-		       unsigned int *_pa_num, unsigned int *_pa_size)
+struct p2p_iov_map {
+	u64 aligned_addr;
+	u64 aligned_size;
+	u32 page_size;
+	u32 pa_num;
+};
+
+static int get_pa_segments(int host_pid, const struct p2p_iov *iov,
+			   unsigned int iov_nr,
+			   struct p2p_pa_segment **_segments,
+			   unsigned int *_segment_nr)
 {
 	struct devmm_svm_process_id pid;
-	u64 addr, aligned_addr;
-	u64 size, aligned_size;
+	struct p2p_pa_segment *segments;
+	struct p2p_iov_map *maps;
 	u64 *pa_list;
-	unsigned int pa_num;
-	int page_size;
+	unsigned int max_pa_num = 0;
+	unsigned int segment_nr = 0;
+	unsigned int segment_idx = 0;
+	unsigned int i;
 	int err;
 
-	init_process_id(desc, &pid);
+	init_process_id(host_pid, &pid);
+	maps = kvmalloc_array(iov_nr, sizeof(*maps), GFP_KERNEL);
+	if (!maps)
+		return -ENOMEM;
 
-	addr = desc->addr;
-	size = desc->size;
-	page_size = devmm_get_mem_page_size(&pid, addr, size);
-	if (page_size <= 0) {
-		printk(KERN_ERR
-		       "Failed to get page size for addr %llx, size %llu\n",
-		       addr, size);
-		if (!page_size) {
-			page_size = -EINVAL;
+	for (i = 0; i < iov_nr; i++) {
+		u64 range_size;
+		u64 pa_num;
+		u64 offset;
+		u32 page_size;
+
+		page_size = devmm_get_mem_page_size(&pid, iov[i].addr,
+						    iov[i].size);
+		if (page_size < SECTOR_SIZE || !is_power_of_2(page_size)) {
+			pr_err("p2p: invalid page size %u for iov %u\n",
+			       page_size, i);
+			err = -EINVAL;
+			goto free_maps;
 		}
-		return page_size;
-	}
 
-	aligned_addr = round_down(addr, page_size);
-	aligned_size = round_up((addr - aligned_addr + size), page_size);
-	pa_num = aligned_size / page_size;
-
-	pa_list = kvmalloc(pa_num * sizeof(*pa_list), GFP_KERNEL);
-	if (!pa_list) {
-		return -ENOMEM;
-	}
-
-	err = devmm_get_mem_pa_list(&pid, aligned_addr, aligned_size, pa_list,
-				    pa_num);
-	if (err) {
-		printk(KERN_ERR
-		       "Failed to get PA list for addr %llx, size %llu, err %d\n",
-		       aligned_addr, aligned_size, err);
-		kvfree(pa_list);
-		return err;
-	}
-
-	devmm_put_mem_pa_list(&pid, aligned_addr, aligned_size, pa_list,
-			      pa_num);
-
-	*_pa_list = pa_list;
-	*_pa_num = pa_num;
-	*_pa_size = page_size;
-
-	return addr - aligned_addr;
-}
-
-static int get_pa_list_batch(const struct va_desc_ba *desc, u64 **_pa_list,
-			     unsigned int *_pa_num, unsigned int *_pa_size,
-			     int **_addr_off, int **_ret_size)
-{
-	struct devmm_svm_process_id pid;
-	u64 addr, aligned_addr;
-	u64 size, aligned_size;
-	u64 tail;
-	u64 *pa_list;
-	int *addr_off;
-	int *ret_size;
-	unsigned int pa_num = 0;
-	int page_size;
-	int err;
-	int i, j;
-
-	init_process_id_batch(desc, &pid);
-
-	addr = desc->addr[0];
-	size = desc->size[0];
-	page_size = devmm_get_mem_page_size(&pid, addr, size);
-	if (page_size <= 0) {
-		printk(KERN_ERR
-		       "Failed to get page size for addr %llx, size %llu\n",
-		       addr, size);
-		if (!page_size) {
-			page_size = -EINVAL;
+		offset = iov[i].addr & (page_size - 1);
+		if (check_add_overflow(offset, (u64)iov[i].size,
+				       &range_size)) {
+			err = -EOVERFLOW;
+			goto free_maps;
 		}
-		return page_size;
+		pa_num = DIV_ROUND_UP_ULL(range_size, page_size);
+		if (!pa_num || pa_num > U32_MAX ||
+		    pa_num > UINT_MAX - segment_nr) {
+			err = -E2BIG;
+			goto free_maps;
+		}
+
+		maps[i].aligned_addr = iov[i].addr - offset;
+		maps[i].page_size = page_size;
+		maps[i].pa_num = pa_num;
+		if (check_mul_overflow(pa_num, (u64)page_size,
+				       &maps[i].aligned_size)) {
+			err = -EOVERFLOW;
+			goto free_maps;
+		}
+		segment_nr += maps[i].pa_num;
+		max_pa_num = max(max_pa_num, maps[i].pa_num);
 	}
 
-	for (i = 0; i < desc->count; i++) {
-		aligned_addr = round_down(desc->addr[i], page_size);
-		aligned_size =
-			round_up((desc->addr[i] - aligned_addr + desc->size[i]),
-				 page_size);
-		pa_num += aligned_size / page_size;
+	segments = kvmalloc_array(segment_nr, sizeof(*segments), GFP_KERNEL);
+	if (!segments) {
+		err = -ENOMEM;
+		goto free_maps;
 	}
-
-	pa_list = kvmalloc(pa_num * sizeof(*pa_list), GFP_KERNEL);
+	pa_list = kvmalloc_array(max_pa_num, sizeof(*pa_list), GFP_KERNEL);
 	if (!pa_list) {
-		return -ENOMEM;
-	}
-	addr_off = kvmalloc(pa_num * sizeof(*addr_off), GFP_KERNEL);
-	if (!addr_off) {
-		kvfree(pa_list);
-		return -ENOMEM;
-	}
-	ret_size = kvmalloc(pa_num * sizeof(*ret_size), GFP_KERNEL);
-	if (!ret_size) {
-		kvfree(pa_list);
-		kvfree(addr_off);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto free_segments;
 	}
 
-	pa_num = 0;
-	for (i = 0; i < desc->count; i++) {
-		aligned_addr = round_down(desc->addr[i], page_size);
-		aligned_size =
-			round_up((desc->addr[i] - aligned_addr + desc->size[i]),
-				 page_size);
-		pa_num += aligned_size / page_size;
+	for (i = 0; i < iov_nr; i++) {
+		u64 remaining = iov[i].size;
+		u64 offset = iov[i].addr - maps[i].aligned_addr;
+		unsigned int j;
 
-		err = devmm_get_mem_pa_list(
-			&pid, aligned_addr, aligned_size,
-			pa_list + (pa_num - aligned_size / page_size),
-			aligned_size / page_size);
+		err = devmm_get_mem_pa_list(&pid, maps[i].aligned_addr,
+					    maps[i].aligned_size, pa_list,
+					    maps[i].pa_num);
 		if (err) {
-			printk(KERN_ERR
-			       "Failed to get PA list for batch %d, err %d\n",
+			pr_err("p2p: failed to get PA list for iov %u, err %d\n",
 			       i, err);
-			kvfree(pa_list);
-			kvfree(addr_off);
-			kvfree(ret_size);
-			return err;
+			goto free_pa_list;
 		}
-		devmm_put_mem_pa_list(
-			&pid, aligned_addr, aligned_size,
-			pa_list + (pa_num - aligned_size / page_size),
-			aligned_size / page_size);
-		j = pa_num - (aligned_size / page_size);
-		addr_off[j] = desc->addr[i] - aligned_addr;
-		ret_size[j] = min_t(int, desc->size[i],
-				    page_size - (desc->addr[i] - aligned_addr));
-		j++;
-		tail = (desc->addr[i] - aligned_addr + desc->size[i]) %
-		       page_size;
-		while (j < pa_num) {
-			addr_off[j] = 0;
-			ret_size[j] = page_size;
-			if (j == pa_num - 1) {
-				ret_size[j] = tail ? tail : page_size;
+
+		for (j = 0; j < maps[i].pa_num; j++) {
+			u64 len = min_t(u64, remaining,
+					    maps[i].page_size - offset);
+			u64 end;
+
+			if (check_add_overflow(pa_list[j], offset,
+					       &segments[segment_idx].addr)) {
+				err = -EOVERFLOW;
+				break;
 			}
-			j++;
+			segments[segment_idx].len = len;
+			if (!len ||
+			    ((segments[segment_idx].addr | len) &
+			     (SECTOR_SIZE - 1)) ||
+			    check_add_overflow(segments[segment_idx].addr, len,
+					       &end)) {
+				err = -EINVAL;
+				break;
+			}
+			segment_idx++;
+			remaining -= len;
+			offset = 0;
+		}
+
+		devmm_put_mem_pa_list(&pid, maps[i].aligned_addr,
+					  maps[i].aligned_size, pa_list,
+					  maps[i].pa_num);
+		if (err)
+			goto free_pa_list;
+		if (remaining) {
+			err = -EINVAL;
+			goto free_pa_list;
 		}
 	}
 
-	*_pa_list = pa_list;
-	*_pa_num = pa_num;
-	*_pa_size = page_size;
-	*_addr_off = addr_off;
-	*_ret_size = ret_size;
-
+	kvfree(pa_list);
+	kvfree(maps);
+	*_segments = segments;
+	*_segment_nr = segment_nr;
 	return 0;
-}
 
-static int dump_pa(void __user *arg)
-{
-	struct va_desc desc;
-	u64 *pa_list;
-	unsigned int pa_num, pa_size;
-	int err;
-
-	if (copy_from_user(&desc, arg, sizeof(desc))) {
-		return -EFAULT;
-	}
-
-	err = get_pa_list(&desc, &pa_list, &pa_num, &pa_size);
-	if (err) {
-		return err;
-	}
-
-	kfree(pa_list);
-	return 0;
+free_pa_list:
+	kvfree(pa_list);
+free_segments:
+	kvfree(segments);
+free_maps:
+	kvfree(maps);
+	return err;
 }
 
 static void free_io_ctx(struct p2p_io_context *io_ctx)
 {
 	kvfree(io_ctx->cmd_list);
-	kvfree(io_ctx->pa_list);
+	kvfree(io_ctx->pa_segments);
 	fput(io_ctx->file);
 	kfree(io_ctx);
 }
@@ -382,27 +341,31 @@ static inline unsigned int p2p_queue_max_sectors(struct block_device *bdev)
 }
 
 static struct p2p_io_context *new_io_ctx(struct block_device *bdev,
-					 struct file *file,
-					 const struct read_desc *desc,
-					 u64 *pa_list, unsigned int pa_num,
-					 unsigned int pa_size,
-					 u64 data_size)
+					 struct file *file, unsigned int nsid,
+					 struct p2p_pa_segment *pa_segments,
+					 unsigned int pa_num, u64 data_size,
+					 unsigned int ext_nr)
 {
 	struct p2p_io_context *io_ctx;
 	unsigned int max_sectors;
 	unsigned int max_bytes;
-	unsigned int nr;
+	u64 count;
 
 	max_sectors = p2p_queue_max_sectors(bdev);
+	if (!max_sectors)
+		return ERR_PTR(-EINVAL);
 	max_bytes = max_sectors << SECTOR_SHIFT;
-	nr = round_up(data_size, max_bytes) / max_bytes * 10;
+	count = DIV_ROUND_UP_ULL(data_size, max_bytes);
+	if (check_add_overflow(count, (u64)ext_nr, &count) ||
+	    check_add_overflow(count, (u64)pa_num, &count) ||
+	    count > UINT_MAX)
+		return ERR_PTR(-E2BIG);
 
 	io_ctx = kzalloc(sizeof(*io_ctx), GFP_KERNEL);
 	if (!io_ctx)
 		return ERR_PTR(-ENOMEM);
 
-	io_ctx->cmd_list =
-		kvmalloc_array(nr, sizeof(*io_ctx->cmd_list), GFP_KERNEL);
+	io_ctx->cmd_list = kvcalloc(count, sizeof(*io_ctx->cmd_list), GFP_KERNEL);
 	if (!io_ctx->cmd_list) {
 		kfree(io_ctx);
 		return ERR_PTR(-ENOMEM);
@@ -410,55 +373,12 @@ static struct p2p_io_context *new_io_ctx(struct block_device *bdev,
 
 	io_ctx->bdev = bdev;
 	io_ctx->file = file;
-	io_ctx->nsid = desc->nsid;
+	io_ctx->nsid = nsid;
 	io_ctx->pa_num = pa_num;
-	io_ctx->pa_list = pa_list;
-	io_ctx->pa_size = pa_size;
+	io_ctx->pa_segments = pa_segments;
 	io_ctx->data_size = data_size;
 	io_ctx->max_sectors = max_sectors;
-	io_ctx->count = nr;
-
-	atomic_set(&io_ctx->io_ref, 1);
-	INIT_LIST_HEAD(&io_ctx->io_list);
-	init_completion(&io_ctx->io_done);
-
-	return io_ctx;
-}
-
-static struct p2p_io_context *
-new_io_ctx_batch(struct block_device *bdev, struct file *file,
-		 const struct read_desc_ba *desc,
-		 u64 *pa_list, unsigned int pa_num, unsigned int pa_size,
-		 u64 data_size)
-{
-	struct p2p_io_context *io_ctx;
-	unsigned int max_sectors;
-	unsigned int max_bytes;
-	unsigned int count;
-
-	max_sectors = p2p_queue_max_sectors(bdev);
-	max_bytes = max_sectors << SECTOR_SHIFT;
-	count = round_up(data_size, max_sectors) / max_sectors * 10;
-
-	io_ctx = kzalloc(sizeof(*io_ctx), GFP_KERNEL);
-	if (!io_ctx)
-		return ERR_PTR(-ENOMEM);
-
-	io_ctx->bdev = bdev;
-	io_ctx->file = file;
-	io_ctx->nsid = desc->nsid;
-	io_ctx->pa_num = pa_num;
-	io_ctx->pa_list = pa_list;
-	io_ctx->pa_size = pa_size;
-	io_ctx->max_sectors = max_sectors;
-	io_ctx->cmd_list =
-		kvmalloc_array(count, sizeof(struct nvme_command), GFP_KERNEL);
-	if (!io_ctx->cmd_list) {
-		kfree(io_ctx);
-		return ERR_PTR(-ENOMEM);
-	}
 	io_ctx->start_time = ktime_get_ns();
-	io_ctx->data_size = data_size;
 	io_ctx->count = count;
 
 	atomic_set(&io_ctx->io_ref, 1);
@@ -633,12 +553,14 @@ static int do_read_io(struct p2p_io_context *io_ctx, unsigned long long sector,
 	struct gendisk *disk = io_ctx->bdev->bd_disk;
 	struct request_queue *queue = disk->queue;
 	struct request *req;
-	struct nvme_command *cmd = &io_ctx->cmd_list[io_ctx->cmd_id];
+	struct nvme_command *cmd;
+
 	if (io_ctx->cmd_id >= io_ctx->count) {
 		pr_err("cmd_id %u >= count %u\n", io_ctx->cmd_id,
 		       io_ctx->count);
 		return -EINVAL;
 	}
+	cmd = &io_ctx->cmd_list[io_ctx->cmd_id];
 
 	pr_debug("read from blk 0x%x0x%llx to pa 0x%llx\n", sector_nr, sector,
 		 paddr);
@@ -653,7 +575,6 @@ static int do_read_io(struct p2p_io_context *io_ctx, unsigned long long sector,
 	cmd->rw.dptr.sgl.addr = cpu_to_le64(paddr);
 	cmd->rw.dptr.sgl.length = cpu_to_le32(sector_nr << SECTOR_SHIFT);
 	cmd->rw.dptr.sgl.type = NVME_SGL_FMT_DATA_DESC << 4;
-	io_ctx->cmd_id++;
 
 	req = blk_mq_alloc_request(queue, REQ_OP_DRV_IN, 0);
 	if (IS_ERR(req)) {
@@ -666,163 +587,95 @@ static int do_read_io(struct p2p_io_context *io_ctx, unsigned long long sector,
 	req->end_io_data = io_ctx;
 	req->end_io = end_read_io;
 	atomic_inc(&io_ctx->io_ref);
+	io_ctx->cmd_id++;
 
 	blk_execute_rq_nowait(req, true);
 
 	return 0;
 }
 
-static unsigned int cur_pa_remain_sector(struct p2p_io_context *io_ctx)
+static u64 cur_pa_remain_sector(struct p2p_io_context *io_ctx)
 {
 	if (io_ctx->pa_idx >= io_ctx->pa_num) {
 		pr_warn("bad pa_idx %d >= pa_num %d\n", io_ctx->pa_idx,
 			io_ctx->pa_num);
 		return 0;
 	}
-	return (io_ctx->pa_size - io_ctx->pa_offset) >> SECTOR_SHIFT;
+	return (io_ctx->pa_segments[io_ctx->pa_idx].len -
+		io_ctx->pa_offset) >> SECTOR_SHIFT;
 }
 
 static unsigned long long cur_pa(struct p2p_io_context *io_ctx)
 {
-	return io_ctx->pa_list[io_ctx->pa_idx] + io_ctx->pa_offset;
+	return io_ctx->pa_segments[io_ctx->pa_idx].addr + io_ctx->pa_offset;
 }
 
-static void cur_pa_advance_sector(struct p2p_io_context *io_ctx,
-				  unsigned int sector)
+static int cur_pa_advance_sector(struct p2p_io_context *io_ctx,
+				 unsigned int sector)
 {
-	io_ctx->pa_offset += (sector << SECTOR_SHIFT);
-	if (io_ctx->pa_offset >= io_ctx->pa_size) {
-		if (io_ctx->pa_offset > io_ctx->pa_size) {
-			pr_warn("bad pa_offset %u > pa_size %u\n",
-				io_ctx->pa_offset, io_ctx->pa_size);
-		}
+	u64 len;
+
+	if (io_ctx->pa_idx >= io_ctx->pa_num)
+		return -EINVAL;
+	len = io_ctx->pa_segments[io_ctx->pa_idx].len;
+	io_ctx->pa_offset += (u64)sector << SECTOR_SHIFT;
+	if (io_ctx->pa_offset > len) {
+		pr_warn("bad pa_offset %llu > segment len %llu\n",
+			io_ctx->pa_offset, len);
+		return -EINVAL;
+	}
+	if (io_ctx->pa_offset == len) {
 		io_ctx->pa_offset = 0;
 		io_ctx->pa_idx++;
 	}
+	return 0;
 }
 
 static unsigned int calc_read_size(struct p2p_io_context *io_ctx,
-				   unsigned int left)
+				   u64 extent_left, u64 total_left)
 {
-	unsigned int limit = io_ctx->max_sectors;
-	unsigned int to_read = left;
-	unsigned int pa_left;
+	u64 to_read = min(extent_left, total_left);
+	u64 pa_left;
 
-	if (to_read > limit)
-		to_read = limit;
-
+	to_read = min_t(u64, to_read, io_ctx->max_sectors);
 	pa_left = cur_pa_remain_sector(io_ctx);
-	if (to_read > pa_left)
-		to_read = pa_left;
+	to_read = min(to_read, pa_left);
 	return to_read;
 }
 
 static int do_read_ios(struct p2p_io_context *io_ctx,
 		       struct fiemap_extent *extents, unsigned int nr)
 {
+	u64 total_left = io_ctx->data_size >> SECTOR_SHIFT;
 	unsigned int i;
 	int err = 0;
 
-	for (i = 0; i < nr; i++) {
+	for (i = 0; i < nr && total_left; i++) {
 		unsigned long long sector = extents[i].fe_physical >>
 					    SECTOR_SHIFT;
-		unsigned int left = extents[i].fe_length >> SECTOR_SHIFT;
+		u64 left = extents[i].fe_length >> SECTOR_SHIFT;
 		unsigned int to_read;
-		int err;
 
-		while (left > 0) {
-			to_read = calc_read_size(io_ctx, left);
+		while (left > 0 && total_left) {
+			to_read = calc_read_size(io_ctx, left, total_left);
 			if (!to_read) {
 				err = -EINVAL;
-				break;
+				goto out;
 			}
 			err = do_read_io(io_ctx, sector, to_read,
 					 cur_pa(io_ctx));
-			if (err) {
+			if (err)
 				goto out;
-			}
 			sector += to_read;
 			left -= to_read;
-			cur_pa_advance_sector(io_ctx, to_read);
-		}
-	}
-
-out:
-	return err;
-}
-
-static int do_read_ios_batch(struct p2p_io_context *io_ctx,
-			     struct fiemap_extent *extents, unsigned int nr,
-			     int *addr_off, int *align_size)
-{
-	unsigned int i;
-	int err = 0;
-	unsigned long long count = 0;
-	unsigned long long size = align_size[0] >> SECTOR_SHIFT;
-	int idx = 0;
-	io_ctx->pa_offset = addr_off[0];
-
-	for (i = 0; i < nr; i++) {
-		unsigned long long sector = extents[i].fe_physical >>
-					    SECTOR_SHIFT;
-		unsigned int left = extents[i].fe_length >> SECTOR_SHIFT;
-		unsigned int to_read;
-		int err;
-
-		while (left > 0) {
-			to_read = calc_read_size(io_ctx, left);
-			if (!to_read) {
-				err = -EINVAL;
-				break;
-			}
-
-			if (count + to_read > size) {
-				to_read = size - count;
-				err = do_read_io(io_ctx, sector, to_read,
-						 cur_pa(io_ctx));
-				if (err) {
-					goto out;
-				}
-				io_ctx->pa_idx++;
-				idx++;
-				if (idx >= io_ctx->pa_num) {
-					pr_err("batch VA boundary overrun: idx %u >= pa_num %u\n",
-					       idx, io_ctx->pa_num);
-					err = -EINVAL;
-					goto out;
-				}
-				io_ctx->pa_offset = addr_off[idx];
-				size = align_size[idx] >> SECTOR_SHIFT;
-				count = 0;
-				sector += to_read;
-				left -= to_read;
-				continue;
-			}
-
-			err = do_read_io(io_ctx, sector, to_read,
-					 cur_pa(io_ctx));
-			if (err) {
+			total_left -= to_read;
+			err = cur_pa_advance_sector(io_ctx, to_read);
+			if (err)
 				goto out;
-			}
-			sector += to_read;
-			left -= to_read;
-			count += to_read;
-			if (count >= size) {
-				io_ctx->pa_idx++;
-				idx++;
-				if (idx >= io_ctx->pa_num) {
-					pr_err("batch VA boundary overrun: idx %u >= pa_num %u\n",
-					       idx, io_ctx->pa_num);
-					err = -EINVAL;
-					goto out;
-				}
-				io_ctx->pa_offset = addr_off[idx];
-				size = align_size[idx] >> SECTOR_SHIFT;
-				count = 0;
-			} else
-				cur_pa_advance_sector(io_ctx, to_read);
 		}
 	}
+	if (total_left)
+		err = -EINVAL;
 
 out:
 	return err;
@@ -836,16 +689,43 @@ static int wait_io_done(struct p2p_io_context *io_ctx)
 	return io_ctx->io_err;
 }
 
-static unsigned long long calc_data_size(struct fiemap_extent *extents,
-					 unsigned int nr)
+static int validate_read_data(const struct p2p_iov *iov, unsigned int iov_nr,
+			      const struct fiemap_extent *extents,
+			      unsigned int ext_nr, u64 *data_size)
 {
+	u64 extent_size = 0;
+	u64 iov_size = 0;
 	unsigned int i;
-	unsigned long long size = 0;
 
-	for (i = 0; i < nr; i++) {
-		size += extents[i].fe_length;
+	for (i = 0; i < iov_nr; i++) {
+		u64 end;
+
+		if (!iov[i].size ||
+		    ((iov[i].addr | iov[i].size) & (SECTOR_SIZE - 1)) ||
+		    check_add_overflow((u64)iov[i].addr, (u64)iov[i].size,
+				       &end) ||
+		    check_add_overflow(iov_size, (u64)iov[i].size,
+				       &iov_size))
+			return -EINVAL;
 	}
-	return size;
+
+	for (i = 0; i < ext_nr; i++) {
+		u64 end;
+
+		if (!extents[i].fe_length ||
+		    ((extents[i].fe_physical | extents[i].fe_length) &
+		     (SECTOR_SIZE - 1)) ||
+		    check_add_overflow(extents[i].fe_physical,
+				       extents[i].fe_length, &end) ||
+		    check_add_overflow(extent_size, extents[i].fe_length,
+				       &extent_size))
+			return -EINVAL;
+	}
+
+	if (extent_size < iov_size)
+		return -E2BIG;
+	*data_size = iov_size;
+	return 0;
 }
 
 static struct block_device *p2p_bdev_from_file(struct file *file)
@@ -904,90 +784,95 @@ static int p2p_validate_nvme_bdev(struct block_device *bdev)
 
 static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 {
-	struct read_desc __user *user_desc = arg;
+	struct p2p_read_param __user *user_param = arg;
+	struct p2p_pa_segment *pa_segments = NULL;
+	struct p2p_read_param param;
 	struct fiemap_extent *extents;
-	struct read_desc desc;
-	struct file *reg_file;
+	struct p2p_iov *iov;
+	struct file *reg_file = NULL;
 	struct block_device *bdev;
 	struct p2p_io_context *io_ctx;
-	u64 *pa_list;
 	u64 data_size;
 	unsigned int pa_num;
-	unsigned int pa_size;
-	unsigned int ext_num;
 	int err;
-	int addr_off;
 
-	if (copy_from_user(&desc, user_desc, sizeof(desc))) {
+	if (copy_from_user(&param, user_param, sizeof(param)))
 		return -EFAULT;
+	if (!param.nsid || param.host_pid <= 0 || !param.iov_nr ||
+	    param.iov_nr > P2P_MAX_IOV || !param.ext_nr ||
+	    param.ext_nr > P2P_MAX_EXTENTS)
+		return -EINVAL;
+
+	iov = kvmalloc_array(param.iov_nr, sizeof(*iov), GFP_KERNEL);
+	if (!iov)
+		return -ENOMEM;
+	if (copy_from_user(iov,
+			   (__force void __user *)(uintptr_t)param.iov,
+			   array_size(param.iov_nr, sizeof(*iov)))) {
+		err = -EFAULT;
+		goto free_iov;
 	}
 
-	err = get_pa_list(&desc.desc, &pa_list, &pa_num, &pa_size);
-	if (err) {
-		return err;
+	extents = kvmalloc_array(param.ext_nr, sizeof(*extents), GFP_KERNEL);
+	if (!extents) {
+		err = -ENOMEM;
+		goto free_iov;
 	}
-	addr_off = err;
+	if (copy_from_user(extents, user_param->extents,
+			   array_size(param.ext_nr, sizeof(*extents)))) {
+		err = -EFAULT;
+		goto free_extents;
+	}
 
-	reg_file = fget(desc.file_fd);
+	err = validate_read_data(iov, param.iov_nr, extents, param.ext_nr,
+				 &data_size);
+	if (err)
+		goto free_extents;
+
+	reg_file = fget(param.file_fd);
 	if (!reg_file) {
 		err = -EBADF;
-		goto free_pa_out;
+		goto free_extents;
 	}
-
 	bdev = p2p_bdev_from_file(reg_file);
 	if (IS_ERR(bdev)) {
 		err = PTR_ERR(bdev);
-		goto put_reg_file_out;
+		goto put_reg_file;
 	}
-
 	err = p2p_validate_nvme_bdev(bdev);
 	if (err)
-		goto put_reg_file_out;
+		goto put_reg_file;
 
-	ext_num = desc.ext_num;
-	extents = kvmalloc(ext_num * sizeof(*extents), GFP_KERNEL);
-	if (!extents) {
-		err = -ENOMEM;
-		goto put_reg_file_out;
-	}
-	if (copy_from_user(extents, user_desc->extents,
-			   ext_num * sizeof(*extents))) {
-		err = -EFAULT;
-		goto free_ext_out;
-	}
+	err = get_pa_segments(param.host_pid, iov, param.iov_nr,
+			      &pa_segments, &pa_num);
+	if (err)
+		goto put_reg_file;
 
-	data_size = calc_data_size(extents, ext_num);
-	if (data_size > (unsigned long long)pa_size * pa_num) {
-		pr_err("data_size %llu > pa_size %u * pa_num %u\n", data_size,
-		       pa_size, pa_num);
-		err = -E2BIG;
-		goto free_ext_out;
-	}
-
-	io_ctx = new_io_ctx(bdev, reg_file, &desc, pa_list, pa_num, pa_size,
-			    data_size);
+	io_ctx = new_io_ctx(bdev, reg_file, param.nsid, pa_segments, pa_num,
+			    data_size, param.ext_nr);
 	if (IS_ERR(io_ctx)) {
 		err = PTR_ERR(io_ctx);
-		goto free_ext_out;
+		goto free_pa_segments;
 	}
 	reg_file = NULL;
-	pa_list = NULL;
-	io_ctx->pa_offset = addr_off;
+	pa_segments = NULL;
 
-	io_ctx->issue_err = do_read_ios(io_ctx, extents, ext_num);
+	io_ctx->issue_err = do_read_ios(io_ctx, extents, param.ext_nr);
 
 	spin_lock(&batch_lock);
 	batch->io_cnt++;
 	list_add_tail(&io_ctx->io_list, &batch->io_list);
 	spin_unlock(&batch_lock);
 
-free_ext_out:
-	kvfree(extents);
-put_reg_file_out:
+free_pa_segments:
+	kvfree(pa_segments);
+put_reg_file:
 	if (reg_file)
 		fput(reg_file);
-free_pa_out:
-	kvfree(pa_list);
+free_extents:
+	kvfree(extents);
+free_iov:
+	kvfree(iov);
 	return err;
 }
 
@@ -997,6 +882,7 @@ static int p2p_drain_read(struct p2p_batch *batch)
 	unsigned int total_cnt;
 	unsigned int got_cnt;
 	unsigned int err_cnt;
+	int first_err = 0;
 	LIST_HEAD(tmp);
 
 	if (!READ_ONCE(batch->io_cnt))
@@ -1023,17 +909,20 @@ static int p2p_drain_read(struct p2p_batch *batch)
 		if (io_err && !err) {
 			pr_err("got io err %d %d %d\n", io_err,
 			       blk_status_to_errno(io_err), io_ctx->nsid);
-			err = io_err;
+			err = blk_status_to_errno(io_err);
 		}
 
 		if (!err)
-			dump_pa_content(io_ctx->pa_list[0],
-					min_t(unsigned int, io_ctx->data_size,
-					      io_ctx->pa_size));
-		else
+			dump_pa_content(io_ctx->pa_segments[0].addr,
+					min_t(u64, io_ctx->data_size,
+					      io_ctx->pa_segments[0].len));
+		else {
 			err_cnt++;
+			if (!first_err)
+				first_err = err;
+		}
 
-		if (io_ctx->cmd_id != 0) {
+		if (!err && io_ctx->cmd_id != 0) {
 			g_time += (io_ctx->end_time - io_ctx->start_time);
 			g_size += io_ctx->data_size;
 			g_count++;
@@ -1045,7 +934,7 @@ static int p2p_drain_read(struct p2p_batch *batch)
 		free_io_ctx(io_ctx);
 	}
 
-	if (g_count >= 1000) {
+	if (g_count >= 1000 && g_time) {
 		pr_info("end drain %d read got cnt %d/%d/%llu io %llu/%llu bandwidth %llu\n",
 			batch->batch_id, got_cnt, err_cnt, g_count, g_size,
 			g_time, g_size / g_time);
@@ -1053,128 +942,7 @@ static int p2p_drain_read(struct p2p_batch *batch)
 		g_size = 0;
 		g_count = 0;
 	}
-	return 0;
-}
-
-static int p2p_read_file_batch(struct p2p_batch *batch, void __user *arg)
-{
-	struct read_desc_ba __user *user_desc = arg;
-	struct fiemap_extent *extents;
-	unsigned long *kaddr, *kaddr1;
-	struct read_desc_ba desc;
-	struct file *reg_file;
-	struct block_device *bdev;
-	struct p2p_io_context *io_ctx;
-	u64 *pa_list;
-	u64 data_size;
-	unsigned int pa_num;
-	unsigned int pa_size;
-	unsigned int ext_num;
-	int err;
-	int *addr_off;
-	int *align_size;
-
-	if (copy_from_user(&desc, user_desc, sizeof(desc))) {
-		return -EFAULT;
-	}
-	kaddr = kvmalloc(desc.desc.count * sizeof(unsigned long), GFP_KERNEL);
-	if (!kaddr)
-		return -ENOMEM;
-	if (copy_from_user(kaddr,
-			   (__force void __user *)(uintptr_t)desc.desc.addr,
-			   desc.desc.count * sizeof(unsigned long))) {
-		err = -EFAULT;
-		goto free_kaddr_out;
-	}
-	desc.desc.addr = kaddr;
-
-	kaddr1 = kvmalloc(desc.desc.count * sizeof(unsigned long), GFP_KERNEL);
-	if (!kaddr1) {
-		err = -ENOMEM;
-		goto free_kaddr_out;
-	}
-	if (copy_from_user(kaddr1,
-			   (__force void __user *)(uintptr_t)desc.desc.size,
-			   desc.desc.count * sizeof(unsigned long))) {
-		err = -EFAULT;
-		goto free_kaddr1_out;
-	}
-	desc.desc.size = kaddr1;
-
-	err = get_pa_list_batch(&desc.desc, &pa_list, &pa_num, &pa_size,
-				&addr_off, &align_size);
-	if (err) {
-		err = -EFAULT;
-		goto free_kaddr1_out;
-	}
-
-	reg_file = fget(desc.file_fd);
-	if (!reg_file) {
-		err = -EBADF;
-		goto free_pa_out;
-	}
-
-	bdev = p2p_bdev_from_file(reg_file);
-	if (IS_ERR(bdev)) {
-		err = PTR_ERR(bdev);
-		goto put_reg_file_out;
-	}
-
-	err = p2p_validate_nvme_bdev(bdev);
-	if (err)
-		goto put_reg_file_out;
-
-	ext_num = desc.ext_num;
-	extents = kvmalloc(ext_num * sizeof(*extents), GFP_KERNEL);
-	if (!extents) {
-		err = -ENOMEM;
-		goto put_reg_file_out;
-	}
-	if (copy_from_user(extents, user_desc->extents,
-			   ext_num * sizeof(*extents))) {
-		err = -EFAULT;
-		goto free_ext_out;
-	}
-
-	data_size = calc_data_size(extents, ext_num);
-	if (data_size > (unsigned long long)pa_size * pa_num) {
-		pr_err("data_size %llu > pa_size %u * pa_num %u\n", data_size,
-		       pa_size, pa_num);
-		err = -E2BIG;
-		goto free_ext_out;
-	}
-
-	io_ctx = new_io_ctx_batch(bdev, reg_file, &desc, pa_list, pa_num,
-				  pa_size, data_size);
-	if (IS_ERR(io_ctx)) {
-		err = PTR_ERR(io_ctx);
-		goto free_ext_out;
-	}
-	reg_file = NULL;
-	pa_list = NULL;
-
-	io_ctx->issue_err = do_read_ios_batch(io_ctx, extents, ext_num,
-					      addr_off, align_size);
-
-	spin_lock(&batch_lock);
-	batch->io_cnt++;
-	list_add_tail(&io_ctx->io_list, &batch->io_list);
-	spin_unlock(&batch_lock);
-
-free_ext_out:
-	kvfree(extents);
-put_reg_file_out:
-	if (reg_file)
-		fput(reg_file);
-free_pa_out:
-	kvfree(pa_list);
-	kvfree(addr_off);
-	kvfree(align_size);
-free_kaddr1_out:
-	kvfree(kaddr1);
-free_kaddr_out:
-	kvfree(kaddr);
-	return err;
+	return first_err;
 }
 
 static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -1183,14 +951,9 @@ static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	int err = 0;
 
 	switch (cmd) {
-	case IOCTL_DUMP_PA:
-		err = dump_pa((void __user *)arg);
-		break;
 	case IOCTL_READ_FILE:
-		err = p2p_read_file(batch, (void __user *)arg);
-		break;
 	case IOCTL_READ_FILE_BATCH:
-		err = p2p_read_file_batch(batch, (void __user *)arg);
+		err = p2p_read_file(batch, (void __user *)arg);
 		break;
 	case IOCTL_DRAIN_READ:
 		err = p2p_drain_read(batch);

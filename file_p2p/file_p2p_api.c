@@ -9,6 +9,7 @@
 #include <time.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdint.h>
 
 #include <linux/fiemap.h>
 #include <linux/fs.h>
@@ -46,7 +47,7 @@ int new_p2p_fd(void)
 		err = -errno;
 		fprintf(stderr, "open /dev/p2p_device failed, errno: %d\n",
 			err);
-		return -err;
+		return err;
 	}
 
 	return dev_fd;
@@ -238,17 +239,50 @@ static int prepare_read_extents(int file_fd, const struct stat *file_stat,
 	return 0;
 }
 
-int read_file(int dev_fd, struct read_parameter *param)
+static int get_iov_size(const struct p2p_iov *iov, unsigned int iov_nr,
+			unsigned long *size_out)
 {
-	struct read_desc *read;
-	struct fiemap *exts;
+	unsigned long size = 0;
+	unsigned int i;
+
+	if (!iov || !iov_nr)
+		return -EINVAL;
+
+	for (i = 0; i < iov_nr; i++) {
+		if (!iov[i].size ||
+		    ((iov[i].addr | iov[i].size) &
+		     (FILE_P2P_SECTOR_SIZE - 1)) ||
+		    ULONG_MAX - iov[i].addr < iov[i].size ||
+		    ULONG_MAX - size < iov[i].size)
+			return -EINVAL;
+		size += iov[i].size;
+	}
+
+	*size_out = size;
+	return 0;
+}
+
+static int submit_read(int dev_fd, const struct read_parameter *param,
+		       unsigned long ioctl_cmd)
+{
+	struct p2p_read_param *read;
+	struct fiemap *exts = NULL;
 	struct stat file_stat;
-	unsigned long max_size;
-	unsigned long long total_size;
-	unsigned int ext_num;
+	unsigned long read_size;
+	unsigned long long total_size = 0;
+	size_t request_size;
+	unsigned int ext_num = 0;
 	const char *name;
 	int file_fd = -1;
 	int err = 0;
+
+	if (!param || !param->file_name)
+		return -EINVAL;
+	err = get_iov_size(param->iov, param->iov_nr, &read_size);
+	if (err)
+		return err;
+	if (ULONG_MAX - param->file_offset < read_size)
+		return -EOVERFLOW;
 
 	name = param->file_name;
 	file_fd = open(name, O_RDONLY);
@@ -265,42 +299,48 @@ int read_file(int dev_fd, struct read_parameter *param)
 		goto close_fds_out;
 	}
 
-	max_size = param->size;
-	err = prepare_read_extents(file_fd, &file_stat, param->bdev_offset,
-				   max_size, &exts, &ext_num, &total_size);
+	err = prepare_read_extents(file_fd, &file_stat, param->file_offset,
+				   read_size, &exts, &ext_num, &total_size);
 	if (err) {
 		fprintf(stderr, "prepare extents failed, errno: %d\n", err);
 		goto close_fds_out;
 	}
 
-	if (total_size > param->size) {
-		err = -EINVAL;
-		fprintf(stderr, "total_size %llu > param->size %u\n",
-			total_size, param->size);
+	if (!ext_num || total_size < read_size) {
+		err = -ENODATA;
+		fprintf(stderr, "extent size %llu < IOV size %lu\n", total_size,
+			read_size);
 		goto free_ext_out;
 	}
 
-	read = malloc(sizeof(*read) + ext_num * sizeof(read->extents[0]));
+	if (__builtin_mul_overflow((size_t)ext_num,
+				   sizeof(read->extents[0]), &request_size) ||
+	    __builtin_add_overflow(request_size, sizeof(*read),
+				   &request_size)) {
+		err = -E2BIG;
+		goto free_ext_out;
+	}
+	read = malloc(request_size);
 	if (read == NULL) {
 		err = -ENOMEM;
-		fprintf(stderr, "malloc read_desc failed, errno: %d\n", err);
+		fprintf(stderr, "malloc p2p_read_param failed, errno: %d\n", err);
 		goto free_ext_out;
 	}
 
-	read->desc.hostpid = getpid();
-	read->desc.addr = param->addr;
-	read->desc.size = param->size;
-	read->nsid = 1;
 	read->file_fd = file_fd;
-	read->ext_num = ext_num;
+	read->nsid = 1;
+	read->host_pid = getpid();
+	read->iov = param->iov;
+	read->iov_nr = param->iov_nr;
+	read->ext_nr = ext_num;
 	memcpy(read->extents, exts->fm_extents,
 	       ext_num * sizeof(read->extents[0]));
 
-	err = ioctl(dev_fd, IOCTL_READ_FILE, read);
+	err = ioctl(dev_fd, ioctl_cmd, read);
 	if (err < 0) {
 		err = -errno;
-		fprintf(stderr, "ioctl IOCTL_READ_FILE failed, errno: %d\n",
-			-err);
+		fprintf(stderr, "read ioctl 0x%lx failed, errno: %d\n",
+			ioctl_cmd, -err);
 		goto free_read_out;
 	}
 
@@ -315,97 +355,29 @@ close_fds_out:
 	return err;
 }
 
-int read_file_batch(int dev_fd, struct read_parameter *param, int param_num)
+int read_file(int dev_fd, struct read_parameter *param)
 {
-	struct read_desc_ba *read;
-	struct fiemap *exts;
-	struct stat file_stat;
-	unsigned long max_size;
-	unsigned long long total_size;
-	unsigned int ext_num;
-	const char *name;
-	int j;
-	int file_fd = -1;
-	int err = 0;
+	return submit_read(dev_fd, param, IOCTL_READ_FILE);
+}
 
-	name = param[0].file_name;
-	file_fd = open(name, O_RDONLY);
-	if (file_fd < 0) {
-		err = -errno;
-		fprintf(stderr, "open %s failed, errno: %d\n", name, err);
-		goto close_fds_out;
+int read_file_batch(int dev_fd, struct read_parameter *params, int param_num)
+{
+	int i;
+	int err;
+
+	if (!params || param_num <= 0)
+		return -EINVAL;
+	for (i = 0; i < param_num; i++) {
+		err = submit_read(dev_fd, &params[i], IOCTL_READ_FILE_BATCH);
+		if (err)
+			return err;
 	}
+	return 0;
+}
 
-	err = fstat(file_fd, &file_stat);
-	if (err < 0) {
-		err = -errno;
-		fprintf(stderr, "fstat %s failed, errno: %d\n", name, err);
-		goto close_fds_out;
-	}
-
-	max_size = (unsigned long)param[0].size * param_num;
-	err = prepare_read_extents(file_fd, &file_stat, param[0].bdev_offset,
-				   max_size, &exts, &ext_num, &total_size);
-	if (err) {
-		fprintf(stderr, "prepare extents failed, errno: %d\n", err);
-		goto close_fds_out;
-	}
-
-	if (total_size > max_size) {
-		err = -EINVAL;
-		fprintf(stderr, "total_size %llu > max_size %lu\n", total_size,
-			max_size);
-		goto free_ext_out;
-	}
-
-	read = calloc(1, sizeof(*read) + ext_num * sizeof(read->extents[0]));
-	if (read == NULL) {
-		err = -ENOMEM;
-		fprintf(stderr, "malloc read_desc failed, errno: %d\n", err);
-		goto free_ext_out;
-	}
-
-	read->desc.hostpid = getpid();
-	read->desc.count = param_num;
-	read->nsid = 1;
-	read->file_fd = file_fd;
-	read->ext_num = ext_num;
-	memcpy(read->extents, exts->fm_extents,
-	       ext_num * sizeof(read->extents[0]));
-
-	read->desc.addr = malloc(param_num * sizeof(unsigned long));
-	read->desc.size = malloc(param_num * sizeof(unsigned long));
-	if (read->desc.addr == NULL || read->desc.size == NULL) {
-		err = -ENOMEM;
-		fprintf(stderr, "malloc read_desc desc failed, errno: %d\n",
-			err);
-		goto free_read_out;
-	}
-	for (j = 0; j < param_num; j++) {
-		read->desc.addr[j] = param[j].addr;
-		read->desc.size[j] = param[j].size;
-	}
-
-	err = ioctl(dev_fd, IOCTL_READ_FILE_BATCH, read);
-	if (err < 0) {
-		err = -errno;
-		fprintf(stderr,
-			"ioctl IOCTL_READ_FILE_BATCH failed, errno: %d\n",
-			-err);
-		goto free_read_out;
-	}
-
-free_read_out:
-	if (read->desc.addr != NULL)
-		free(read->desc.addr);
-	if (read->desc.size != NULL)
-		free(read->desc.size);
-	free(read);
-free_ext_out:
-	free(exts);
-close_fds_out:
-	if (file_fd >= 0)
-		close(file_fd);
-
-	return err;
+int drain_read(int dev_fd)
+{
+	if (ioctl(dev_fd, IOCTL_DRAIN_READ) < 0)
+		return -errno;
+	return 0;
 }
