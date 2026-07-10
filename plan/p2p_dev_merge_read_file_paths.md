@@ -99,14 +99,13 @@ Implement one `p2p_read_file()` handler that:
 Return the real translation or validation errno. Do not convert every
 `get_pa_list` failure to `-EFAULT` as the old batch handler does.
 
-### 2. Flatten IOVs into exact PA segments
+### 2. Flatten IOVs into exact PA IOVs
 
 Replace `get_pa_list()` and `get_pa_list_batch()` with one helper that accepts
-`host_pid` plus the copied `p2p_iov[]` and returns kernel-only destination
-segments:
+`host_pid` plus the copied `p2p_iov[]` and returns kernel-only physical IOVs:
 
 ```c
-struct p2p_pa_segment {
+struct p2p_pa_iov {
 	u64 addr;
 	u64 len;
 };
@@ -123,8 +122,8 @@ For each IOV:
 The output contains no alignment padding. It therefore replaces `pa_list`,
 `pa_size`, `addr_off`, and `align_size`, supports the single-IOV case without a
 special branch, and does not require every IOV to use the same page size.
-Use overflow-checked page and segment counts, and make the I/O context own the
-completed segment array after successful construction.
+Use overflow-checked page and IOV counts, and make the I/O context own the
+completed PA IOV array after successful construction.
 
 ### 3. Use one I/O context constructor
 
@@ -137,7 +136,9 @@ segments.
 - Allocate `cmd_list` using an overflow-checked upper bound that accounts for
   source-extent boundaries, destination-segment boundaries, and
   `DIV_ROUND_UP(data_size, max_bytes)` splits.
-- Store and free the destination segment array in `p2p_io_context`.
+- Store and free the destination PA IOV array in `p2p_io_context`. Traversal
+  state remains local to `do_read_ios()` and is not retained for completion or
+  drain handling.
 - Check `cmd_id` against the allocated count before taking a pointer to
   `cmd_list[cmd_id]`.
 
@@ -147,8 +148,18 @@ constructor calculations.
 ### 4. Use one read-issuing state machine
 
 Replace `do_read_ios()` and `do_read_ios_batch()` with one extent loop and a
-destination PA-segment iterator. Keep the same three-stage shape as the current
-single-address path:
+local `p2p_iov_iter` over the destination PA IOVs. Model its API after the
+kernel iterator operations:
+
+- `p2p_iov_iter_init()` initializes the current IOV, offset, segment count, and
+  total remaining byte count.
+- `p2p_iov_iter_count()` returns the total bytes not yet submitted.
+- `p2p_iov_iter_addr()` returns the current physical address plus IOV offset.
+- `p2p_iov_iter_single_seg_count()` clips work to the current physically
+  contiguous IOV.
+- `p2p_iov_iter_advance()` consumes submitted bytes and crosses IOV boundaries.
+
+Keep the same three-stage shape as the current single-address path:
 
 1. Initialize the destination iterator at the first exact PA segment.
 2. Call `calc_read_size()` for each command. It returns the minimum of the
@@ -186,9 +197,10 @@ no `iov_nr == 1` implementation fork below request validation.
 
 Use one cleanup ladder with explicit ownership transfer:
 
-- The handler owns copied IOVs, extents, file reference, and PA segments while
+- The handler owns copied IOVs, extents, file reference, and PA IOVs while
   preparing the request.
-- The I/O context owns the file reference and PA segments after construction.
+- The I/O context owns the file reference and PA IOV allocation after
+  construction.
 - `free_io_ctx()` releases both exactly once after drain.
 
 ## Userspace Adaptation
@@ -239,7 +251,7 @@ construct this contract and remove references to the deleted `bdev_name`,
   `issue_err`.
 - Reject zero counts, zero-length or unaligned entries, arithmetic overflow,
   insufficient extent coverage, and invalid userspace pointers without leaking
-  a file reference, PA list, segment array, command list, or I/O context.
+  a file reference, PA list, PA IOV array, command list, or I/O context.
 
 ## Non-Goals
 
