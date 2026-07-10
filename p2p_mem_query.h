@@ -20,7 +20,7 @@ int devmm_get_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
 			  u64 size, u64 *pa_list, u32 pa_num);
 void devmm_put_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
 			   u64 size, u64 *pa_list, u32 pa_num);
-u32 devmm_get_mem_page_size(struct devmm_svm_process_id *process_id, u64 addr,
+int devmm_get_mem_page_size(struct devmm_svm_process_id *process_id, u64 addr,
 			    u64 size);
 
 #endif

@@ -27,7 +27,7 @@ void devmm_put_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
 }
 EXPORT_SYMBOL(devmm_put_mem_pa_list);
 
-u32 devmm_get_mem_page_size(struct devmm_svm_process_id *process_id, u64 addr,
+int devmm_get_mem_page_size(struct devmm_svm_process_id *process_id, u64 addr,
 			    u64 size)
 {
 	return (2 << 20);
