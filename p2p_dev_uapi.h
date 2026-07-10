@@ -4,22 +4,22 @@
 #include <linux/types.h>
 #include <linux/fiemap.h>
 
-struct va_desc {
-	int hostpid;
+struct p2p_iov {
 	unsigned long addr;
 	unsigned long size;
 };
 
-struct read_desc {
-	struct va_desc desc;
-	unsigned int nsid;
+struct p2p_read_param {
 	int file_fd;
-	unsigned int ext_num;
+	unsigned int nsid;
+	int host_pid;
+	struct p2p_iov *iov;
+	unsigned int iov_nr;
+	unsigned int ext_nr;
 	struct fiemap_extent extents[0];
 };
 
 struct va_desc_ba {
-	int hostpid;
 	unsigned long *addr;
 	unsigned long *size;
 	int count;
@@ -42,8 +42,8 @@ struct paddr_desc {
 };
 
 #define IOCTL_DUMP_PA _IOW('k', 1, struct va_desc)
-#define IOCTL_READ_FILE _IOWR('k', 2, struct read_desc)
-#define IOCTL_READ_FILE_BATCH _IOWR('k', 3, struct read_desc_ba)
+#define IOCTL_READ_FILE _IOWR('k', 2, struct p2p_read_param)
+#define IOCTL_READ_FILE_BATCH _IOWR('k', 3, struct p2p_read_param)
 #define IOCTL_DRAIN_READ _IOC(_IOC_READ, 'k', 4, 0)
 
 #endif

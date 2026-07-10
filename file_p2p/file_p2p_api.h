@@ -1,12 +1,13 @@
 #ifndef __FILE_P2P_API_H__
 #define __FILE_P2P_API_H__
 
+#include "p2p_dev_uapi.h"
+
 struct read_parameter {
 	const char *file_name;
-	const char *bdev_name;
-	unsigned long bdev_offset;
-	unsigned int size;
-	unsigned long addr;
+	unsigned long file_offset;
+	struct p2p_iov *iov;
+	unsigned int iov_nr;
 };
 
 int new_p2p_fd(void);
