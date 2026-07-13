@@ -13,6 +13,9 @@
 #include <linux/tracepoint.h>
 #include <linux/limits.h>
 #include <linux/overflow.h>
+#ifdef CALC_CRC32
+#include <linux/crc32.h>
+#endif
 
 #include <linux/nvme.h>
 #include <linux/blk_types.h>
@@ -643,6 +646,44 @@ static int wait_io_done(struct p2p_io_context *io_ctx)
 	return io_ctx->io_err;
 }
 
+#ifdef CALC_CRC32
+static void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
+{
+	u32 crc = ~0U;
+	unsigned int i;
+
+	/*
+	 * wait_io_done() observed NVMe DMA completion before this helper.
+	 * Order the following CPU reads from P2P memory after that completion.
+	 */
+	dma_rmb();
+
+	for (i = 0; i < io_ctx->pa_iov_nr; i++) {
+		const struct p2p_pa_iov *iov = &io_ctx->pa_iov[i];
+		void __iomem *addr;
+
+		addr = ioremap(iov->addr, iov->len);
+		if (!addr) {
+			pr_err("p2p: crc32 failed file=%pD length=0x%llx errno=%d\n",
+			       io_ctx->file, io_ctx->data_size, -ENOMEM);
+			return;
+		}
+
+		crc = crc32_le(crc, (__force const unsigned char *)addr,
+			       iov->len);
+		iounmap(addr);
+	}
+
+	crc ^= ~0U;
+	pr_info("p2p: crc32 file=%pD length=0x%llx crc32=%08x\n",
+		io_ctx->file, io_ctx->data_size, crc);
+}
+#else
+static void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
+{
+}
+#endif
+
 static int validate_read_data(const struct p2p_iov *iov, unsigned int iov_nr,
 			      const struct fiemap_extent *extents,
 			      unsigned int ext_nr, u64 *data_size)
@@ -839,12 +880,12 @@ static int p2p_drain_read(struct p2p_batch *batch)
 		}
 
 		if (!err) {
+			dump_io_ctx_crc32(io_ctx);
 			dump_pa_content(io_ctx->pa_iov[0].addr,
 					min_t(u64, io_ctx->data_size,
 					      io_ctx->pa_iov[0].len));
-		} else {
-			if (!first_err)
-				first_err = err;
+		} else if (!first_err) {
+			first_err = err;
 		}
 
 		list_del_init(&io_ctx->io_list);
