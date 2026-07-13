@@ -215,7 +215,7 @@ static int parse_devt(const char *text, dev_t *devt)
 	unsigned int dev_major;
 	unsigned int dev_minor;
 	char trailing;
-	int count;
+	int err;
 
 	if (sscanf(text, "%u:%u %c", &dev_major, &dev_minor, &trailing) != 2)
 		return -EINVAL;
@@ -223,8 +223,8 @@ static int parse_devt(const char *text, dev_t *devt)
 	if (major(*devt) != dev_major || minor(*devt) != dev_minor)
 		return -EINVAL;
 
-	count = validate_nvme_component(*devt);
-	return count;
+	err = validate_nvme_component(*devt);
+	return err;
 }
 
 static int parse_linear_params(const char *params, dev_t *devt,
@@ -354,18 +354,15 @@ static int discover_linear(dev_t top_dev, struct topo_user_cfg *cfg)
 		err = parse_linear_params(params, &component, &start_sector);
 		if (err)
 			goto out;
+		err = encode_dev(component, &entry->dev_id);
+		if (err)
+			goto out;
 		for (j = 0; j < i; j++) {
-			if (cfg->bdevs[j].dev_id ==
-			    ((__u32)(minor(component) & 0xffU) |
-			     (__u32)(major(component) << 8) |
-			     (__u32)((minor(component) & ~0xffU) << 12))) {
+			if (cfg->bdevs[j].dev_id == entry->dev_id) {
 				err = -EINVAL;
 				goto out;
 			}
 		}
-		err = encode_dev(component, &entry->dev_id);
-		if (err)
-			goto out;
 		entry->size_sector = spec->length;
 		entry->start_sector = start_sector;
 		if (__builtin_add_overflow(logical_end,
@@ -956,7 +953,7 @@ int read_file_batch(int dev_fd, struct read_parameter *params, int param_num)
 	if (!params || param_num <= 0)
 		return -EINVAL;
 	for (i = 0; i < param_num; i++) {
-		err = submit_read(dev_fd, &params[i], IOCTL_READ_FILE_BATCH);
+		err = submit_read(dev_fd, &params[i], IOCTL_READ_FILE);
 		if (err)
 			return err;
 	}
