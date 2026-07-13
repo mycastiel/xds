@@ -25,8 +25,7 @@
 #define FILE_P2P_SECTOR_SIZE 512U
 #define FILE_P2P_DEFAULT_BLOCK_SIZE 4096U
 #define FILE_P2P_DM_CONTROL "/dev/mapper/control"
-#define FILE_P2P_DM_BUFFER_MIN (16U << 10)
-#define FILE_P2P_DM_BUFFER_MAX (1U << 20)
+#define FILE_P2P_DM_BUFFER_SIZE (16U << 10)
 #define FILE_P2P_UNSUPPORTED_FIEMAP_FLAGS \
 	(FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC | \
 	 FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED | \
@@ -145,19 +144,8 @@ static int read_text(const char *path, char *buf, size_t size)
 		return err;
 	}
 	if ((size_t)got == size - 1) {
-		char extra;
-		ssize_t more;
-
-		more = read(fd, &extra, 1);
-		if (more > 0) {
-			close(fd);
-			return -E2BIG;
-		}
-		if (more < 0) {
-			err = -errno;
-			close(fd);
-			return err;
-		}
+		close(fd);
+		return -E2BIG;
 	}
 	close(fd);
 	buf[got] = '\0';
@@ -228,8 +216,8 @@ static int parse_linear_params(const char *params, dev_t *devt,
 
 static int dm_table_query(dev_t top_dev, void **buffer_out)
 {
-	size_t size = FILE_P2P_DM_BUFFER_MIN;
-	void *buffer = NULL;
+	struct dm_ioctl *dmi;
+	void *buffer;
 	int control_fd;
 	int err;
 
@@ -237,39 +225,29 @@ static int dm_table_query(dev_t top_dev, void **buffer_out)
 	if (control_fd < 0)
 		return -errno;
 
-	for (;;) {
-		struct dm_ioctl *dmi;
+	buffer = calloc(1, FILE_P2P_DM_BUFFER_SIZE);
+	if (!buffer) {
+		close(control_fd);
+		return -ENOMEM;
+	}
+	dmi = buffer;
+	dmi->version[0] = DM_VERSION_MAJOR;
+	/* DM_TABLE_STATUS has existed since interface version 4.0. */
+	dmi->version[1] = 0;
+	dmi->version[2] = 0;
+	dmi->data_size = FILE_P2P_DM_BUFFER_SIZE;
+	dmi->data_start = sizeof(*dmi);
+	dmi->flags = DM_STATUS_TABLE_FLAG;
+	dmi->dev = top_dev;
 
-		free(buffer);
-		buffer = calloc(1, size);
-		if (!buffer) {
-			err = -ENOMEM;
-			break;
-		}
-		dmi = buffer;
-		dmi->version[0] = DM_VERSION_MAJOR;
-		/* DM_TABLE_STATUS has existed since interface version 4.0. */
-		dmi->version[1] = 0;
-		dmi->version[2] = 0;
-		dmi->data_size = size;
-		dmi->data_start = sizeof(*dmi);
-		dmi->flags = DM_STATUS_TABLE_FLAG;
-		dmi->dev = top_dev;
-
-		if (ioctl(control_fd, DM_TABLE_STATUS, dmi) < 0) {
-			err = -errno;
-			break;
-		}
-		if (!(dmi->flags & DM_BUFFER_FULL_FLAG)) {
-			*buffer_out = buffer;
-			close(control_fd);
-			return 0;
-		}
-		if (size >= FILE_P2P_DM_BUFFER_MAX) {
-			err = -E2BIG;
-			break;
-		}
-		size <<= 1;
+	if (ioctl(control_fd, DM_TABLE_STATUS, dmi) < 0)
+		err = -errno;
+	else if (dmi->flags & DM_BUFFER_FULL_FLAG)
+		err = -E2BIG;
+	else {
+		*buffer_out = buffer;
+		close(control_fd);
+		return 0;
 	}
 
 	free(buffer);
@@ -586,7 +564,6 @@ static int discover_raid0(dev_t top_dev, struct topo_user_cfg *cfg)
 
 int add_topo(int dev_fd, const char *dev)
 {
-	struct topo_user_cfg *check = NULL;
 	struct topo_user_cfg *cfg = NULL;
 	struct stat st;
 	size_t cfg_size;
@@ -611,27 +588,18 @@ int add_topo(int dev_fd, const char *dev)
 	cfg_size = sizeof(*cfg) +
 		   P2P_TOPO_MAX_BDEVS * sizeof(cfg->bdevs[0]);
 	cfg = calloc(1, cfg_size);
-	check = calloc(1, cfg_size);
-	if (!cfg || !check) {
+	if (!cfg) {
 		err = -ENOMEM;
 		goto out;
 	}
 	err = discover(st.st_rdev, cfg);
 	if (err)
 		goto out;
-	err = discover(st.st_rdev, check);
-	if (err)
-		goto out;
-	if (memcmp(cfg, check, cfg_size)) {
-		err = -ESTALE;
-		goto out;
-	}
 	if (ioctl(dev_fd, IOCTL_ADD_TOPO, cfg) < 0)
 		err = -errno;
 	else
 		err = 0;
 out:
-	free(check);
 	free(cfg);
 	return err;
 }
