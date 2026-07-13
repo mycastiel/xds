@@ -519,9 +519,12 @@ library failures are returned as negative errno values.
 
 ### 9.1 dm-linear discovery
 
-Use libdevmapper's table-query interface: create a `DM_DEVICE_TABLE` task,
-select the device by major/minor, run the task, and iterate targets with
-`dm_get_next_target()`.
+Query the active table through the device-mapper ioctl UAPI in
+`<linux/dm-ioctl.h>`.  Open `/dev/mapper/control`, issue `DM_TABLE_STATUS` with
+`DM_STATUS_TABLE_FLAG` and the top device number, grow the result buffer when
+`DM_BUFFER_FULL_FLAG` is returned, and iterate the returned
+`dm_target_spec` records.  This discovery path has no build or runtime
+dependency on libdevmapper.
 
 Reject the table unless:
 
