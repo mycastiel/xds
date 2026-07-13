@@ -64,8 +64,9 @@ struct p2p_read_param {
 
 - Remove `va_desc`, `va_desc_ba`, `read_desc`, `read_desc_ba`, `paddr_desc`,
   `IOCTL_DUMP_PA`, and `dump_pa()` after the read users are converted.
-- Keep `IOCTL_READ_FILE` and `IOCTL_READ_FILE_BATCH` encoded with
-  `struct p2p_read_param`.
+- Keep `IOCTL_READ_FILE` encoded with `struct p2p_read_param`.  Remove the
+  redundant `IOCTL_READ_FILE_BATCH`; the userspace batch helper submits every
+  element through `IOCTL_READ_FILE`.
 - Treat this as the native-word-size ABI already established by `unsigned long`
   and the userspace pointer. Compat-ioctl support is outside this change.
 
@@ -189,11 +190,11 @@ created, enqueue it on `batch->io_list` even if submission stops partway, store
 the synchronous submission failure in `issue_err`, and let `drain_read` wait
 for already-issued commands before freeing the context.
 
-### 5. Merge ioctl dispatch and cleanup
+### 5. Simplify ioctl dispatch and cleanup
 
-Make `IOCTL_READ_FILE` and `IOCTL_READ_FILE_BATCH` share one switch body and call
-the same `p2p_read_file()` implementation. There must be no `is_batch` flag and
-no `iov_nr == 1` implementation fork below request validation.
+Use `IOCTL_READ_FILE` as the only read ioctl and call `p2p_read_file()` directly.
+There must be no `is_batch` flag and no `iov_nr == 1` implementation fork below
+request validation.
 
 Use one cleanup ladder with explicit ownership transfer:
 
@@ -216,8 +217,8 @@ internal submit helper:
   `p2p_read_param`.
 - `read_file()` submits one parameter with `IOCTL_READ_FILE`.
 - `read_file_batch()` iterates its parameter array and submits each parameter
-  with `IOCTL_READ_FILE_BATCH`; all resulting contexts remain asynchronous on
-  the same device fd and are collected by `drain_read()`.
+  with `IOCTL_READ_FILE`; all resulting contexts remain asynchronous on the
+  same device fd and are collected by `drain_read()`.
 
 Using several destination buffers for one contiguous file range no longer
 requires `read_file_batch()`; callers put those buffers in one parameter's IOV

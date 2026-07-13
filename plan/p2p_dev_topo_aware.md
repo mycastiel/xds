@@ -359,7 +359,12 @@ possible last put with concurrent insertion.  The final-pin release callback
 executes while protected by that spinlock and:
 
 1. deletes the topology from the radix tree; and
-2. drops the tree's initial `refcnt`.
+2. releases the spinlock.
+
+It then drops the tree's initial `refcnt` outside the spinlock.  The reference
+keeps the detached topology alive across this handoff.  A concurrent add may
+install a new topology for the same top device before the old reference is
+dropped; the two objects have independent lifetimes.
 
 An RCU reader that obtained the old tree pointer before removal may acquire a
 live reference and complete against that topology.  A reader that cannot
@@ -520,6 +525,14 @@ records the first issue-side error.  The I/O context remains on the batch list,
 and drain still waits for and frees all successfully submitted requests.  The
 topology reference is dropped immediately after the submission loop, including
 this partial-submission case.
+
+Drain takes a snapshot of the I/O contexts already published on the batch
+list.  Submission and drain ioctls may overlap: an I/O context published after
+the drain snapshot is not covered by that drain and is handled by a later
+drain or by final fd release.  Likewise, concurrent drains do not all wait for
+the same snapshot.  A caller that needs completion status or intends to reuse
+or unmap a destination physical-address range must serialize its final drain
+with submissions and other drains.
 
 ## 9. Userspace topology discovery
 
