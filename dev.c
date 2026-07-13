@@ -24,6 +24,7 @@
 
 #include "p2p_dev_uapi.h"
 #include "p2p_mem_query.h"
+#include "debugfs.h"
 #include "topo.h"
 
 #define P2P_NVME_MAX_RW_SECTORS ((1U << 20) >> SECTOR_SHIFT)
@@ -522,6 +523,7 @@ static enum rq_end_io_ret end_read_io(struct request *req, blk_status_t status)
 {
 	struct p2p_io_context *io_ctx = req->end_io_data;
 
+	p2p_stats_io_complete(status);
 	if (status)
 		cmpxchg(&io_ctx->io_err, 0, status);
 
@@ -567,6 +569,7 @@ static int do_read_io(struct p2p_io_context *io_ctx,
 	req->end_io_data = io_ctx;
 	req->end_io = end_read_io;
 	atomic_inc(&io_ctx->io_ref);
+	p2p_stats_io_issued((u64)sector_nr << SECTOR_SHIFT);
 
 	blk_execute_rq_nowait(req, true);
 
@@ -780,6 +783,8 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 	pa_iov = NULL;
 
 	io_ctx->issue_err = do_read_ios(io_ctx, topo, extents, param.ext_nr);
+	if (io_ctx->issue_err)
+		p2p_stats_io_issue_failed();
 	topo_put(topo);
 	topo = NULL;
 
@@ -920,10 +925,12 @@ static int __init p2p_drv_init(void)
 		goto exit_topo;
 	}
 
+	p2p_debugfs_init();
+
 	err = alloc_chrdev_region(&dev, 0, 1, "p2p_device");
 	if (err < 0) {
 		pr_err("p2p: cannot allocate major number err %d\n", err);
-		goto unregister_hook;
+		goto exit_debugfs;
 	}
 
 	pr_info("p2p: Major = %d Minor = %d \n", MAJOR(dev), MINOR(dev));
@@ -958,7 +965,8 @@ del_cdev:
 	cdev_del(&p2p_cdev);
 free_dev:
 	unregister_chrdev_region(dev, 1);
-unregister_hook:
+exit_debugfs:
+	p2p_debugfs_exit();
 	p2p_tp_hook_exit();
 exit_topo:
 	topo_exit();
@@ -967,6 +975,7 @@ exit_topo:
 
 static void __exit p2p_drv_exit(void)
 {
+	p2p_debugfs_exit();
 	device_destroy(dev_class, dev);
 	class_destroy(dev_class);
 	cdev_del(&p2p_cdev);
