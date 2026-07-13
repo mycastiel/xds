@@ -9,7 +9,6 @@
 #include <linux/uaccess.h>
 #include <linux/ioctl.h>
 #include <linux/vmalloc.h>
-#include <linux/idr.h>
 #include <linux/notifier.h>
 #include <linux/tracepoint.h>
 #include <linux/limits.h>
@@ -64,7 +63,6 @@ struct p2p_io_context {
 };
 
 struct p2p_batch {
-	unsigned int batch_id;
 	struct list_head io_list;
 	unsigned int io_cnt;
 	spinlock_t io_lock;
@@ -85,9 +83,6 @@ static struct tracepoint *p2p_tp;
 static DEFINE_MUTEX(p2p_tp_lock);
 static struct module *p2p_tp_mod;
 
-static DEFINE_SPINLOCK(batch_lock);
-static DEFINE_IDR(batch_tree);
-
 static int p2p_open(struct inode *inode, struct file *file);
 static int p2p_release(struct inode *inode, struct file *file);
 static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
@@ -103,7 +98,6 @@ static struct file_operations fops = {
 static int p2p_open(struct inode *inode, struct file *file)
 {
 	struct p2p_batch *batch;
-	int err;
 
 	batch = kzalloc(sizeof(*batch), GFP_KERNEL);
 	if (!batch)
@@ -114,19 +108,6 @@ static int p2p_open(struct inode *inode, struct file *file)
 	spin_lock_init(&batch->shared_topos.lock);
 	INIT_LIST_HEAD(&batch->shared_topos.head);
 	batch->io_cnt = 0;
-
-	idr_preload(GFP_KERNEL);
-	spin_lock(&batch_lock);
-	err = idr_alloc(&batch_tree, batch, 1, 0, GFP_ATOMIC);
-	spin_unlock(&batch_lock);
-	idr_preload_end();
-
-	if (err < 0) {
-		kfree(batch);
-		return err;
-	}
-
-	batch->batch_id = err;
 	file->private_data = batch;
 
 	return 0;
@@ -137,10 +118,6 @@ static int p2p_release(struct inode *inode, struct file *file)
 	struct p2p_batch *batch = file->private_data;
 	struct shared_topo *shared, *next;
 	LIST_HEAD(topos);
-
-	spin_lock(&batch_lock);
-	idr_remove(&batch_tree, batch->batch_id);
-	spin_unlock(&batch_lock);
 
 	if (!list_empty(&batch->io_list) || batch->io_cnt > 0)
 		p2p_drain_read(batch);
@@ -564,7 +541,8 @@ static int do_read_io(struct p2p_io_context *io_ctx,
 	struct request_queue *queue = disk->queue;
 	struct request *req;
 
-	pr_debug("read from blk 0x%x0x%llx to pa 0x%llx\n", sector_nr, sector, paddr);
+	pr_debug("read from blk 0x%x 0x%llx to pa 0x%llx\n",
+		 sector_nr, sector, paddr);
 
 	cmd.rw.opcode = nvme_cmd_read;
 	cmd.rw.nsid = cpu_to_le32(nsid);
@@ -780,7 +758,6 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 	topo = topo_get(bdev);
 	if (IS_ERR(topo)) {
 		err = PTR_ERR(topo);
-		topo = NULL;
 		goto put_reg_file;
 	}
 	if (!topo) {
@@ -803,15 +780,13 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 	pa_iov = NULL;
 
 	io_ctx->issue_err = do_read_ios(io_ctx, topo, extents, param.ext_nr);
-	if (topo) {
-		topo_put(topo);
-		topo = NULL;
-	}
+	topo_put(topo);
+	topo = NULL;
 
-	spin_lock(&batch_lock);
+	spin_lock(&batch->io_lock);
 	batch->io_cnt++;
 	list_add_tail(&io_ctx->io_list, &batch->io_list);
-	spin_unlock(&batch_lock);
+	spin_unlock(&batch->io_lock);
 
 free_pa_iov:
 	kvfree(pa_iov);
@@ -837,10 +812,14 @@ static int p2p_drain_read(struct p2p_batch *batch)
 	if (!READ_ONCE(batch->io_cnt))
 		return 0;
 
-	spin_lock(&batch_lock);
+	spin_lock(&batch->io_lock);
+	if (!batch->io_cnt) {
+		spin_unlock(&batch->io_lock);
+		return 0;
+	}
 	list_splice_init(&batch->io_list, &tmp);
 	batch->io_cnt = 0;
-	spin_unlock(&batch_lock);
+	spin_unlock(&batch->io_lock);
 
 	list_for_each_entry_safe(io_ctx, next_io_ctx, &tmp, io_list) {
 		int err, io_err;
@@ -908,7 +887,6 @@ static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 	switch (cmd) {
 	case IOCTL_READ_FILE:
-	case IOCTL_READ_FILE_BATCH:
 		err = p2p_read_file(batch, (void __user *)arg);
 		break;
 	case IOCTL_DRAIN_READ:

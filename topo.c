@@ -272,8 +272,7 @@ static int topo_validate_raid0(struct topo *topo,
 	return 0;
 }
 
-static int topo_validate_cfg(const struct topo_user_cfg *cfg,
-			     const struct topo *topo)
+static int topo_validate_cfg(const struct topo_user_cfg *cfg, dev_t top_dev)
 {
 	bool nvme;
 	u32 i;
@@ -284,7 +283,7 @@ static int topo_validate_cfg(const struct topo_user_cfg *cfg,
 	     strcmp(cfg->name, "raid0")))
 		return -EINVAL;
 	nvme = !strcmp(cfg->name, "nvme");
-	if (!topo->top_dev || !cfg->nr_devs ||
+	if (!top_dev || !cfg->nr_devs ||
 	    cfg->nr_devs > P2P_TOPO_MAX_BDEVS ||
 	    (nvme && cfg->nr_devs != 1))
 		return -EINVAL;
@@ -294,7 +293,7 @@ static int topo_validate_cfg(const struct topo_user_cfg *cfg,
 
 		if (!id || cfg->bdevs[i].reserved ||
 		    !cfg->bdevs[i].size_sector ||
-		    (nvme ? id != topo->top_dev : id == topo->top_dev))
+		    (nvme ? id != top_dev : id == top_dev))
 			return -EINVAL;
 		for (j = 0; j < i; j++) {
 			if (id == new_decode_dev(cfg->bdevs[j].dev_id))
@@ -316,7 +315,7 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 
 	topo->top_dev = new_decode_dev(cfg->top_dev);
 	topo->nr_bdevs = cfg->nr_devs;
-	err = topo_validate_cfg(cfg, topo);
+	err = topo_validate_cfg(cfg, topo->top_dev);
 	if (err)
 		goto free_topo;
 
@@ -485,8 +484,8 @@ static void topo_pin_release(struct kref *ref)
 
 	removed = radix_tree_delete(&topo_tree, topo->top_dev);
 	WARN_ON_ONCE(removed != topo);
-	topo_put(topo);
 	spin_unlock(&topo_lock);
+	topo_put(topo);
 }
 
 void topo_del(struct topo *topo)

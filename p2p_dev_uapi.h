@@ -29,6 +29,11 @@ struct topo_user_bdev {
 };
 
 struct topo_user_cfg {
+	/*
+	 * top_dev must be the whole block device hosting the file system.
+	 * Components must be whole, non-multipath NVMe namespaces; partitions
+	 * and NVMe multipath heads are unsupported.
+	 */
 	char name[P2P_TOPO_NAME_LEN];
 	__u32 top_dev;
 	__u32 nr_devs;
@@ -37,7 +42,10 @@ struct topo_user_cfg {
 };
 
 #define IOCTL_READ_FILE _IOWR('k', 2, struct p2p_read_param)
-#define IOCTL_READ_FILE_BATCH _IOWR('k', 3, struct p2p_read_param)
+/*
+ * Drain snapshots I/O contexts already published by read ioctls. A read or
+ * another drain that overlaps this ioctl need not be covered by its wait.
+ */
 #define IOCTL_DRAIN_READ _IOC(_IOC_READ, 'k', 4, 0)
 #define IOCTL_ADD_TOPO _IOW('k', 5, struct topo_user_cfg)
 
