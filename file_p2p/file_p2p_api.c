@@ -10,7 +10,12 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <stdbool.h>
+#include <sys/sysmacros.h>
 
+#include <linux/dm-ioctl.h>
 #include <linux/fiemap.h>
 #include <linux/fs.h>
 
@@ -19,6 +24,9 @@
 
 #define FILE_P2P_SECTOR_SIZE 512U
 #define FILE_P2P_DEFAULT_BLOCK_SIZE 4096U
+#define FILE_P2P_DM_CONTROL "/dev/mapper/control"
+#define FILE_P2P_DM_BUFFER_MIN (16U << 10)
+#define FILE_P2P_DM_BUFFER_MAX (1U << 20)
 #define FILE_P2P_UNSUPPORTED_FIEMAP_FLAGS \
 	(FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC | \
 	 FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED | \
@@ -51,6 +59,581 @@ int new_p2p_fd(void)
 	}
 
 	return dev_fd;
+}
+
+static int sysfs_path(char *path, size_t size, dev_t devt,
+		      const char *suffix)
+{
+	int len;
+
+	len = snprintf(path, size, "/sys/dev/block/%u:%u/%s",
+		       major(devt), minor(devt), suffix);
+	if (len < 0)
+		return -errno;
+	if ((size_t)len >= size)
+		return -ENAMETOOLONG;
+	return 0;
+}
+
+static int path_exists(dev_t devt, const char *suffix)
+{
+	char path[PATH_MAX];
+	struct stat st;
+	int err;
+
+	err = sysfs_path(path, sizeof(path), devt, suffix);
+	if (err)
+		return 0;
+	return !stat(path, &st);
+}
+
+static int validate_nvme_component(dev_t devt)
+{
+	if (!devt || path_exists(devt, "partition") ||
+	    !path_exists(devt, "device/subsysnqn") ||
+	    path_exists(devt, "device/iopolicy"))
+		return -EOPNOTSUPP;
+	return 0;
+}
+
+static int encode_dev(dev_t devt, __u32 *encoded)
+{
+	unsigned int dev_major = major(devt);
+	unsigned int dev_minor = minor(devt);
+
+	if (!devt || dev_major > 0xfffU || dev_minor > 0xfffffU)
+		return -EINVAL;
+	*encoded = (dev_minor & 0xffU) | (dev_major << 8) |
+		   ((dev_minor & ~0xffU) << 12);
+	return 0;
+}
+
+static int parse_u64(const char *text, unsigned long long *value)
+{
+	char *end;
+
+	while (isspace((unsigned char)*text))
+		text++;
+	if (!*text || *text == '-')
+		return -EINVAL;
+	errno = 0;
+	*value = strtoull(text, &end, 10);
+	if (errno)
+		return -errno;
+	if (end == text)
+		return -EINVAL;
+	while (isspace((unsigned char)*end))
+		end++;
+	return *end ? -EINVAL : 0;
+}
+
+static int read_text(const char *path, char *buf, size_t size)
+{
+	ssize_t got;
+	int fd;
+	int err;
+
+	if (size < 2)
+		return -EINVAL;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+	got = read(fd, buf, size - 1);
+	if (got < 0) {
+		err = -errno;
+		close(fd);
+		return err;
+	}
+	if ((size_t)got == size - 1) {
+		char extra;
+		ssize_t more;
+
+		more = read(fd, &extra, 1);
+		if (more > 0) {
+			close(fd);
+			return -E2BIG;
+		}
+		if (more < 0) {
+			err = -errno;
+			close(fd);
+			return err;
+		}
+	}
+	close(fd);
+	buf[got] = '\0';
+	return 0;
+}
+
+static int read_sysfs_text(dev_t devt, const char *suffix, char *buf,
+			   size_t size)
+{
+	char path[PATH_MAX];
+	int err;
+
+	err = sysfs_path(path, sizeof(path), devt, suffix);
+	if (err)
+		return err;
+	return read_text(path, buf, size);
+}
+
+static int read_sysfs_u64(dev_t devt, const char *suffix,
+			  unsigned long long *value)
+{
+	char buf[64];
+	int err;
+
+	err = read_sysfs_text(devt, suffix, buf, sizeof(buf));
+	if (err)
+		return err;
+	return parse_u64(buf, value);
+}
+
+static int parse_devt(const char *text, dev_t *devt)
+{
+	unsigned int dev_major;
+	unsigned int dev_minor;
+	char trailing;
+	int count;
+
+	if (sscanf(text, "%u:%u %c", &dev_major, &dev_minor, &trailing) != 2)
+		return -EINVAL;
+	*devt = makedev(dev_major, dev_minor);
+	if (major(*devt) != dev_major || minor(*devt) != dev_minor)
+		return -EINVAL;
+
+	count = validate_nvme_component(*devt);
+	return count;
+}
+
+static int parse_linear_params(const char *params, dev_t *devt,
+			       unsigned long long *start_sector)
+{
+	unsigned int dev_major;
+	unsigned int dev_minor;
+	int consumed = 0;
+
+	if (sscanf(params, "%u:%u %llu %n", &dev_major, &dev_minor,
+		   start_sector, &consumed) != 3)
+		return -EINVAL;
+	while (isspace((unsigned char)params[consumed]))
+		consumed++;
+	if (params[consumed])
+		return -EINVAL;
+
+	*devt = makedev(dev_major, dev_minor);
+	if (major(*devt) != dev_major || minor(*devt) != dev_minor)
+		return -EINVAL;
+	return validate_nvme_component(*devt);
+}
+
+static int dm_table_query(dev_t top_dev, void **buffer_out)
+{
+	size_t size = FILE_P2P_DM_BUFFER_MIN;
+	void *buffer = NULL;
+	int control_fd;
+	int err;
+
+	control_fd = open(FILE_P2P_DM_CONTROL, O_RDWR | O_CLOEXEC);
+	if (control_fd < 0)
+		return -errno;
+
+	for (;;) {
+		struct dm_ioctl *dmi;
+
+		free(buffer);
+		buffer = calloc(1, size);
+		if (!buffer) {
+			err = -ENOMEM;
+			break;
+		}
+		dmi = buffer;
+		dmi->version[0] = DM_VERSION_MAJOR;
+		/* DM_TABLE_STATUS has existed since interface version 4.0. */
+		dmi->version[1] = 0;
+		dmi->version[2] = 0;
+		dmi->data_size = size;
+		dmi->data_start = sizeof(*dmi);
+		dmi->flags = DM_STATUS_TABLE_FLAG;
+		dmi->dev = top_dev;
+
+		if (ioctl(control_fd, DM_TABLE_STATUS, dmi) < 0) {
+			err = -errno;
+			break;
+		}
+		if (!(dmi->flags & DM_BUFFER_FULL_FLAG)) {
+			*buffer_out = buffer;
+			close(control_fd);
+			return 0;
+		}
+		if (size >= FILE_P2P_DM_BUFFER_MAX) {
+			err = -E2BIG;
+			break;
+		}
+		size <<= 1;
+	}
+
+	free(buffer);
+	close(control_fd);
+	return err;
+}
+
+static int discover_linear(dev_t top_dev, struct topo_user_cfg *cfg)
+{
+	struct dm_target_spec *first;
+	struct dm_target_spec *spec;
+	struct dm_ioctl *dmi;
+	unsigned long long logical_end = 0;
+	char *limit;
+	void *buffer;
+	unsigned int i;
+	int err;
+
+	err = dm_table_query(top_dev, &buffer);
+	if (err)
+		return err;
+	dmi = buffer;
+	if (!(dmi->flags & DM_ACTIVE_PRESENT_FLAG) || !dmi->target_count ||
+	    dmi->target_count > P2P_TOPO_MAX_BDEVS ||
+	    dmi->data_size < sizeof(*dmi) ||
+	    dmi->data_start < sizeof(*dmi) || dmi->data_start >= dmi->data_size) {
+		err = dmi->target_count > P2P_TOPO_MAX_BDEVS ? -E2BIG : -EINVAL;
+		goto out;
+	}
+
+	limit = (char *)buffer + dmi->data_size;
+	first = (void *)((char *)buffer + dmi->data_start);
+	spec = first;
+	strcpy(cfg->name, "linear");
+	cfg->nr_devs = dmi->target_count;
+	err = encode_dev(top_dev, &cfg->top_dev);
+	if (err)
+		goto out;
+
+	for (i = 0; i < cfg->nr_devs; i++) {
+		struct topo_user_bdev *entry = &cfg->bdevs[i];
+		unsigned long long start_sector;
+		char *params;
+		char *params_end;
+		dev_t component;
+		unsigned int j;
+
+		if ((char *)(spec + 1) > limit ||
+		    !memchr(spec->target_type, '\0', sizeof(spec->target_type)) ||
+		    strcmp(spec->target_type, "linear") || !spec->length ||
+		    spec->sector_start != logical_end) {
+			err = -EINVAL;
+			goto out;
+		}
+		params = (char *)(spec + 1);
+		if (i + 1 < cfg->nr_devs) {
+			if (!spec->next || (char *)first + spec->next <= params ||
+			    (char *)first + spec->next > limit) {
+				err = -EINVAL;
+				goto out;
+			}
+			params_end = (char *)first + spec->next;
+		} else {
+			params_end = limit;
+		}
+		if (!memchr(params, '\0', params_end - params)) {
+			err = -EINVAL;
+			goto out;
+		}
+		err = parse_linear_params(params, &component, &start_sector);
+		if (err)
+			goto out;
+		for (j = 0; j < i; j++) {
+			if (cfg->bdevs[j].dev_id ==
+			    ((__u32)(minor(component) & 0xffU) |
+			     (__u32)(major(component) << 8) |
+			     (__u32)((minor(component) & ~0xffU) << 12))) {
+				err = -EINVAL;
+				goto out;
+			}
+		}
+		err = encode_dev(component, &entry->dev_id);
+		if (err)
+			goto out;
+		entry->size_sector = spec->length;
+		entry->start_sector = start_sector;
+		if (__builtin_add_overflow(logical_end,
+					   (unsigned long long)spec->length,
+					   &logical_end)) {
+			err = -EINVAL;
+			goto out;
+		}
+		if (i + 1 < cfg->nr_devs)
+			spec = (void *)((char *)first + spec->next);
+	}
+	err = 0;
+out:
+	free(buffer);
+	return err;
+}
+
+static int state_is_active(const char *state)
+{
+	const char *token = state;
+
+	while (*token) {
+		const char *end = strchr(token, ',');
+		size_t len = end ? (size_t)(end - token) : strlen(token);
+
+		while (len && isspace((unsigned char)token[len - 1]))
+			len--;
+		while (len && isspace((unsigned char)*token)) {
+			token++;
+			len--;
+		}
+		if (len == strlen("in_sync") && !memcmp(token, "in_sync", len))
+			return 1;
+		if (!end)
+			break;
+		token = end + 1;
+	}
+	return 0;
+}
+
+static int read_member_value(const char *member_path, const char *name,
+			     unsigned long long *value)
+{
+	char path[PATH_MAX];
+	char text[64];
+	int len;
+	int err;
+
+	len = snprintf(path, sizeof(path), "%s/%s", member_path, name);
+	if (len < 0)
+		return -errno;
+	if ((size_t)len >= sizeof(path))
+		return -ENAMETOOLONG;
+	err = read_text(path, text, sizeof(text));
+	if (err)
+		return err;
+	return parse_u64(text, value);
+}
+
+static int discover_raid0_members(dev_t top_dev, unsigned int raid_disks,
+				  struct topo_user_cfg *cfg)
+{
+	bool found[P2P_TOPO_MAX_BDEVS] = { };
+	char md_path[PATH_MAX];
+	struct dirent *dirent;
+	unsigned int active = 0;
+	DIR *dir;
+	int err;
+
+	err = sysfs_path(md_path, sizeof(md_path), top_dev, "md");
+	if (err)
+		return err;
+	dir = opendir(md_path);
+	if (!dir)
+		return -errno;
+
+	for (;;) {
+		struct topo_user_bdev *entry;
+		unsigned long long start_sector;
+		unsigned long long size_sector;
+		unsigned long long slot;
+		char member_path[PATH_MAX];
+		char state_path[PATH_MAX];
+		char block_dev_path[PATH_MAX];
+		char state[128];
+		char block_dev[64];
+		dev_t component;
+		int len;
+
+		errno = 0;
+		dirent = readdir(dir);
+		if (!dirent) {
+			if (errno) {
+				err = -errno;
+				goto out;
+			}
+			break;
+		}
+		if (strncmp(dirent->d_name, "dev-", 4))
+			continue;
+		len = snprintf(member_path, sizeof(member_path), "%s/%s",
+			       md_path, dirent->d_name);
+		if (len < 0 || (size_t)len >= sizeof(member_path)) {
+			err = -ENAMETOOLONG;
+			goto out;
+		}
+		len = snprintf(state_path, sizeof(state_path), "%s/state",
+			       member_path);
+		if (len < 0 || (size_t)len >= sizeof(state_path)) {
+			err = -ENAMETOOLONG;
+			goto out;
+		}
+		err = read_text(state_path, state, sizeof(state));
+		if (err)
+			goto out;
+		if (!state_is_active(state))
+			continue;
+
+		err = read_member_value(member_path, "slot", &slot);
+		if (err)
+			goto out;
+		if (slot >= raid_disks || found[slot]) {
+			err = -EINVAL;
+			goto out;
+		}
+		entry = &cfg->bdevs[slot];
+		err = read_member_value(member_path, "offset", &start_sector);
+		if (err)
+			goto out;
+		err = read_member_value(member_path, "size", &size_sector);
+		if (err)
+			goto out;
+		if (!size_sector) {
+			err = -EINVAL;
+			goto out;
+		}
+		len = snprintf(block_dev_path, sizeof(block_dev_path),
+			       "%s/block/dev", member_path);
+		if (len < 0 || (size_t)len >= sizeof(block_dev_path)) {
+			err = -ENAMETOOLONG;
+			goto out;
+		}
+		err = read_text(block_dev_path, block_dev, sizeof(block_dev));
+		if (err)
+			goto out;
+		err = parse_devt(block_dev, &component);
+		if (err)
+			goto out;
+		err = encode_dev(component, &entry->dev_id);
+		if (err)
+			goto out;
+		entry->size_sector = size_sector;
+		entry->start_sector = start_sector;
+		found[slot] = true;
+		active++;
+	}
+
+	if (active != raid_disks) {
+		err = -EINVAL;
+		goto out;
+	}
+	err = 0;
+out:
+	closedir(dir);
+	return err;
+}
+
+static int discover_raid0(dev_t top_dev, struct topo_user_cfg *cfg)
+{
+	unsigned long long chunk_bytes;
+	unsigned long long chunk_sectors;
+	unsigned long long raid_disks;
+	unsigned long long degraded;
+	char level[64];
+	unsigned int shift = 0;
+	unsigned int i;
+	int err;
+
+	err = read_sysfs_text(top_dev, "md/level", level, sizeof(level));
+	if (err)
+		return err;
+	level[strcspn(level, "\r\n")] = '\0';
+	if (strcmp(level, "raid0"))
+		return -EOPNOTSUPP;
+	err = read_sysfs_u64(top_dev, "md/chunk_size", &chunk_bytes);
+	if (err)
+		return err;
+	err = read_sysfs_u64(top_dev, "md/raid_disks", &raid_disks);
+	if (err)
+		return err;
+	err = read_sysfs_u64(top_dev, "md/degraded", &degraded);
+	if (err)
+		return err;
+	if (raid_disks < 2 || raid_disks > P2P_TOPO_MAX_BDEVS)
+		return raid_disks > P2P_TOPO_MAX_BDEVS ? -E2BIG : -EINVAL;
+	if (degraded || !chunk_bytes || chunk_bytes % FILE_P2P_SECTOR_SIZE)
+		return -EINVAL;
+	chunk_sectors = chunk_bytes / FILE_P2P_SECTOR_SIZE;
+	if (!chunk_sectors || (chunk_sectors & (chunk_sectors - 1)))
+		return -EINVAL;
+	while ((1ULL << shift) != chunk_sectors) {
+		if (++shift >= 32)
+			return -EINVAL;
+	}
+
+	strcpy(cfg->name, "raid0");
+	cfg->nr_devs = raid_disks;
+	cfg->extra[0] = shift;
+	err = encode_dev(top_dev, &cfg->top_dev);
+	if (err)
+		return err;
+	err = discover_raid0_members(top_dev, raid_disks, cfg);
+	if (err)
+		return err;
+
+	for (i = 0; i < cfg->nr_devs; i++) {
+		unsigned int j;
+
+		if (cfg->bdevs[i].start_sector != cfg->bdevs[0].start_sector ||
+		    cfg->bdevs[i].size_sector != cfg->bdevs[0].size_sector ||
+		    cfg->bdevs[i].size_sector % chunk_sectors)
+			return -EINVAL;
+		for (j = 0; j < i; j++) {
+			if (cfg->bdevs[i].dev_id == cfg->bdevs[j].dev_id)
+				return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+int add_topo(int dev_fd, const char *dev)
+{
+	struct topo_user_cfg *check = NULL;
+	struct topo_user_cfg *cfg = NULL;
+	struct stat st;
+	size_t cfg_size;
+	int (*discover)(dev_t, struct topo_user_cfg *);
+	int err;
+
+	if (dev_fd < 0 || !dev)
+		return -EINVAL;
+	if (stat(dev, &st) < 0)
+		return -errno;
+	if (!S_ISBLK(st.st_mode))
+		return -EINVAL;
+	if (path_exists(st.st_rdev, "device/subsysnqn"))
+		return validate_nvme_component(st.st_rdev);
+	if (path_exists(st.st_rdev, "dm"))
+		discover = discover_linear;
+	else if (path_exists(st.st_rdev, "md"))
+		discover = discover_raid0;
+	else
+		return -EOPNOTSUPP;
+
+	cfg_size = sizeof(*cfg) +
+		   P2P_TOPO_MAX_BDEVS * sizeof(cfg->bdevs[0]);
+	cfg = calloc(1, cfg_size);
+	check = calloc(1, cfg_size);
+	if (!cfg || !check) {
+		err = -ENOMEM;
+		goto out;
+	}
+	err = discover(st.st_rdev, cfg);
+	if (err)
+		goto out;
+	err = discover(st.st_rdev, check);
+	if (err)
+		goto out;
+	if (memcmp(cfg, check, cfg_size)) {
+		err = -ESTALE;
+		goto out;
+	}
+	if (ioctl(dev_fd, IOCTL_ADD_TOPO, cfg) < 0)
+		err = -errno;
+	else
+		err = 0;
+out:
+	free(check);
+	free(cfg);
+	return err;
 }
 
 static int is_power_of_two(unsigned int value)

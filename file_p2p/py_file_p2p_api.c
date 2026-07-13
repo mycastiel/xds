@@ -207,6 +207,20 @@ static PyObject *py_new_p2p_fd(PyObject *self, PyObject *Py_UNUSED(ignored))
 	return PyLong_FromLong((long)ret);
 }
 
+static PyObject *py_add_topo(PyObject *self, PyObject *args)
+{
+	const char *dev;
+	int dev_fd;
+	int ret;
+
+	if (!PyArg_ParseTuple(args, "is", &dev_fd, &dev))
+		return NULL;
+
+	Py_BEGIN_ALLOW_THREADS ret = add_topo(dev_fd, dev);
+	Py_END_ALLOW_THREADS
+	return PyLong_FromLong((long)ret);
+}
+
 static PyObject *py_close_p2p_fd(PyObject *self, PyObject *args)
 {
 	int dev_fd = 0;
@@ -259,6 +273,10 @@ static PyMethodDef FileP2PMethods[] = {
 	  "\n"
 	  "Returns:\n"
 	  "    int: File descriptor on success, negative errno on error.\n" },
+	{ "add_topo", py_add_topo, METH_VARARGS,
+	  "add_topo(dev_fd, dev) -> int\n\n"
+	  "Discover and register a supported block-device topology.\n"
+	  "Returns 0 on success or a negative errno.\n" },
 	{ "close_p2p_fd", py_close_p2p_fd, METH_VARARGS,
 	  "close_p2p_fd(dev_fd) -> None\n\n"
 	  "Close p2p device file descriptor.\n"
