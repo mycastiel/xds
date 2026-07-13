@@ -10,6 +10,8 @@ all:
 obj-m := stub.o
 obj-m += p2p_dev.o
 
+p2p_dev-objs := dev.o
+
 clean:
 	rm -rf *.o *.ko *.mod.c *.mod.o *.mod modules.* Module.* .*.ko.cmd .*.mod.o.cmd .*.o.cmd
 	rm -rf .*.mod.cmd .tmp_versions/
