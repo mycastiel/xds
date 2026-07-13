@@ -27,6 +27,7 @@
 
 #include "p2p_dev_uapi.h"
 #include "p2p_mem_query.h"
+#include "topo.h"
 
 #define P2P_NVME_MAX_RW_SECTORS ((1U << 20) >> SECTOR_SHIFT)
 #define P2P_SYSFS_BDEV_PATH_MAX 48
@@ -60,19 +61,17 @@ struct p2p_iov_map {
 struct p2p_io_context {
 	struct block_device *bdev;
 	struct file *file;
+	struct topo *topo;
 	unsigned int nsid;
 	struct p2p_pa_iov *pa_iov;
 	unsigned int pa_iov_nr;
 	u64 data_size;
-	unsigned int max_sectors;
 	struct completion io_done;
 	atomic_t io_ref;
 	int io_err;
 	int issue_err;
 	struct list_head io_list;
-	struct nvme_command *cmd_list;
 	unsigned int cmd_id;
-	unsigned int count;
 	u64 start_time;
 	u64 end_time;
 };
@@ -82,6 +81,7 @@ struct p2p_batch {
 	struct list_head io_list;
 	unsigned int io_cnt;
 	spinlock_t io_lock;
+	struct shared_topo_list shared_topos;
 };
 
 #define RQF_NVME_PT ((__force req_flags_t)(1 << 31))
@@ -124,6 +124,8 @@ static int p2p_open(struct inode *inode, struct file *file)
 
 	spin_lock_init(&batch->io_lock);
 	INIT_LIST_HEAD(&batch->io_list);
+	spin_lock_init(&batch->shared_topos.lock);
+	INIT_LIST_HEAD(&batch->shared_topos.head);
 	batch->io_cnt = 0;
 
 	idr_preload(GFP_KERNEL);
@@ -146,6 +148,8 @@ static int p2p_open(struct inode *inode, struct file *file)
 static int p2p_release(struct inode *inode, struct file *file)
 {
 	struct p2p_batch *batch = file->private_data;
+	struct shared_topo *shared, *next;
+	LIST_HEAD(topos);
 
 	spin_lock(&batch_lock);
 	idr_remove(&batch_tree, batch->batch_id);
@@ -153,6 +157,15 @@ static int p2p_release(struct inode *inode, struct file *file)
 
 	if (!list_empty(&batch->io_list) || batch->io_cnt > 0)
 		p2p_drain_read(batch);
+
+	spin_lock(&batch->shared_topos.lock);
+	list_splice_init(&batch->shared_topos.head, &topos);
+	spin_unlock(&batch->shared_topos.lock);
+	list_for_each_entry_safe(shared, next, &topos, list) {
+		list_del(&shared->list);
+		topo_del(shared->topo);
+		kfree(shared);
+	}
 
 	kfree(batch);
 
@@ -363,8 +376,9 @@ free_maps:
 
 static void free_io_ctx(struct p2p_io_context *io_ctx)
 {
-	kvfree(io_ctx->cmd_list);
 	kvfree(io_ctx->pa_iov);
+	if (io_ctx->topo)
+		topo_put(io_ctx->topo);
 	fput(io_ctx->file);
 	kfree(io_ctx);
 }
@@ -379,38 +393,25 @@ static inline unsigned int p2p_queue_max_sectors(struct block_device *bdev)
 }
 
 static struct p2p_io_context *new_io_ctx(struct block_device *bdev,
-					 struct file *file, unsigned int nsid,
+					 struct file *file, struct topo *topo,
+					 unsigned int nsid,
 					 struct p2p_pa_iov *pa_iov,
 					 unsigned int pa_iov_nr, u64 data_size)
 {
 	struct p2p_io_context *io_ctx;
-	unsigned int max_sectors;
-	unsigned int max_bytes;
-	u64 count;
-
-	max_sectors = p2p_queue_max_sectors(bdev);
-	max_bytes = max_sectors << SECTOR_SHIFT;
-	count = DIV_ROUND_UP_ULL(data_size, max_bytes) * 10;
 
 	io_ctx = kzalloc(sizeof(*io_ctx), GFP_KERNEL);
 	if (!io_ctx)
 		return ERR_PTR(-ENOMEM);
 
-	io_ctx->cmd_list = kvcalloc(count, sizeof(*io_ctx->cmd_list), GFP_KERNEL);
-	if (!io_ctx->cmd_list) {
-		kfree(io_ctx);
-		return ERR_PTR(-ENOMEM);
-	}
-
 	io_ctx->bdev = bdev;
 	io_ctx->file = file;
+	io_ctx->topo = topo;
 	io_ctx->nsid = nsid;
 	io_ctx->pa_iov = pa_iov;
 	io_ctx->pa_iov_nr = pa_iov_nr;
 	io_ctx->data_size = data_size;
-	io_ctx->max_sectors = max_sectors;
 	io_ctx->start_time = ktime_get_ns();
-	io_ctx->count = count;
 
 	atomic_set(&io_ctx->io_ref, 1);
 	INIT_LIST_HEAD(&io_ctx->io_list);
@@ -576,40 +577,34 @@ static enum rq_end_io_ret end_read_io(struct request *req, blk_status_t status)
 	return RQ_END_IO_FREE;
 }
 
-static int do_read_io(struct p2p_io_context *io_ctx, u64 sector,
-		      unsigned int sector_nr, u64 paddr)
+static int do_read_io(struct p2p_io_context *io_ctx,
+		      struct block_device *bdev, unsigned int nsid,
+		      u64 sector, unsigned int sector_nr, u64 paddr)
 {
-	struct gendisk *disk = io_ctx->bdev->bd_disk;
+	struct nvme_command cmd = { };
+	struct gendisk *disk = bdev->bd_disk;
 	struct request_queue *queue = disk->queue;
 	struct request *req;
-	struct nvme_command *cmd;
-
-	if (io_ctx->cmd_id >= io_ctx->count) {
-		pr_err("cmd_id %u >= count %u\n", io_ctx->cmd_id,
-		       io_ctx->count);
-		return -EINVAL;
-	}
-	cmd = &io_ctx->cmd_list[io_ctx->cmd_id];
 
 	pr_debug("read from blk 0x%x0x%llx to pa 0x%llx\n", sector_nr, sector, paddr);
 
-	cmd->rw.opcode = nvme_cmd_read;
-	cmd->rw.nsid = cpu_to_le32(io_ctx->nsid);
-	cmd->rw.slba = cpu_to_le64(sector);
-	cmd->rw.length = cpu_to_le16(sector_nr - 1);
-	cmd->rw.control = 0;
-	cmd->rw.dsmgmt = 0;
+	cmd.rw.opcode = nvme_cmd_read;
+	cmd.rw.nsid = cpu_to_le32(nsid);
+	cmd.rw.slba = cpu_to_le64(sector);
+	cmd.rw.length = cpu_to_le16(sector_nr - 1);
+	cmd.rw.control = 0;
+	cmd.rw.dsmgmt = 0;
 
-	cmd->rw.dptr.sgl.addr = cpu_to_le64(paddr);
-	cmd->rw.dptr.sgl.length = cpu_to_le32(sector_nr << SECTOR_SHIFT);
-	cmd->rw.dptr.sgl.type = NVME_SGL_FMT_DATA_DESC << 4;
+	cmd.rw.dptr.sgl.addr = cpu_to_le64(paddr);
+	cmd.rw.dptr.sgl.length = cpu_to_le32(sector_nr << SECTOR_SHIFT);
+	cmd.rw.dptr.sgl.type = NVME_SGL_FMT_DATA_DESC << 4;
 
 	req = blk_mq_alloc_request(queue, REQ_OP_DRV_IN, 0);
 	if (IS_ERR(req)) {
 		pr_err("Failed to alloc request\n");
-		return -ENOMEM;
+		return PTR_ERR(req);
 	}
-	nvme_init_request(req, cmd);
+	nvme_init_request(req, &cmd);
 
 	req->rq_flags |= RQF_NVME_PT;
 	req->end_io_data = io_ctx;
@@ -620,18 +615,6 @@ static int do_read_io(struct p2p_io_context *io_ctx, u64 sector,
 	blk_execute_rq_nowait(req, true);
 
 	return 0;
-}
-
-static unsigned int calc_read_size(struct p2p_io_context *io_ctx,
-				   const struct p2p_iov_iter *iter,
-				   u64 extent_left)
-{
-	u64 to_read;
-	u64 iov_left;
-
-	to_read = min_t(u64, extent_left, io_ctx->max_sectors);
-	iov_left = p2p_iov_iter_single_seg_count(iter) >> SECTOR_SHIFT;
-	return min(to_read, iov_left);
 }
 
 static int do_read_ios(struct p2p_io_context *io_ctx,
@@ -650,14 +633,36 @@ static int do_read_ios(struct p2p_io_context *io_ctx,
 		unsigned int to_read;
 
 		while (left > 0 && p2p_iov_iter_count(&iter)) {
-			to_read = calc_read_size(io_ctx, &iter, left);
+			struct block_device *to_bdev = io_ctx->bdev;
+			struct topo_bdev *topo_bdev = NULL;
+			u64 to_sector = sector;
+			u64 iov_left;
+			u32 topo_limit = min_t(u64, left, U32_MAX);
+			u32 nsid = io_ctx->nsid;
+
+			if (io_ctx->topo) {
+				err = io_ctx->topo->ops->map_sector(io_ctx->topo,
+							 sector, topo_limit,
+							 &topo_bdev, &to_sector,
+							 &topo_limit);
+				if (err)
+					goto out;
+				to_bdev = topo_bdev->handle->bdev;
+				nsid = topo_bdev->nsid;
+			}
+
+			iov_left = p2p_iov_iter_single_seg_count(&iter) >>
+				   SECTOR_SHIFT;
+			to_read = min3(topo_limit,
+				       p2p_queue_max_sectors(to_bdev),
+				       (u32)min_t(u64, iov_left, U32_MAX));
 			if (!to_read) {
 				pr_err("p2p: zero read size at extent %u, extent sectors 0x%llx, IOV bytes 0x%llx\n",
 				       i, left, p2p_iov_iter_count(&iter));
 				err = -EINVAL;
 				goto out;
 			}
-			err = do_read_io(io_ctx, sector, to_read,
+			err = do_read_io(io_ctx, to_bdev, nsid, to_sector, to_read,
 					 p2p_iov_iter_addr(&iter));
 			if (err)
 				goto out;
@@ -788,13 +793,14 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 	struct file *reg_file = NULL;
 	struct block_device *bdev;
 	struct p2p_io_context *io_ctx;
+	struct topo *topo = NULL;
 	u64 data_size;
 	unsigned int pa_iov_nr;
 	int err;
 
 	if (copy_from_user(&param, user_param, sizeof(param)))
 		return -EFAULT;
-	if (!param.nsid || param.host_pid <= 0 || !param.iov_nr ||
+	if (param.host_pid <= 0 || !param.iov_nr ||
 	    param.iov_nr > P2P_MAX_IOV || !param.ext_nr ||
 	    param.ext_nr > P2P_MAX_EXTENTS)
 		return -EINVAL;
@@ -835,20 +841,34 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 		err = PTR_ERR(bdev);
 		goto put_reg_file;
 	}
-	err = p2p_validate_nvme_bdev(bdev);
-	if (err)
+	topo = topo_get(bdev);
+	if (IS_ERR(topo)) {
+		err = PTR_ERR(topo);
+		topo = NULL;
 		goto put_reg_file;
+	}
+	if (!topo) {
+		if (!param.nsid) {
+			err = -EINVAL;
+			goto put_reg_file;
+		}
+		err = p2p_validate_nvme_bdev(bdev);
+		if (err)
+			goto put_reg_file;
+	}
 
 	err = get_pa_iov(param.host_pid, iov, param.iov_nr, &pa_iov, &pa_iov_nr);
 	if (err)
-		goto put_reg_file;
+		goto put_topo;
 
-	io_ctx = new_io_ctx(bdev, reg_file, param.nsid, pa_iov, pa_iov_nr, data_size);
+	io_ctx = new_io_ctx(bdev, reg_file, topo, param.nsid, pa_iov,
+			    pa_iov_nr, data_size);
 	if (IS_ERR(io_ctx)) {
 		err = PTR_ERR(io_ctx);
 		goto free_pa_iov;
 	}
 	reg_file = NULL;
+	topo = NULL;
 	pa_iov = NULL;
 
 	io_ctx->issue_err = do_read_ios(io_ctx, extents, param.ext_nr);
@@ -860,6 +880,9 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 
 free_pa_iov:
 	kvfree(pa_iov);
+put_topo:
+	if (topo)
+		topo_put(topo);
 put_reg_file:
 	if (reg_file)
 		fput(reg_file);
@@ -939,6 +962,40 @@ static int p2p_drain_read(struct p2p_batch *batch)
 	return first_err;
 }
 
+static int p2p_add_topo(struct p2p_batch *batch, void __user *arg)
+{
+	struct topo_user_cfg header;
+	struct topo_user_cfg *cfg;
+	struct topo *topo;
+	size_t entries_size;
+	size_t size;
+	int err;
+
+	if (copy_from_user(&header, arg, sizeof(header)))
+		return -EFAULT;
+	if (!header.nr_devs)
+		return -EINVAL;
+	if (header.nr_devs > P2P_TOPO_MAX_BDEVS)
+		return -E2BIG;
+	if (check_mul_overflow((size_t)header.nr_devs,
+			       sizeof(header.bdevs[0]), &entries_size) ||
+	    check_add_overflow(sizeof(header), entries_size, &size))
+		return -E2BIG;
+
+	cfg = memdup_user(arg, size);
+	if (IS_ERR(cfg))
+		return PTR_ERR(cfg);
+	if (cfg->nr_devs != header.nr_devs) {
+		kfree(cfg);
+		return -EINVAL;
+	}
+
+	topo = topo_add(cfg, &batch->shared_topos);
+	err = PTR_ERR_OR_ZERO(topo);
+	kfree(cfg);
+	return err;
+}
+
 static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct p2p_batch *batch = file->private_data;
@@ -951,6 +1008,9 @@ static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 	case IOCTL_DRAIN_READ:
 		err = p2p_drain_read(batch);
+		break;
+	case IOCTL_ADD_TOPO:
+		err = p2p_add_topo(batch, (void __user *)arg);
 		break;
 	default:
 		pr_info("p2p driver: invalid ioctl command 0x%x\n", cmd);
@@ -965,10 +1025,17 @@ static int __init p2p_drv_init(void)
 	struct device *device;
 	int err;
 
+	err = topo_init();
+	if (err) {
+		pr_err("p2p: initialize topology release workqueue err %d\n",
+		       err);
+		return err;
+	}
+
 	err = p2p_tp_hook_init();
 	if (err) {
 		pr_err("p2p: register tp hook err %d\n", err);
-		return err;
+		goto exit_topo;
 	}
 
 	err = alloc_chrdev_region(&dev, 0, 1, "p2p_device");
@@ -1012,17 +1079,19 @@ free_dev:
 	unregister_chrdev_region(dev, 1);
 unregister_hook:
 	p2p_tp_hook_exit();
+exit_topo:
+	topo_exit();
 	return err;
 }
 
 static void __exit p2p_drv_exit(void)
 {
-	p2p_tp_hook_exit();
-
 	device_destroy(dev_class, dev);
 	class_destroy(dev_class);
 	cdev_del(&p2p_cdev);
 	unregister_chrdev_region(dev, 1);
+	p2p_tp_hook_exit();
+	topo_exit();
 	pr_info("p2p: Device Driver Removed Done\n");
 }
 
