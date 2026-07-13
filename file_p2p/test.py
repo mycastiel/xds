@@ -1,10 +1,15 @@
 import sys
 import file_p2p
 
-def test_read(name):
+def test_read(name, dev):
     dev_fd = file_p2p.new_p2p_fd()
     if dev_fd < 0:
         print("new_p2p_fd failed, errno: %d" % -dev_fd)
+        return
+
+    err = file_p2p.add_topo(dev_fd, dev)
+    if err < 0:
+        print("add_topo failed, errno: %d" % -err)
         return
 
     err = file_p2p.read_file(dev_fd, name, 4096, [(0, 8 << 20)])
@@ -17,4 +22,4 @@ def test_read(name):
         return
 
 if __name__ == "__main__":
-    test_read(sys.argv[1])
+    test_read(sys.argv[1], sys.argv[2])

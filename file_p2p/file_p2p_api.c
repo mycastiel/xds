@@ -176,6 +176,40 @@ static int read_sysfs_u64(dev_t devt, const char *suffix,
 	return parse_u64(buf, value);
 }
 
+static int discover_nvme(const char *dev, dev_t top_dev,
+			 struct topo_user_cfg *cfg)
+{
+	uint64_t size_bytes;
+	int fd;
+	int err;
+
+	err = validate_nvme_component(top_dev);
+	if (err)
+		return err;
+
+	fd = open(dev, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+	if (ioctl(fd, BLKGETSIZE64, &size_bytes) < 0)
+		err = -errno;
+	else
+		err = 0;
+	close(fd);
+	if (err)
+		return err;
+	if (!size_bytes || size_bytes % FILE_P2P_SECTOR_SIZE)
+		return -EINVAL;
+
+	memcpy(cfg->name, "nvme", sizeof("nvme"));
+	cfg->nr_devs = 1;
+	err = encode_dev(top_dev, &cfg->top_dev);
+	if (err)
+		return err;
+	cfg->bdevs[0].dev_id = cfg->top_dev;
+	cfg->bdevs[0].size_sector = size_bytes / FILE_P2P_SECTOR_SIZE;
+	return 0;
+}
+
 static int parse_devt(const char *text, dev_t *devt)
 {
 	unsigned int dev_major;
@@ -568,6 +602,7 @@ int add_topo(int dev_fd, const char *dev)
 	struct stat st;
 	size_t cfg_size;
 	int (*discover)(dev_t, struct topo_user_cfg *);
+	bool nvme = false;
 	int err;
 
 	if (dev_fd < 0 || !dev)
@@ -577,8 +612,8 @@ int add_topo(int dev_fd, const char *dev)
 	if (!S_ISBLK(st.st_mode))
 		return -EINVAL;
 	if (path_exists(st.st_rdev, "device/subsysnqn"))
-		return validate_nvme_component(st.st_rdev);
-	if (path_exists(st.st_rdev, "dm"))
+		nvme = true;
+	else if (path_exists(st.st_rdev, "dm"))
 		discover = discover_linear;
 	else if (path_exists(st.st_rdev, "md"))
 		discover = discover_raid0;
@@ -592,7 +627,10 @@ int add_topo(int dev_fd, const char *dev)
 		err = -ENOMEM;
 		goto out;
 	}
-	err = discover(st.st_rdev, cfg);
+	if (nvme)
+		err = discover_nvme(dev, st.st_rdev, cfg);
+	else
+		err = discover(st.st_rdev, cfg);
 	if (err)
 		goto out;
 	if (ioctl(dev_fd, IOCTL_ADD_TOPO, cfg) < 0)
@@ -879,7 +917,6 @@ static int submit_read(int dev_fd, const struct read_parameter *param,
 	}
 
 	read->file_fd = file_fd;
-	read->nsid = 1;
 	read->host_pid = getpid();
 	read->iov = param->iov;
 	read->iov_nr = param->iov_nr;

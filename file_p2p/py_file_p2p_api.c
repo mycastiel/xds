@@ -275,7 +275,7 @@ static PyMethodDef FileP2PMethods[] = {
 	  "    int: File descriptor on success, negative errno on error.\n" },
 	{ "add_topo", py_add_topo, METH_VARARGS,
 	  "add_topo(dev_fd, dev) -> int\n\n"
-	  "Discover and register a supported block-device topology.\n"
+	  "Discover and register the required block-device topology.\n"
 	  "Returns 0 on success or a negative errno.\n" },
 	{ "close_p2p_fd", py_close_p2p_fd, METH_VARARGS,
 	  "close_p2p_fd(dev_fd) -> None\n\n"
