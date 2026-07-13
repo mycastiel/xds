@@ -1,17 +1,16 @@
-# Limited topology-aware I/O for dm-linear and MD RAID0
+# Mandatory topology-aware I/O for NVMe, dm-linear, and MD RAID0
 
 ## 1. Scope
 
-`p2p_dev` currently resolves the block device from the file descriptor and
-requires that device to be a directly accessible NVMe namespace.  This design
-adds a limited topology layer so that the physical sectors returned by FIEMAP
-for a dm-linear or MD RAID0 device can be translated to sectors on its
-underlying NVMe namespaces before the NVMe read commands are submitted.
+`p2p_dev` resolves the block device from the file descriptor and requires a
+registered topology for every read.  Direct NVMe namespaces use a dedicated
+one-component NVMe backend.  For dm-linear and MD RAID0 devices, the physical
+sectors returned by FIEMAP are translated to sectors on the underlying NVMe
+namespaces before NVMe read commands are submitted.
 
 The supported configurations are deliberately narrow:
 
-- a directly accessible NVMe namespace, which continues to use the existing
-  path and does not require topology registration;
+- a directly accessible NVMe namespace registered as an `nvme` topology;
 - a dm device whose active table contains only contiguous `linear` targets;
 - an MD array whose level is `raid0` and whose members form one uniform strip
   zone; and
@@ -24,9 +23,9 @@ support nested topologies, or submit I/O through the upper dm/MD device.
 
 ## 2. Operating contract and limitations
 
-Topology registration must happen before reads through the corresponding
-dm-linear or MD RAID0 device.  Once registered, the topology is visible to all
-open `/dev/p2p_device` file descriptors, not only the fd that registered it.
+Topology registration must happen before every read, including a read from a
+direct NVMe namespace.  Once registered, the topology is visible to all open
+`/dev/p2p_device` file descriptors, not only the fd that registered it.
 
 The registered topology must remain unchanged while it is pinned.  In
 particular, dm table reload, MD reshape, component replacement, slot changes,
@@ -45,10 +44,11 @@ without comparing their configuration with the installed configuration.  The
 callers are responsible for supplying the same topology.  This is an explicit
 simplification of this limited implementation.
 
-An already registered topology remains valid for in-flight reads after its
-last pin is dropped, because each read holds a separate lifetime reference.
-It is removed from the global lookup tree immediately after the last pin, so
-new reads can no longer acquire it.
+A read that acquired a topology before its last pin is dropped keeps that
+topology valid through mapping and request submission with a separate lifetime
+reference.  Submitted requests then keep their component queues active until
+completion.  The topology is removed from the global lookup tree immediately
+after the last pin, so new reads can no longer acquire it.
 
 ## 3. UAPI
 
@@ -70,11 +70,12 @@ struct topo_user_bdev {
 };
 
 struct topo_user_cfg {
-	/* Exactly "linear" or "raid0", including a terminating NUL. */
+	/* Exactly "nvme", "linear", or "raid0", including a terminating NUL. */
 	char name[P2P_TOPO_NAME_LEN];
 	__u32 top_dev;
 	__u32 nr_devs;
 	/*
+	 * nvme:   extra[0] = extra[1] = 0
 	 * linear: extra[0] = extra[1] = 0
 	 * raid0:  extra[0] = ilog2(chunk size in sectors), extra[1] = 0
 	 */
@@ -87,14 +88,16 @@ struct topo_user_cfg {
 
 The flexible array is not included in the encoded ioctl size.  The kernel
 first copies and validates the fixed header, rejects `nr_devs == 0` or
-`nr_devs > P2P_TOPO_MAX_BDEVS`, checks the complete allocation size for
-overflow, and then copies exactly `nr_devs` component entries.
+`nr_devs > P2P_TOPO_MAX_BDEVS`, then copies exactly the bounded number of
+component entries.
 
-NSID is intentionally absent from the UAPI.  The kernel obtains the actual
-NVMe NSID from each opened component bdev by invoking its block-device ioctl
-operation with `NVME_IOCTL_ID`, then stores the positive result in the kernel
-`topo_bdev`.  This avoids confusing the independently allocated namespace
-instance in names such as `nvme0n1` or `nvme0c1n1` with the NVMe command NSID.
+NSID is intentionally absent from both `p2p_read_param` and the topology UAPI.
+The kernel obtains the actual NVMe NSID from each opened component bdev by
+invoking its block-device ioctl operation with `NVME_IOCTL_ID`, then stores the
+positive result in the kernel `topo_bdev`.  This avoids trusting a caller value
+or confusing the independently allocated namespace instance in names such as
+`nvme0n1` or `nvme0c1n1` with the NVMe command NSID.  Removing the old
+`p2p_read_param.nsid` field intentionally changes the read ioctl ABI.
 
 ## 4. Kernel file organization and data structures
 
@@ -111,7 +114,7 @@ cross-file interfaces in `topo.h`.  The main driver source is `dev.c`.
   RCU-delayed destruction;
 - top and component bdev handles;
 - component NSID lookup through `NVME_IOCTL_ID`;
-- dm-linear and RAID0 mapping operations; and
+- NVMe, dm-linear, and RAID0 mapping operations; and
 - creation of the per-fd tracking entry for each successful `topo_add()`.
 
 `topo.h` is the internal interface between `dev.c` and `topo.c`.  For
@@ -124,7 +127,7 @@ the selected `topo_ops` mapping function directly.
 - `IOCTL_ADD_TOPO` dispatch;
 - embedding and initializing `shared_topo_list` in each `p2p_batch`;
 - calling `topo_del()` for those pins during p2p-fd release;
-- choosing direct-NVMe versus topology-aware reads;
+- requiring a registered topology for every read;
 - splitting reads by topology and destination queue limits; and
 - constructing and submitting the NVMe command.
 
@@ -248,8 +251,8 @@ returned pointer is not a read-path `refcnt`; its pin is released by
 `ERR_PTR(-ESTALE)` when the topology found by an RCU reader has already reached
 a zero lifetime reference count, or a valid topology with one read-path
 `refcnt`.  `topo_put()` releases that reference after the read has mapped and
-submitted all of its requests.  Callers must test `IS_ERR()` before treating a
-NULL result as the direct-NVMe case.
+submitted all of its requests.  Callers must test `IS_ERR()` and reject a NULL
+result with `-ENODEV`.
 
 `topo_add()` performs these steps:
 
@@ -284,11 +287,13 @@ into the preallocated `shared_topo` does not allocate and cannot fail.
 The kernel does not trust userspace topology discovery when creating a new
 topology.  It validates:
 
-- `name` is NUL-terminated and is exactly `linear` or `raid0`;
+- `name` is NUL-terminated and is exactly `nvme`, `linear`, or `raid0`;
 - `reserved` and every topology-specific unused `extra` field are zero;
 - `top_dev` and component device IDs decode to nonzero block-device numbers;
 - `nr_devs` is between one and four;
-- no component equals `top_dev` and component IDs are unique;
+- an `nvme` topology has exactly one component equal to `top_dev`;
+- a `linear` or `raid0` component does not equal `top_dev`, and component IDs
+  are unique;
 - each component is a whole NVMe namespace rather than a partition or an NVMe
   multipath head, using the existing NVMe-bdev validation;
 - every size is nonzero;
@@ -302,10 +307,12 @@ For `NVME_IOCTL_ID`, the helper verifies that the component's
 opened bdev, `BLK_OPEN_READ`, `NVME_IOCTL_ID`, and argument zero.  It does not
 parse `disk_name` and does not pass this lookup through userspace.
 
-The top device is expected to be dm or MD according to `name`.  The kernel can
-check the upper device identity exposed by sysfs, but it does not reconstruct
-the live dm table or MD metadata.  Exact correspondence with the active stack
-therefore remains part of the userspace operating contract.
+The top device is expected to be a direct NVMe namespace, dm, or MD according
+to `name`.  Component validation also validates the top device for `nvme`,
+because its sole component has the same device ID.  For dm and MD, the kernel
+checks the upper-device identity exposed by sysfs but does not reconstruct the
+live table or metadata.  Exact correspondence with the active stack therefore
+remains part of the userspace operating contract.
 
 ## 6. Lifetime and concurrency
 
@@ -386,11 +393,29 @@ most `in_nr_sectors` beginning at a logical sector on the top device and
 returns a `topo_bdev`, its physical sector, and the number of sectors that
 remain contiguous on that component without crossing a topology boundary.
 The returned `topo_bdev` supplies both the destination bdev handle and NSID.
-The operation returns an error for a sector outside the registered topology.
-Creation-time range and arithmetic validation guarantees that mapping an
-in-range sector cannot overflow.
+The dm-linear and RAID0 operations return an error for a sector outside the
+registered topology.  Creation-time range and arithmetic validation guarantees
+that mapping an in-range sector cannot overflow.  The direct NVMe operation is
+an unchecked pass-through for FIEMAP sectors from the registered namespace.
 
-### 7.1 dm-linear
+### 7.1 Direct NVMe
+
+The `nvme` backend has exactly one component.  Its device ID equals `top_dev`,
+its `start_sector` and both `extra` values are zero, and its `size_sector`
+equals the opened namespace size.  It uses a dedicated `nvme_map_sector()`
+callback:
+
+```text
+to_bdev       = bdevs[0]
+to_sector     = from_sector
+out_nr_sectors = in_nr_sectors
+```
+
+The callback is a pure pass-through: it selects the only component and returns
+the input sector and sector count unchanged.  It does not reuse the dm-linear
+mapping callback.
+
+### 7.2 dm-linear
 
 Userspace orders entries by the logical start of their dm table targets.  The
 kernel requires the sum of their `size_sector` values to equal the top bdev
@@ -411,7 +436,7 @@ The returned length stops at a linear-target boundary.  The normal read
 splitting logic may shorten it further for an IOV boundary or destination
 queue limit.
 
-### 7.2 MD RAID0
+### 7.3 MD RAID0
 
 This implementation supports only a single uniform strip zone.  Userspace
 orders entries by MD slot.  The kernel requires:
@@ -448,26 +473,24 @@ members.
 After resolving the bdev from `file_fd`, `p2p_read_file()` calls
 `topo_get(bdev)`:
 
-- if `IS_ERR(topo)` is true, it returns `PTR_ERR(topo)` without falling back to
-  the direct-device path;
-- if `topo` is NULL, it validates the bdev as a direct NVMe namespace and
-  preserves the existing read behavior and `p2p_read_param.nsid`; or
-- if a topology exists, it maps every source extent through
-  `topo->ops->map_sector()` and drops the topology reference after all possible
-  requests have been submitted.
+- if `IS_ERR(topo)` is true, it returns `PTR_ERR(topo)`;
+- if `topo` is NULL, it returns `-ENODEV` because registration is mandatory; or
+- otherwise, it maps every source extent through `topo->ops->map_sector()` and
+  drops the topology reference after all possible requests have been
+  submitted.
 
 For a topology read, each iteration is limited by all of:
 
 - sectors remaining in the FIEMAP extent;
 - bytes remaining in the current physical-address IOV segment;
-- sectors returned by `map_sector()`, which stop at a dm target or RAID0 chunk
-  boundary; and
+- sectors returned by `map_sector()`, which stop at the end of an NVMe
+  namespace, a dm target, or a RAID0 chunk boundary; and
 - `p2p_queue_max_sectors()` for the mapped component bdev.
 
 `dev.c` submits the request to `to_bdev->handle->bdev`'s queue, uses the
-returned `to_sector`, and places `to_bdev->nsid` in the NVMe command.  Queue
-limits must be calculated per mapped component; the upper dm/MD queue limit
-and a single `io_ctx->max_sectors` value are insufficient.
+returned `to_sector`, and places `to_bdev->nsid` in the NVMe command.  There is
+no caller-supplied NSID or direct-device fallback.  Queue limits are calculated
+per mapped component; an upper dm/MD queue limit is insufficient.
 
 ### 8.1 Per-request command construction
 
@@ -510,14 +533,23 @@ int add_topo(int dev_fd, const char *dev);
 `stat()` and probes `/sys/dev/block/<major>:<minor>/`:
 
 - `device/subsysnqn` identifies a direct NVMe namespace.  The helper returns
-  zero without issuing `ADD_TOPO`;
+  an `nvme` configuration;
 - `dm/` selects dm discovery; and
 - `md/` selects MD discovery.
 
 Unknown devices and unsupported stacks return `-EOPNOTSUPP`.  System-call and
 library failures are returned as negative errno values.
 
-### 9.1 dm-linear discovery
+### 9.1 Direct NVMe discovery
+
+Open the supplied block-device path and issue `BLKGETSIZE64`.  Reject a zero or
+non-512-byte-aligned result.  Set `name = "nvme"`, set `nr_devs = 1`, encode
+the same device as both `top_dev` and `bdevs[0].dev_id`, set `start_sector = 0`,
+and convert the returned byte size to `bdevs[0].size_sector`.  Both `extra`
+values remain zero.  The common `ADD_TOPO` ioctl registers this configuration;
+direct NVMe is not a userspace no-op.
+
+### 9.2 dm-linear discovery
 
 Query the active table through the device-mapper ioctl UAPI in
 `<linux/dm-ioctl.h>`.  Open `/dev/mapper/control`, issue `DM_TABLE_STATUS` with
@@ -543,7 +575,7 @@ length, and set `start_sector` to the component offset from the linear target
 parameters.  Preserve target order in `bdevs[]`.  Set `name = "linear"` and
 both `extra` values to zero.
 
-### 9.2 MD RAID0 discovery
+### 9.3 MD RAID0 discovery
 
 Read `/sys/dev/block/<major>:<minor>/md/level`, `chunk_size`, `raid_disks`,
 `degraded`, and the member `dev-*` directories.  Reject the array unless:
@@ -585,9 +617,8 @@ Use consistent errors for topology operations:
 - the underlying bdev-open or ioctl error when it gives more precise failure
   information.
 
-If a read resolves to a non-NVMe bdev and no registered topology exists, retain
-the current direct-device validation error.  Do not attempt to discover or
-register a topology implicitly from the read ioctl.
+If no topology is registered for the resolved bdev, the read returns
+`-ENODEV`.  The read ioctl does not discover or register a topology implicitly.
 
 ## 11. Implementation order
 
@@ -597,9 +628,9 @@ register a topology implicitly from the read ioctl.
    `IOCTL_ADD_TOPO`, and `add_topo()` discovery.
 3. Add topology objects, radix-tree lookup, spinlock-protected insertion/pin
    management, RCU-work destruction, and per-fd tracking.
-4. Add strict common, dm-linear, and RAID0 validation plus component NSID
+4. Add strict common, NVMe, dm-linear, and RAID0 validation plus component NSID
    lookup through `NVME_IOCTL_ID`.
-5. Implement and unit-test both sector-mapping operations independently.
+5. Implement and unit-test all three sector-mapping operations independently.
 6. Hold topology references through `do_read_ios()` and integrate mapped bdev,
    sector, NSID, boundary, and queue-limit selection into request submission.
 7. Replace `cmd_list` with a stack-local command copied by
@@ -622,16 +653,17 @@ register a topology implicitly from the read ioctl.
 
 ### Mapping tests
 
+- direct NVMe reads at sector zero and the final namespace sector;
 - dm-linear reads wholly inside each target and reads crossing every target
   boundary;
 - RAID0 reads at the first/last sector of a chunk, across a chunk boundary,
   across a full stripe, and at the final array sector;
 - arithmetic near the end of every component range; and
-- mapping input outside the top-device size.
+- dm-linear and RAID0 mapping input outside the top-device size.
 
 ### Registration and lifetime tests
 
-- direct NVMe `add_topo()` is a no-op;
+- direct NVMe `add_topo()` installs and pins an `nvme` topology;
 - two threads concurrently add the same top device and both fds can read;
 - repeated adds on one fd create pins that are all released by close;
 - the topology remains visible after one of multiple owner fds closes;
@@ -643,6 +675,8 @@ register a topology implicitly from the read ioctl.
 
 ### End-to-end I/O tests
 
+- direct NVMe after explicit registration, including a namespace whose NSID is
+  not one;
 - dm-linear with two to four NVMe components, including reads crossing target
   boundaries;
 - uniform two- to four-member MD RAID0, including reads crossing chunk and
@@ -655,6 +689,7 @@ register a topology implicitly from the read ioctl.
 
 ### Negative tests
 
+- read without a registered topology;
 - non-linear dm target, discontinuous dm table, and nested dm/MD component;
 - RAID level other than RAID0, degraded/missing member, duplicate slot,
   unequal member offset or size, and invalid chunk size;
