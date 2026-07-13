@@ -184,8 +184,6 @@ struct topo {
 	struct bdev_handle *top_handle;
 	union topo_priv priv;
 
-	/* Set before removal from the radix tree. */
-	bool deleting;
 	/* Object lifetime: tree ownership plus active read references. */
 	struct kref refcnt;
 	/* Number of successful ADD_TOPO calls that still own a pin. */
@@ -209,6 +207,11 @@ struct shared_topo_list {
 `struct shared_topo_list`.  Each entry in the list represents exactly one pin
 owned by that fd.  Passing only this embedded list to `topo_add()` prevents
 `topo.c` from depending on the rest of the private I/O-batch representation.
+
+`topo.name` and `topo_bdev.id` remain in the installed object even though the
+mapping path can operate from `ops` and the opened handles alone.  Registration,
+pin, and release debug messages use them to identify the topology and component
+device numbers.
 
 The topology tree is a radix tree keyed by the encoded `dev_t` value.  Tree
 mutation and `pin_refcnt` changes are serialized by the topology spinlock in
@@ -238,39 +241,38 @@ variable-length userspace configuration into kernel memory.  `topo_add()`
 allocates a `shared_topo` and, on success, stores the returned topology in that
 node and links it into the supplied `shared_topo_list`.  The ioctl handler
 frees the copied configuration and returns `PTR_ERR_OR_ZERO(topo)`.  The
-returned pointer is not an active-I/O `refcnt`; its pin is released by
+returned pointer is not a read-path `refcnt`; its pin is released by
 `topo_del()` when the related p2p fd closes.
 
 `topo_get()` returns NULL when the top bdev has no registered topology,
-`ERR_PTR(-ESTALE)` when lookup encounters a topology whose deletion has
-started, or a valid topology with one active-I/O `refcnt`.  `topo_put()`
-releases that reference after the I/O has completed.  Callers must test
-`IS_ERR()` before treating a NULL result as the direct-NVMe case.
+`ERR_PTR(-ESTALE)` when the topology found by an RCU reader has already reached
+a zero lifetime reference count, or a valid topology with one read-path
+`refcnt`.  `topo_put()` releases that reference after the read has mapped and
+submitted all of its requests.  Callers must test `IS_ERR()` before treating a
+NULL result as the direct-NVMe case.
 
 `topo_add()` performs these steps:
 
-1. Validate the already-copied fixed header and component array.
-2. Allocate a candidate `topo`, its component array, and a `shared_topo`
-   tracking entry.
-3. Decode and open the top bdev read-only with `bdev_open_by_dev()`.
-4. Decode and open every component bdev read-only.  Opening the bdevs pins the
-   upper device and components against removal and `dev_t` reuse.
-5. Validate the common constraints and the topology-specific configuration.
-6. For each component, invoke its bdev ioctl operation with `NVME_IOCTL_ID` and
-   store the returned positive NSID in `topo_bdev.nsid`.
-7. Initialize `deleting` to false and initialize `refcnt` and `pin_refcnt` to
-   one.  The initial `refcnt` is the global-tree reference; the initial
-   `pin_refcnt` belongs to this ADD call.
-8. Call `radix_tree_preload(GFP_KERNEL)` before taking the topology spinlock.
-9. Under the spinlock, look up `top_dev`:
-   - if it is absent, insert the candidate;
-   - if it is present, increment the installed topology's `pin_refcnt` and
-     return that topology.  Do not compare the candidate with the installed
-     topology.
-10. Store the pinned topology in the new `shared_topo` and link it into the
-    supplied list under `list->lock`.
-11. End the radix-tree preload.  On the duplicate path, synchronously release
-    the unused candidate and all bdev handles outside both spinlocks.
+1. Decode and validate `top_dev`, then allocate a `shared_topo` tracking entry.
+2. Under the topology spinlock, look up `top_dev`.  If it already exists,
+   increment its `pin_refcnt`, link it into the supplied per-fd list, and return
+   it without validating or opening the duplicate caller's component list.
+3. If the initial lookup misses, validate the copied header and component array
+   and allocate a candidate `topo` and its component array.
+4. Open the top and component bdevs read-only with `bdev_open_by_dev()`.  The
+   handles pin the devices against removal and `dev_t` reuse.
+5. Validate the common and topology-specific constraints.  For each component,
+   invoke its bdev ioctl operation with `NVME_IOCTL_ID` and store the positive
+   result in `topo_bdev.nsid`.
+6. Initialize `refcnt` and `pin_refcnt` to one.  The initial `refcnt` is the
+   global-tree reference; the initial `pin_refcnt` belongs to this ADD call.
+7. Call `radix_tree_preload(GFP_KERNEL)`, then look up `top_dev` again under the
+   spinlock to close the race with another creator.  Insert the candidate if it
+   is still absent; otherwise pin the topology that won the race.
+8. Store the pinned topology in the preallocated `shared_topo` and link it into
+   the supplied list under `list->lock`.
+9. End the radix-tree preload.  On the raced-duplicate path, synchronously
+   release the unused candidate and all bdev handles outside both spinlocks.
 
 Failures before insertion synchronously destroy the candidate.  Once a
 candidate is inserted, every exit path must either return its pinned pointer
@@ -279,14 +281,14 @@ into the preallocated `shared_topo` does not allocate and cannot fail.
 
 ### 5.1 Common kernel validation
 
-The kernel does not trust userspace topology discovery.  It validates:
+The kernel does not trust userspace topology discovery when creating a new
+topology.  It validates:
 
 - `name` is NUL-terminated and is exactly `linear` or `raid0`;
 - `reserved` and every topology-specific unused `extra` field are zero;
 - `top_dev` and component device IDs decode to nonzero block-device numbers;
 - `nr_devs` is between one and four;
 - no component equals `top_dev` and component IDs are unique;
-- the opened top bdev's `bd_dev` equals `top_dev`;
 - each component is a whole NVMe namespace rather than a partition or an NVMe
   multipath head, using the existing NVMe-bdev validation;
 - every size is nonzero;
@@ -314,35 +316,31 @@ The read path performs lockless lookup:
 ```c
 rcu_read_lock();
 topo = radix_tree_lookup(&topo_tree, top_bdev->bd_dev);
-if (!topo) {
-	rcu_read_unlock();
-	return NULL;
-}
+if (!topo)
+	goto out;
 if (!kref_get_unless_zero(&topo->refcnt)) {
-	rcu_read_unlock();
-	return ERR_PTR(-ESTALE);
+	topo = ERR_PTR(-ESTALE);
+	goto out;
 }
-if (unlikely(READ_ONCE(topo->deleting))) {
-	rcu_read_unlock();
-	topo_put(topo);
-	return ERR_PTR(-ESTALE);
-}
+
+out:
 rcu_read_unlock();
 return topo;
 ```
 
 The `kref_get_unless_zero()` failure covers an object whose lifetime count has
 already reached zero but whose memory remains visible to an earlier RCU
-reader.  The `deleting` check covers an object still kept alive by other active
-I/O references after its last topology pin was dropped.  A successful result
-owns one `refcnt`; that topology reference is stored in `p2p_io_context` and is
-not dropped through `topo_put()` until all requests belonging to the read have
-completed and the context is freed.
+reader.  A reader that obtained the tree pointer before removal may still
+acquire a reference and proceed if another reference keeps the object alive;
+otherwise it receives `-ESTALE`.  A successful result owns one `refcnt`, so
+radix-tree removal can proceed concurrently without invalidating that reader.
+The read path holds the reference while mapping and submitting requests, then
+drops it through `topo_put()` after command submission has finished.
 
-Deletion can start immediately after the final `deleting` check.  That result
-is still valid: acquiring the reference and observing `deleting == false`
-linearizes the lookup before deletion, and the acquired `refcnt` keeps all
-topology state and bdev handles alive for the read.
+The acquired `refcnt` keeps all topology state and bdev handles alive through
+request allocation and submission.  Each allocated block request holds its
+component request queue active until that request completes, so the topology
+reference is not needed by completion or drain.
 
 ### 6.2 Pin release
 
@@ -353,13 +351,12 @@ one `pin_refcnt`, using the topology spinlock in `topo.c` to serialize the
 possible last put with concurrent insertion.  The final-pin release callback
 executes while protected by that spinlock and:
 
-1. sets `topo->deleting` with `WRITE_ONCE()`;
-2. deletes the topology from the radix tree; and
-3. drops the tree's initial `refcnt`.
+1. deletes the topology from the radix tree; and
+2. drops the tree's initial `refcnt`.
 
-Setting `deleting` before radix-tree removal lets an RCU reader that already
-obtained the old tree pointer distinguish it from a topology that is still
-available for new reads.
+An RCU reader that obtained the old tree pointer before removal may acquire a
+live reference and complete against that topology.  A reader that cannot
+acquire the reference returns `-ESTALE`.
 
 The final `refcnt` release cannot call `bdev_release()`, because it can occur
 from an atomic context and because RCU readers may still hold the old pointer.
@@ -389,8 +386,9 @@ most `in_nr_sectors` beginning at a logical sector on the top device and
 returns a `topo_bdev`, its physical sector, and the number of sectors that
 remain contiguous on that component without crossing a topology boundary.
 The returned `topo_bdev` supplies both the destination bdev handle and NSID.
-The operation returns an error for a sector outside the registered topology or
-for any overflow.
+The operation returns an error for a sector outside the registered topology.
+Creation-time range and arithmetic validation guarantees that mapping an
+in-range sector cannot overflow.
 
 ### 7.1 dm-linear
 
@@ -454,8 +452,9 @@ After resolving the bdev from `file_fd`, `p2p_read_file()` calls
   the direct-device path;
 - if `topo` is NULL, it validates the bdev as a direct NVMe namespace and
   preserves the existing read behavior and `p2p_read_param.nsid`; or
-- if a topology exists, it stores that reference in the new I/O context and
-  maps every source extent through `topo->ops->map_sector()`.
+- if a topology exists, it maps every source extent through
+  `topo->ops->map_sector()` and drops the topology reference after all possible
+  requests have been submitted.
 
 For a topology read, each iteration is limited by all of:
 
@@ -495,8 +494,9 @@ completion context is needed.
 
 If submission fails after some requests were already issued, `issue_err`
 records the first issue-side error.  The I/O context remains on the batch list,
-and drain still waits for and frees all successfully submitted requests before
-dropping the topology reference.
+and drain still waits for and frees all successfully submitted requests.  The
+topology reference is dropped immediately after the submission loop, including
+this partial-submission case.
 
 ## 9. Userspace topology discovery
 
@@ -521,10 +521,11 @@ library failures are returned as negative errno values.
 
 Query the active table through the device-mapper ioctl UAPI in
 `<linux/dm-ioctl.h>`.  Open `/dev/mapper/control`, issue `DM_TABLE_STATUS` with
-`DM_STATUS_TABLE_FLAG` and the top device number, grow the result buffer when
-`DM_BUFFER_FULL_FLAG` is returned, and iterate the returned
-`dm_target_spec` records.  This discovery path has no build or runtime
-dependency on libdevmapper.
+`DM_STATUS_TABLE_FLAG` and the top device number into a fixed 16 KiB result
+buffer, and iterate the returned `dm_target_spec` records.  The supported table
+has at most four small linear records, so `DM_BUFFER_FULL_FLAG` is rejected with
+`-E2BIG` rather than growing the buffer.  This discovery path has no build or
+runtime dependency on libdevmapper.
 
 Reject the table unless:
 
@@ -562,10 +563,10 @@ Read each member's `slot`, `offset`, and `size`, sort by slot, and fill the
 component array in that order.  Set `name = "raid0"`, set `extra[0]` to
 `ilog2(chunk_size / 512)`, and set `extra[1]` to zero.
 
-Userspace should re-read the essential values after assembling the structure
-and fail if they changed during discovery.  This narrows, but cannot eliminate,
-the race with administrative topology changes; the no-reconfiguration
-operating contract remains required.
+Userspace takes one snapshot while assembling the structure.  It does not
+repeat the full discovery because a second snapshot cannot close the remaining
+race before registration.  The no-reconfiguration operating contract remains
+required.
 
 ## 10. Error behavior
 
@@ -576,7 +577,8 @@ Use consistent errors for topology operations:
   or a configuration that does not match the selected topology type;
 - `-E2BIG`: component count or variable-size allocation exceeds a limit;
 - `-ENODEV`: a device number cannot be opened or a required device disappeared;
-- `-ESTALE`: `topo_get()` observed a topology whose deletion had started;
+- `-ESTALE`: `topo_get()` found an RCU-visible topology whose lifetime
+  reference count had already reached zero;
 - `-EOPNOTSUPP`: unsupported top-device type, component type, NVMe multipath
   head, nested topology, or unavailable `NVME_IOCTL_ID`;
 - `-ENOMEM`: allocation or radix-tree preload failed; and
@@ -598,8 +600,8 @@ register a topology implicitly from the read ioctl.
 4. Add strict common, dm-linear, and RAID0 validation plus component NSID
    lookup through `NVME_IOCTL_ID`.
 5. Implement and unit-test both sector-mapping operations independently.
-6. Carry topology references in `p2p_io_context` and integrate mapped bdev,
-   sector, NSID, boundary, and queue-limit selection into `do_read_ios()`.
+6. Hold topology references through `do_read_ios()` and integrate mapped bdev,
+   sector, NSID, boundary, and queue-limit selection into request submission.
 7. Replace `cmd_list` with a stack-local command copied by
    `nvme_init_request()` for each submitted request.
 8. Call `topo_init()` before publishing the character device and call
@@ -636,7 +638,7 @@ register a topology implicitly from the read ioctl.
 - the last owner close removes it from new lookup;
 - a read acquired before the last owner close completes safely afterward; and
 - a `topo_get()` racing with last-owner close returns either a referenced
-  topology or `-ESTALE`, never a deleting topology without a reference; and
+  topology or `-ESTALE`, never a topology without a lifetime reference; and
 - repeated register/close and module unload exercise the RCU release path.
 
 ### End-to-end I/O tests
