@@ -9,10 +9,8 @@
 #include <linux/uaccess.h>
 #include <linux/ioctl.h>
 #include <linux/vmalloc.h>
-#include <linux/ktime.h>
 #include <linux/idr.h>
 #include <linux/notifier.h>
-#include <linux/namei.h>
 #include <linux/tracepoint.h>
 #include <linux/limits.h>
 #include <linux/overflow.h>
@@ -30,14 +28,9 @@
 #include "topo.h"
 
 #define P2P_NVME_MAX_RW_SECTORS ((1U << 20) >> SECTOR_SHIFT)
-#define P2P_SYSFS_BDEV_PATH_MAX 48
 #define P2P_MAX_IOV 65536U
 #define P2P_MAX_EXTENTS 1048576U
 #define P2P_MIN_PAGE_SIZE (64U << 10)
-
-u64 g_time = 0;
-u64 g_count = 0;
-u64 g_size = 0;
 
 struct p2p_pa_iov {
 	u64 addr;
@@ -61,7 +54,6 @@ struct p2p_iov_map {
 struct p2p_io_context {
 	struct block_device *bdev;
 	struct file *file;
-	struct topo *topo;
 	unsigned int nsid;
 	struct p2p_pa_iov *pa_iov;
 	unsigned int pa_iov_nr;
@@ -71,9 +63,6 @@ struct p2p_io_context {
 	int io_err;
 	int issue_err;
 	struct list_head io_list;
-	unsigned int cmd_id;
-	u64 start_time;
-	u64 end_time;
 };
 
 struct p2p_batch {
@@ -226,13 +215,13 @@ static inline u64 p2p_iov_iter_addr(const struct p2p_iov_iter *iter)
 	return iter->iov->addr + iter->iov_offset;
 }
 
-static u64 p2p_iov_iter_single_seg_count(const struct p2p_iov_iter *iter)
+static u32 p2p_iov_iter_single_seg_sectors(const struct p2p_iov_iter *iter)
 {
 	if (!iter->count)
 		return 0;
 	if (WARN_ON_ONCE(iter->iov_offset >= iter->iov->len))
 		return 0;
-	return iter->iov->len - iter->iov_offset;
+	return (iter->iov->len - iter->iov_offset) >> SECTOR_SHIFT;
 }
 
 static void p2p_iov_iter_advance(struct p2p_iov_iter *iter, u64 bytes)
@@ -377,8 +366,6 @@ free_maps:
 static void free_io_ctx(struct p2p_io_context *io_ctx)
 {
 	kvfree(io_ctx->pa_iov);
-	if (io_ctx->topo)
-		topo_put(io_ctx->topo);
 	fput(io_ctx->file);
 	kfree(io_ctx);
 }
@@ -393,7 +380,7 @@ static inline unsigned int p2p_queue_max_sectors(struct block_device *bdev)
 }
 
 static struct p2p_io_context *new_io_ctx(struct block_device *bdev,
-					 struct file *file, struct topo *topo,
+					 struct file *file,
 					 unsigned int nsid,
 					 struct p2p_pa_iov *pa_iov,
 					 unsigned int pa_iov_nr, u64 data_size)
@@ -406,12 +393,10 @@ static struct p2p_io_context *new_io_ctx(struct block_device *bdev,
 
 	io_ctx->bdev = bdev;
 	io_ctx->file = file;
-	io_ctx->topo = topo;
 	io_ctx->nsid = nsid;
 	io_ctx->pa_iov = pa_iov;
 	io_ctx->pa_iov_nr = pa_iov_nr;
 	io_ctx->data_size = data_size;
-	io_ctx->start_time = ktime_get_ns();
 
 	atomic_set(&io_ctx->io_ref, 1);
 	INIT_LIST_HEAD(&io_ctx->io_list);
@@ -565,13 +550,12 @@ static void p2p_tp_hook_exit(void)
 static enum rq_end_io_ret end_read_io(struct request *req, blk_status_t status)
 {
 	struct p2p_io_context *io_ctx = req->end_io_data;
+
 	if (status)
 		cmpxchg(&io_ctx->io_err, 0, status);
 
-	io_ctx->end_time = ktime_get_ns();
-	if (!atomic_dec_and_test(&io_ctx->io_ref)) {
+	if (!atomic_dec_and_test(&io_ctx->io_ref))
 		return RQ_END_IO_FREE;
-	}
 
 	complete(&io_ctx->io_done);
 	return RQ_END_IO_FREE;
@@ -601,7 +585,8 @@ static int do_read_io(struct p2p_io_context *io_ctx,
 
 	req = blk_mq_alloc_request(queue, REQ_OP_DRV_IN, 0);
 	if (IS_ERR(req)) {
-		pr_err("Failed to alloc request\n");
+		pr_err("p2p: failed to allocate request: %ld\n",
+		       PTR_ERR(req));
 		return PTR_ERR(req);
 	}
 	nvme_init_request(req, &cmd);
@@ -610,14 +595,13 @@ static int do_read_io(struct p2p_io_context *io_ctx,
 	req->end_io_data = io_ctx;
 	req->end_io = end_read_io;
 	atomic_inc(&io_ctx->io_ref);
-	io_ctx->cmd_id++;
 
 	blk_execute_rq_nowait(req, true);
 
 	return 0;
 }
 
-static int do_read_ios(struct p2p_io_context *io_ctx,
+static int do_read_ios(struct p2p_io_context *io_ctx, struct topo *topo,
 		       struct fiemap_extent *extents, unsigned int nr)
 {
 	struct p2p_iov_iter iter;
@@ -629,20 +613,19 @@ static int do_read_ios(struct p2p_io_context *io_ctx,
 
 	for (i = 0; i < nr && p2p_iov_iter_count(&iter); i++) {
 		u64 sector = extents[i].fe_physical >> SECTOR_SHIFT;
-		u64 left = extents[i].fe_length >> SECTOR_SHIFT;
+		/* The current use case limits each extent to less than 2 TiB. */
+		u32 left = extents[i].fe_length >> SECTOR_SHIFT;
 		unsigned int to_read;
 
-		while (left > 0 && p2p_iov_iter_count(&iter)) {
+		while (left && p2p_iov_iter_count(&iter)) {
 			struct block_device *to_bdev = io_ctx->bdev;
 			struct topo_bdev *topo_bdev = NULL;
 			u64 to_sector = sector;
-			u64 iov_left;
-			u32 topo_limit = min_t(u64, left, U32_MAX);
+			u32 topo_limit = left;
 			u32 nsid = io_ctx->nsid;
 
-			if (io_ctx->topo) {
-				err = io_ctx->topo->ops->map_sector(io_ctx->topo,
-							 sector, topo_limit,
+			if (topo) {
+				err = topo->ops->map_sector(topo, sector, topo_limit,
 							 &topo_bdev, &to_sector,
 							 &topo_limit);
 				if (err)
@@ -651,14 +634,13 @@ static int do_read_ios(struct p2p_io_context *io_ctx,
 				nsid = topo_bdev->nsid;
 			}
 
-			iov_left = p2p_iov_iter_single_seg_count(&iter) >>
-				   SECTOR_SHIFT;
 			to_read = min3(topo_limit,
 				       p2p_queue_max_sectors(to_bdev),
-				       (u32)min_t(u64, iov_left, U32_MAX));
+				       p2p_iov_iter_single_seg_sectors(&iter));
 			if (!to_read) {
-				pr_err("p2p: zero read size at extent %u, extent sectors 0x%llx, IOV bytes 0x%llx\n",
-				       i, left, p2p_iov_iter_count(&iter));
+				pr_err("p2p: zero read size at extent %u, extent sectors 0x%x, IOV bytes 0x%llx\n",
+				       i, left,
+				       p2p_iov_iter_count(&iter));
 				err = -EINVAL;
 				goto out;
 			}
@@ -684,9 +666,8 @@ out:
 
 static int wait_io_done(struct p2p_io_context *io_ctx)
 {
-	if (!atomic_dec_and_test(&io_ctx->io_ref)) {
+	if (!atomic_dec_and_test(&io_ctx->io_ref))
 		wait_for_completion_io(&io_ctx->io_done);
-	}
 	return io_ctx->io_err;
 }
 
@@ -747,30 +728,12 @@ static struct block_device *p2p_bdev_from_file(struct file *file)
 	return sb->s_bdev;
 }
 
-static bool p2p_sysfs_bdev_attr_exists(dev_t devt, const char *attr)
-{
-	char name[P2P_SYSFS_BDEV_PATH_MAX];
-	struct path path;
-	int len;
-	int err;
-
-	len = snprintf(name, sizeof(name), "/sys/dev/block/%u:%u/device/%s",
-		       MAJOR(devt), MINOR(devt), attr);
-	WARN_ON_ONCE(len >= (int)sizeof(name));
-
-	err = kern_path(name, LOOKUP_FOLLOW, &path);
-	if (err)
-		return false;
-	path_put(&path);
-	return true;
-}
-
 static int p2p_validate_nvme_bdev(struct block_device *bdev)
 {
 	dev_t devt = bdev->bd_dev;
 
-	if (p2p_sysfs_bdev_attr_exists(devt, "subsysnqn")) {
-		if (p2p_sysfs_bdev_attr_exists(devt, "iopolicy")) {
+	if (p2p_sysfs_bdev_path_exists(devt, "device/subsysnqn")) {
+		if (p2p_sysfs_bdev_path_exists(devt, "device/iopolicy")) {
 			pr_err("p2p: NVMe multipath head %u:%u is unsupported\n",
 			       MAJOR(devt), MINOR(devt));
 			return -EOPNOTSUPP;
@@ -861,17 +824,20 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 	if (err)
 		goto put_topo;
 
-	io_ctx = new_io_ctx(bdev, reg_file, topo, param.nsid, pa_iov,
+	io_ctx = new_io_ctx(bdev, reg_file, param.nsid, pa_iov,
 			    pa_iov_nr, data_size);
 	if (IS_ERR(io_ctx)) {
 		err = PTR_ERR(io_ctx);
 		goto free_pa_iov;
 	}
 	reg_file = NULL;
-	topo = NULL;
 	pa_iov = NULL;
 
-	io_ctx->issue_err = do_read_ios(io_ctx, extents, param.ext_nr);
+	io_ctx->issue_err = do_read_ios(io_ctx, topo, extents, param.ext_nr);
+	if (topo) {
+		topo_put(topo);
+		topo = NULL;
+	}
 
 	spin_lock(&batch_lock);
 	batch->io_cnt++;
@@ -896,9 +862,6 @@ free_iov:
 static int p2p_drain_read(struct p2p_batch *batch)
 {
 	struct p2p_io_context *io_ctx, *next_io_ctx;
-	unsigned int total_cnt;
-	unsigned int got_cnt;
-	unsigned int err_cnt;
 	int first_err = 0;
 	LIST_HEAD(tmp);
 
@@ -907,19 +870,12 @@ static int p2p_drain_read(struct p2p_batch *batch)
 
 	spin_lock(&batch_lock);
 	list_splice_init(&batch->io_list, &tmp);
-	total_cnt = batch->io_cnt;
 	batch->io_cnt = 0;
 	spin_unlock(&batch_lock);
 
-	if (total_cnt == 0)
-		return 0;
-
-	err_cnt = 0;
-	got_cnt = 0;
 	list_for_each_entry_safe(io_ctx, next_io_ctx, &tmp, io_list) {
 		int err, io_err;
 
-		got_cnt++;
 		err = io_ctx->issue_err;
 		io_err = wait_io_done(io_ctx);
 
@@ -929,36 +885,19 @@ static int p2p_drain_read(struct p2p_batch *batch)
 			err = blk_status_to_errno(io_err);
 		}
 
-		if (!err)
+		if (!err) {
 			dump_pa_content(io_ctx->pa_iov[0].addr,
 					min_t(u64, io_ctx->data_size,
 					      io_ctx->pa_iov[0].len));
-		else {
-			err_cnt++;
+		} else {
 			if (!first_err)
 				first_err = err;
-		}
-
-		if (!err && io_ctx->cmd_id != 0) {
-			g_time += (io_ctx->end_time - io_ctx->start_time);
-			g_size += io_ctx->data_size;
-			g_count++;
-		} else {
-			pr_info("cmd_id %u\n", io_ctx->cmd_id);
 		}
 
 		list_del_init(&io_ctx->io_list);
 		free_io_ctx(io_ctx);
 	}
 
-	if (g_count >= 1000 && g_time) {
-		pr_info("end drain %d read got cnt %d/%d/%llu io %llu/%llu bandwidth %llu\n",
-			batch->batch_id, got_cnt, err_cnt, g_count, g_size,
-			g_time, g_size / g_time);
-		g_time = 0;
-		g_size = 0;
-		g_count = 0;
-	}
 	return first_err;
 }
 
@@ -967,7 +906,6 @@ static int p2p_add_topo(struct p2p_batch *batch, void __user *arg)
 	struct topo_user_cfg header;
 	struct topo_user_cfg *cfg;
 	struct topo *topo;
-	size_t entries_size;
 	size_t size;
 	int err;
 
@@ -977,10 +915,8 @@ static int p2p_add_topo(struct p2p_batch *batch, void __user *arg)
 		return -EINVAL;
 	if (header.nr_devs > P2P_TOPO_MAX_BDEVS)
 		return -E2BIG;
-	if (check_mul_overflow((size_t)header.nr_devs,
-			       sizeof(header.bdevs[0]), &entries_size) ||
-	    check_add_overflow(sizeof(header), entries_size, &size))
-		return -E2BIG;
+	size = sizeof(header) +
+	       header.nr_devs * sizeof(header.bdevs[0]);
 
 	cfg = memdup_user(arg, size);
 	if (IS_ERR(cfg))
@@ -1027,8 +963,7 @@ static int __init p2p_drv_init(void)
 
 	err = topo_init();
 	if (err) {
-		pr_err("p2p: initialize topology release workqueue err %d\n",
-		       err);
+		pr_err("p2p: initialize topology release workqueue err %d\n", err);
 		return err;
 	}
 
@@ -1040,8 +975,7 @@ static int __init p2p_drv_init(void)
 
 	err = alloc_chrdev_region(&dev, 0, 1, "p2p_device");
 	if (err < 0) {
-		pr_err("p2p: cannot allocate major number err %d\n",
-		       err);
+		pr_err("p2p: cannot allocate major number err %d\n", err);
 		goto unregister_hook;
 	}
 

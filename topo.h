@@ -41,7 +41,6 @@ struct topo {
 	struct bdev_handle *top_handle;
 	union topo_priv priv;
 
-	bool deleting;
 	struct kref refcnt;
 	struct kref pin_refcnt;
 	struct rcu_work rcu_work;
@@ -57,6 +56,7 @@ struct shared_topo_list {
 	struct list_head head;
 };
 
+bool p2p_sysfs_bdev_path_exists(dev_t devt, const char *suffix);
 int topo_init(void);
 void topo_exit(void);
 struct topo *topo_add(const struct topo_user_cfg *cfg,

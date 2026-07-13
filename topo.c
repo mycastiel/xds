@@ -18,7 +18,7 @@ static RADIX_TREE(topo_tree, GFP_ATOMIC);
 static DEFINE_SPINLOCK(topo_lock);
 static struct workqueue_struct *topo_release_wq;
 
-static bool topo_sysfs_path_exists(dev_t devt, const char *suffix)
+bool p2p_sysfs_bdev_path_exists(dev_t devt, const char *suffix)
 {
 	char name[P2P_SYSFS_BDEV_PATH_MAX];
 	struct path path;
@@ -43,9 +43,9 @@ static int topo_validate_nvme_bdev(struct block_device *bdev)
 
 	if (bdev_is_partition(bdev))
 		return -EOPNOTSUPP;
-	if (!topo_sysfs_path_exists(devt, "device/subsysnqn"))
+	if (!p2p_sysfs_bdev_path_exists(devt, "device/subsysnqn"))
 		return -EOPNOTSUPP;
-	if (topo_sysfs_path_exists(devt, "device/iopolicy"))
+	if (p2p_sysfs_bdev_path_exists(devt, "device/iopolicy"))
 		return -EOPNOTSUPP;
 	return 0;
 }
@@ -62,7 +62,7 @@ static int topo_get_nsid(struct block_device *bdev, u32 *nsid)
 	if (ret < 0)
 		return ret;
 	if (!ret)
-		return -EOPNOTSUPP;
+		return -EINVAL;
 
 	*nsid = ret;
 	return 0;
@@ -74,7 +74,6 @@ static int linear_map_sector(struct topo *topo, u64 from_sector,
 {
 	u64 logical_start = 0;
 	u64 offset;
-	u64 mapped;
 	u64 available;
 	u32 i;
 
@@ -90,11 +89,9 @@ static int linear_map_sector(struct topo *topo, u64 from_sector,
 		}
 
 		offset = from_sector - logical_start;
-		if (check_add_overflow(bdev->start_sector, offset, &mapped))
-			return -EOVERFLOW;
 		available = bdev->size_sector - offset;
 		*to_bdev = bdev;
-		*to_sector = mapped;
+		*to_sector = bdev->start_sector + offset;
 		*out_nr_sectors = min_t(u64, in_nr_sectors, available);
 		return 0;
 	}
@@ -111,7 +108,6 @@ static int raid0_map_sector(struct topo *topo, u64 from_sector,
 	u64 offset_in_chunk;
 	u64 member_chunk;
 	u64 member_offset;
-	u64 mapped;
 	u32 member_index;
 
 	if (!in_nr_sectors || from_sector >= topo->size_sector)
@@ -121,14 +117,10 @@ static int raid0_map_sector(struct topo *topo, u64 from_sector,
 	offset_in_chunk = from_sector & (chunk_sectors - 1);
 	member_index = chunk_index % topo->nr_bdevs;
 	member_chunk = div_u64(chunk_index, topo->nr_bdevs);
-	if (check_mul_overflow(member_chunk, chunk_sectors, &member_offset) ||
-	    check_add_overflow(member_offset, offset_in_chunk, &member_offset) ||
-	    check_add_overflow(topo->bdevs[member_index].start_sector,
-			       member_offset, &mapped))
-		return -EOVERFLOW;
+	member_offset = member_chunk * chunk_sectors + offset_in_chunk;
 
 	*to_bdev = &topo->bdevs[member_index];
-	*to_sector = mapped;
+	*to_sector = topo->bdevs[member_index].start_sector + member_offset;
 	*out_nr_sectors = min_t(u64, in_nr_sectors,
 				    chunk_sectors - offset_in_chunk);
 	return 0;
@@ -158,11 +150,25 @@ static void topo_release_handles(struct topo *topo)
 
 static void topo_destroy_sync(struct topo *topo)
 {
-	if (!topo)
-		return;
 	topo_release_handles(topo);
 	kfree(topo->bdevs);
 	kfree(topo);
+}
+
+static void topo_debug_log(const char *action, const struct topo *topo)
+{
+	u32 i;
+
+	pr_debug("p2p: %s %s topology %u:%u with %u components\n",
+		 action, topo->name, MAJOR(topo->top_dev), MINOR(topo->top_dev),
+		 topo->nr_bdevs);
+	for (i = 0; i < topo->nr_bdevs; i++) {
+		const struct topo_bdev *bdev = &topo->bdevs[i];
+
+		pr_debug("p2p: topology component %u is %u:%u nsid %u range 0x%llx+0x%llx\n",
+			 i, MAJOR(bdev->id), MINOR(bdev->id), bdev->nsid,
+			 bdev->start_sector, bdev->size_sector);
+	}
 }
 
 static void topo_release_work(struct work_struct *work)
@@ -170,6 +176,7 @@ static void topo_release_work(struct work_struct *work)
 	struct rcu_work *rcu_work = to_rcu_work(work);
 	struct topo *topo = container_of(rcu_work, struct topo, rcu_work);
 
+	topo_debug_log("release", topo);
 	topo_destroy_sync(topo);
 }
 
@@ -245,14 +252,14 @@ static int topo_validate_cfg(const struct topo_user_cfg *cfg,
 	if (!memchr(cfg->name, '\0', sizeof(cfg->name)) ||
 	    (strcmp(cfg->name, "linear") && strcmp(cfg->name, "raid0")))
 		return -EINVAL;
-	if (!cfg->top_dev || !topo->top_dev || !cfg->nr_devs ||
+	if (!topo->top_dev || !cfg->nr_devs ||
 	    cfg->nr_devs > P2P_TOPO_MAX_BDEVS)
 		return -EINVAL;
 
 	for (i = 0; i < cfg->nr_devs; i++) {
 		dev_t id = new_decode_dev(cfg->bdevs[i].dev_id);
 
-		if (!cfg->bdevs[i].dev_id || !id || cfg->bdevs[i].reserved ||
+		if (!id || cfg->bdevs[i].reserved ||
 		    !cfg->bdevs[i].size_sector || id == topo->top_dev)
 			return -EINVAL;
 		for (j = 0; j < i; j++) {
@@ -295,14 +302,10 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 		topo->top_handle = NULL;
 		goto free_topo;
 	}
-	if (topo->top_handle->bdev->bd_dev != topo->top_dev) {
-		err = -ENODEV;
-		goto free_topo;
-	}
 	if ((!strcmp(topo->name, "linear") &&
-	     !topo_sysfs_path_exists(topo->top_dev, "dm")) ||
+	     !p2p_sysfs_bdev_path_exists(topo->top_dev, "dm")) ||
 	    (!strcmp(topo->name, "raid0") &&
-	     !topo_sysfs_path_exists(topo->top_dev, "md"))) {
+	     !p2p_sysfs_bdev_path_exists(topo->top_dev, "md"))) {
 		err = -EOPNOTSUPP;
 		goto free_topo;
 	}
@@ -319,10 +322,6 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 		if (IS_ERR(bdev->handle)) {
 			err = PTR_ERR(bdev->handle);
 			bdev->handle = NULL;
-			goto free_topo;
-		}
-		if (bdev->handle->bdev->bd_dev != bdev->id) {
-			err = -ENODEV;
 			goto free_topo;
 		}
 		err = topo_validate_nvme_bdev(bdev->handle->bdev);
@@ -359,16 +358,28 @@ struct topo *topo_add(const struct topo_user_cfg *cfg,
 		      struct shared_topo_list *list)
 {
 	struct shared_topo *shared;
-	struct topo *candidate;
+	struct topo *candidate = NULL;
 	struct topo *installed;
+	dev_t top_dev;
+	bool inserted = false;
 	int err;
 
-	if (!cfg || !list)
+	top_dev = new_decode_dev(cfg->top_dev);
+	if (!top_dev)
 		return ERR_PTR(-EINVAL);
 
 	shared = kzalloc(sizeof(*shared), GFP_KERNEL);
 	if (!shared)
 		return ERR_PTR(-ENOMEM);
+
+	spin_lock(&topo_lock);
+	installed = radix_tree_lookup(&topo_tree, top_dev);
+	if (installed)
+		kref_get(&installed->pin_refcnt);
+	spin_unlock(&topo_lock);
+	if (installed)
+		goto link_shared;
+
 	candidate = topo_alloc_candidate(cfg);
 	if (IS_ERR(candidate)) {
 		err = PTR_ERR(candidate);
@@ -385,20 +396,24 @@ struct topo *topo_add(const struct topo_user_cfg *cfg,
 		kref_get(&installed->pin_refcnt);
 	} else {
 		err = radix_tree_insert(&topo_tree, candidate->top_dev, candidate);
-		if (!err)
+		if (!err) {
 			installed = candidate;
+			inserted = true;
+		}
 	}
 	spin_unlock(&topo_lock);
 	radix_tree_preload_end();
 	if (err)
 		goto free_candidate;
 
+link_shared:
 	shared->topo = installed;
 	spin_lock(&list->lock);
 	list_add_tail(&shared->list, &list->head);
 	spin_unlock(&list->lock);
+	topo_debug_log(inserted ? "register" : "pin", installed);
 
-	if (installed != candidate)
+	if (candidate && installed != candidate)
 		topo_destroy_sync(candidate);
 	return installed;
 
@@ -415,19 +430,14 @@ struct topo *topo_get(struct block_device *top_bdev)
 
 	rcu_read_lock();
 	topo = radix_tree_lookup(&topo_tree, top_bdev->bd_dev);
-	if (!topo) {
-		rcu_read_unlock();
-		return NULL;
-	}
+	if (!topo)
+		goto out;
 	if (!kref_get_unless_zero(&topo->refcnt)) {
-		rcu_read_unlock();
-		return ERR_PTR(-ESTALE);
+		topo = ERR_PTR(-ESTALE);
+		goto out;
 	}
-	if (unlikely(READ_ONCE(topo->deleting))) {
-		rcu_read_unlock();
-		topo_put(topo);
-		return ERR_PTR(-ESTALE);
-	}
+
+out:
 	rcu_read_unlock();
 	return topo;
 }
@@ -437,7 +447,6 @@ static void topo_pin_release(struct kref *ref)
 	struct topo *topo = container_of(ref, struct topo, pin_refcnt);
 	void *removed;
 
-	WRITE_ONCE(topo->deleting, true);
 	removed = radix_tree_delete(&topo_tree, topo->top_dev);
 	WARN_ON_ONCE(removed != topo);
 	topo_put(topo);
@@ -446,8 +455,6 @@ static void topo_pin_release(struct kref *ref)
 
 void topo_del(struct topo *topo)
 {
-	if (WARN_ON_ONCE(!topo))
-		return;
 	kref_put_lock(&topo->pin_refcnt, topo_pin_release, &topo_lock);
 }
 
@@ -465,5 +472,4 @@ void topo_exit(void)
 	WARN_ON_ONCE(!radix_tree_empty(&topo_tree));
 	rcu_barrier();
 	destroy_workqueue(topo_release_wq);
-	topo_release_wq = NULL;
 }
