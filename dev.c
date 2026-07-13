@@ -52,9 +52,7 @@ struct p2p_iov_map {
 };
 
 struct p2p_io_context {
-	struct block_device *bdev;
 	struct file *file;
-	unsigned int nsid;
 	struct p2p_pa_iov *pa_iov;
 	unsigned int pa_iov_nr;
 	u64 data_size;
@@ -379,9 +377,7 @@ static inline unsigned int p2p_queue_max_sectors(struct block_device *bdev)
 	return min(max_sectors, P2P_NVME_MAX_RW_SECTORS);
 }
 
-static struct p2p_io_context *new_io_ctx(struct block_device *bdev,
-					 struct file *file,
-					 unsigned int nsid,
+static struct p2p_io_context *new_io_ctx(struct file *file,
 					 struct p2p_pa_iov *pa_iov,
 					 unsigned int pa_iov_nr, u64 data_size)
 {
@@ -391,9 +387,7 @@ static struct p2p_io_context *new_io_ctx(struct block_device *bdev,
 	if (!io_ctx)
 		return ERR_PTR(-ENOMEM);
 
-	io_ctx->bdev = bdev;
 	io_ctx->file = file;
-	io_ctx->nsid = nsid;
 	io_ctx->pa_iov = pa_iov;
 	io_ctx->pa_iov_nr = pa_iov_nr;
 	io_ctx->data_size = data_size;
@@ -618,21 +612,17 @@ static int do_read_ios(struct p2p_io_context *io_ctx, struct topo *topo,
 		unsigned int to_read;
 
 		while (left && p2p_iov_iter_count(&iter)) {
-			struct block_device *to_bdev = io_ctx->bdev;
-			struct topo_bdev *topo_bdev = NULL;
-			u64 to_sector = sector;
+			struct topo_bdev *topo_bdev;
+			struct block_device *to_bdev;
+			u64 to_sector;
 			u32 topo_limit = left;
-			u32 nsid = io_ctx->nsid;
 
-			if (topo) {
-				err = topo->ops->map_sector(topo, sector, topo_limit,
-							 &topo_bdev, &to_sector,
-							 &topo_limit);
-				if (err)
-					goto out;
-				to_bdev = topo_bdev->handle->bdev;
-				nsid = topo_bdev->nsid;
-			}
+			err = topo->ops->map_sector(topo, sector, topo_limit,
+						     &topo_bdev, &to_sector,
+						     &topo_limit);
+			if (err)
+				goto out;
+			to_bdev = topo_bdev->handle->bdev;
 
 			to_read = min3(topo_limit,
 				       p2p_queue_max_sectors(to_bdev),
@@ -644,7 +634,8 @@ static int do_read_ios(struct p2p_io_context *io_ctx, struct topo *topo,
 				err = -EINVAL;
 				goto out;
 			}
-			err = do_read_io(io_ctx, to_bdev, nsid, to_sector, to_read,
+			err = do_read_io(io_ctx, to_bdev, topo_bdev->nsid,
+					 to_sector, to_read,
 					 p2p_iov_iter_addr(&iter));
 			if (err)
 				goto out;
@@ -728,24 +719,6 @@ static struct block_device *p2p_bdev_from_file(struct file *file)
 	return sb->s_bdev;
 }
 
-static int p2p_validate_nvme_bdev(struct block_device *bdev)
-{
-	dev_t devt = bdev->bd_dev;
-
-	if (p2p_sysfs_bdev_path_exists(devt, "device/subsysnqn")) {
-		if (p2p_sysfs_bdev_path_exists(devt, "device/iopolicy")) {
-			pr_err("p2p: NVMe multipath head %u:%u is unsupported\n",
-			       MAJOR(devt), MINOR(devt));
-			return -EOPNOTSUPP;
-		}
-		return 0;
-	}
-
-	pr_err("p2p: bdev %u:%u is not a supported NVMe namespace\n",
-	       MAJOR(devt), MINOR(devt));
-	return -ENODEV;
-}
-
 static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 {
 	struct p2p_read_param __user *user_param = arg;
@@ -811,21 +784,17 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 		goto put_reg_file;
 	}
 	if (!topo) {
-		if (!param.nsid) {
-			err = -EINVAL;
-			goto put_reg_file;
-		}
-		err = p2p_validate_nvme_bdev(bdev);
-		if (err)
-			goto put_reg_file;
+		pr_err("p2p: topology for bdev %u:%u is not registered\n",
+		       MAJOR(bdev->bd_dev), MINOR(bdev->bd_dev));
+		err = -ENODEV;
+		goto put_reg_file;
 	}
 
 	err = get_pa_iov(param.host_pid, iov, param.iov_nr, &pa_iov, &pa_iov_nr);
 	if (err)
 		goto put_topo;
 
-	io_ctx = new_io_ctx(bdev, reg_file, param.nsid, pa_iov,
-			    pa_iov_nr, data_size);
+	io_ctx = new_io_ctx(reg_file, pa_iov, pa_iov_nr, data_size);
 	if (IS_ERR(io_ctx)) {
 		err = PTR_ERR(io_ctx);
 		goto free_pa_iov;
@@ -880,8 +849,8 @@ static int p2p_drain_read(struct p2p_batch *batch)
 		io_err = wait_io_done(io_ctx);
 
 		if (io_err && !err) {
-			pr_err("got io err %d %d %d\n", io_err,
-			       blk_status_to_errno(io_err), io_ctx->nsid);
+			pr_err("p2p: I/O error status %d errno %d\n", io_err,
+			       blk_status_to_errno(io_err));
 			err = blk_status_to_errno(io_err);
 		}
 

@@ -56,7 +56,6 @@ struct shared_topo_list {
 	struct list_head head;
 };
 
-bool p2p_sysfs_bdev_path_exists(dev_t devt, const char *suffix);
 int topo_init(void);
 void topo_exit(void);
 struct topo *topo_add(const struct topo_user_cfg *cfg,

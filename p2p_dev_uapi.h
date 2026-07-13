@@ -11,7 +11,6 @@ struct p2p_iov {
 
 struct p2p_read_param {
 	int file_fd;
-	unsigned int nsid;
 	int host_pid;
 	struct p2p_iov *iov;
 	unsigned int iov_nr;

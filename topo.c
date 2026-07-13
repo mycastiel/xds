@@ -18,7 +18,7 @@ static RADIX_TREE(topo_tree, GFP_ATOMIC);
 static DEFINE_SPINLOCK(topo_lock);
 static struct workqueue_struct *topo_release_wq;
 
-bool p2p_sysfs_bdev_path_exists(dev_t devt, const char *suffix)
+static bool topo_sysfs_path_exists(dev_t devt, const char *suffix)
 {
 	char name[P2P_SYSFS_BDEV_PATH_MAX];
 	struct path path;
@@ -43,9 +43,9 @@ static int topo_validate_nvme_bdev(struct block_device *bdev)
 
 	if (bdev_is_partition(bdev))
 		return -EOPNOTSUPP;
-	if (!p2p_sysfs_bdev_path_exists(devt, "device/subsysnqn"))
+	if (!topo_sysfs_path_exists(devt, "device/subsysnqn"))
 		return -EOPNOTSUPP;
-	if (p2p_sysfs_bdev_path_exists(devt, "device/iopolicy"))
+	if (topo_sysfs_path_exists(devt, "device/iopolicy"))
 		return -EOPNOTSUPP;
 	return 0;
 }
@@ -99,6 +99,16 @@ static int linear_map_sector(struct topo *topo, u64 from_sector,
 	return -EINVAL;
 }
 
+static int nvme_map_sector(struct topo *topo, u64 from_sector,
+			   u32 in_nr_sectors, struct topo_bdev **to_bdev,
+			   u64 *to_sector, u32 *out_nr_sectors)
+{
+	*to_bdev = &topo->bdevs[0];
+	*to_sector = from_sector;
+	*out_nr_sectors = in_nr_sectors;
+	return 0;
+}
+
 static int raid0_map_sector(struct topo *topo, u64 from_sector,
 			    u32 in_nr_sectors, struct topo_bdev **to_bdev,
 			    u64 *to_sector, u32 *out_nr_sectors)
@@ -128,6 +138,10 @@ static int raid0_map_sector(struct topo *topo, u64 from_sector,
 
 static const struct topo_ops linear_ops = {
 	.map_sector = linear_map_sector,
+};
+
+static const struct topo_ops nvme_ops = {
+	.map_sector = nvme_map_sector,
 };
 
 static const struct topo_ops raid0_ops = {
@@ -214,6 +228,21 @@ static int topo_validate_linear(struct topo *topo,
 	return 0;
 }
 
+static int topo_validate_nvme(struct topo *topo,
+			      const struct topo_user_cfg *cfg)
+{
+	struct topo_bdev *bdev = &topo->bdevs[0];
+	u64 size = bdev_nr_sectors(topo->top_handle->bdev);
+
+	if (cfg->extra[0] || cfg->extra[1] || bdev->start_sector ||
+	    bdev->size_sector != size)
+		return -EINVAL;
+
+	topo->size_sector = size;
+	topo->ops = &nvme_ops;
+	return 0;
+}
+
 static int topo_validate_raid0(struct topo *topo,
 			       const struct topo_user_cfg *cfg)
 {
@@ -246,21 +275,26 @@ static int topo_validate_raid0(struct topo *topo,
 static int topo_validate_cfg(const struct topo_user_cfg *cfg,
 			     const struct topo *topo)
 {
+	bool nvme;
 	u32 i;
 	u32 j;
 
 	if (!memchr(cfg->name, '\0', sizeof(cfg->name)) ||
-	    (strcmp(cfg->name, "linear") && strcmp(cfg->name, "raid0")))
+	    (strcmp(cfg->name, "nvme") && strcmp(cfg->name, "linear") &&
+	     strcmp(cfg->name, "raid0")))
 		return -EINVAL;
+	nvme = !strcmp(cfg->name, "nvme");
 	if (!topo->top_dev || !cfg->nr_devs ||
-	    cfg->nr_devs > P2P_TOPO_MAX_BDEVS)
+	    cfg->nr_devs > P2P_TOPO_MAX_BDEVS ||
+	    (nvme && cfg->nr_devs != 1))
 		return -EINVAL;
 
 	for (i = 0; i < cfg->nr_devs; i++) {
 		dev_t id = new_decode_dev(cfg->bdevs[i].dev_id);
 
 		if (!id || cfg->bdevs[i].reserved ||
-		    !cfg->bdevs[i].size_sector || id == topo->top_dev)
+		    !cfg->bdevs[i].size_sector ||
+		    (nvme ? id != topo->top_dev : id == topo->top_dev))
 			return -EINVAL;
 		for (j = 0; j < i; j++) {
 			if (id == new_decode_dev(cfg->bdevs[j].dev_id))
@@ -303,9 +337,9 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 		goto free_topo;
 	}
 	if ((!strcmp(topo->name, "linear") &&
-	     !p2p_sysfs_bdev_path_exists(topo->top_dev, "dm")) ||
+	     !topo_sysfs_path_exists(topo->top_dev, "dm")) ||
 	    (!strcmp(topo->name, "raid0") &&
-	     !p2p_sysfs_bdev_path_exists(topo->top_dev, "md"))) {
+	     !topo_sysfs_path_exists(topo->top_dev, "md"))) {
 		err = -EOPNOTSUPP;
 		goto free_topo;
 	}
@@ -338,7 +372,9 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 			goto free_topo;
 	}
 
-	if (!strcmp(topo->name, "linear"))
+	if (!strcmp(topo->name, "nvme"))
+		err = topo_validate_nvme(topo, cfg);
+	else if (!strcmp(topo->name, "linear"))
 		err = topo_validate_linear(topo, cfg);
 	else
 		err = topo_validate_raid0(topo, cfg);
