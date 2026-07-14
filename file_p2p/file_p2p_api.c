@@ -843,8 +843,7 @@ static int get_iov_size(const struct p2p_iov *iov, unsigned int iov_nr,
 	return 0;
 }
 
-static int submit_read(int dev_fd, const struct read_parameter *param,
-		       unsigned long ioctl_cmd)
+int read_file(int dev_fd, const struct read_parameter *param)
 {
 	struct p2p_read_param *read;
 	struct fiemap *exts = NULL;
@@ -916,11 +915,10 @@ static int submit_read(int dev_fd, const struct read_parameter *param,
 	memcpy(read->extents, exts->fm_extents,
 	       ext_num * sizeof(read->extents[0]));
 
-	err = ioctl(dev_fd, ioctl_cmd, read);
+	err = ioctl(dev_fd, IOCTL_READ_FILE, read);
 	if (err < 0) {
 		err = -errno;
-		fprintf(stderr, "read ioctl 0x%lx failed, errno: %d\n",
-			ioctl_cmd, -err);
+		fprintf(stderr, "read file ioctl failed, errno: %d\n", -err);
 		goto free_read_out;
 	}
 
@@ -933,26 +931,6 @@ close_fds_out:
 		close(file_fd);
 
 	return err;
-}
-
-int read_file(int dev_fd, struct read_parameter *param)
-{
-	return submit_read(dev_fd, param, IOCTL_READ_FILE);
-}
-
-int read_file_batch(int dev_fd, struct read_parameter *params, int param_num)
-{
-	int i;
-	int err;
-
-	if (!params || param_num <= 0)
-		return -EINVAL;
-	for (i = 0; i < param_num; i++) {
-		err = submit_read(dev_fd, &params[i], IOCTL_READ_FILE);
-		if (err)
-			return err;
-	}
-	return 0;
 }
 
 int drain_read(int dev_fd)

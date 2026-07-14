@@ -244,8 +244,8 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	printf("crc32 file=%s offset=0x%" PRIx64 " length=0x%" PRIx64
-	       " crc32=%08" PRIx32 "\n",
+	printf("crc32 file %s offset 0x%" PRIx64 " length 0x%" PRIx64
+	       " crc32 0x%08x\n",
 	       file_name, offset, length, crc);
 
 out:

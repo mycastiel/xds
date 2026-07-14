@@ -664,7 +664,7 @@ static void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
 
 		addr = ioremap(iov->addr, iov->len);
 		if (!addr) {
-			pr_err("p2p: crc32 failed file=%pD length=0x%llx errno=%d\n",
+			pr_err("p2p: crc32 failed file %pD length 0x%llx err %d\n",
 			       io_ctx->file, io_ctx->data_size, -ENOMEM);
 			return;
 		}
@@ -675,7 +675,7 @@ static void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
 	}
 
 	crc ^= ~0U;
-	pr_info("p2p: crc32 file=%pD length=0x%llx crc32=%08x\n",
+	pr_info("p2p: crc32 file %pD length 0x%llx crc32 0x%08x\n",
 		io_ctx->file, io_ctx->data_size, crc);
 }
 #else

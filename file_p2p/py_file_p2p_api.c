@@ -99,93 +99,6 @@ static PyObject *py_read_file(PyObject *Py_UNUSED(self), PyObject *args)
 	return PyLong_FromLong((long)ret);
 }
 
-static PyObject *py_read_file_batch(PyObject *Py_UNUSED(self), PyObject *args)
-{
-	int dev_fd = 0;
-	struct read_parameter *params = NULL;
-	PyObject *py_requests = NULL;
-	PyObject *requests = NULL;
-	Py_ssize_t count;
-	Py_ssize_t i;
-	int ret = 0;
-
-	if (!PyArg_ParseTuple(args, "iO", &dev_fd, &py_requests))
-		return NULL;
-	requests = PySequence_Fast(py_requests, "requests must be a sequence");
-	if (!requests)
-		return NULL;
-	count = PySequence_Fast_GET_SIZE(requests);
-	if (count <= 0 || count > INT_MAX ||
-	    (size_t)count > SIZE_MAX / sizeof(*params)) {
-		PyErr_SetString(PyExc_ValueError,
-				"requests must be a non-empty bounded sequence");
-		goto error;
-	}
-	params = calloc(count, sizeof(*params));
-	if (!params) {
-		PyErr_NoMemory();
-		goto error;
-	}
-
-	for (i = 0; i < count; i++) {
-		PyObject *request;
-		PyObject **items;
-		const char *file_name;
-
-		request = PySequence_Fast(PySequence_Fast_GET_ITEM(requests, i),
-					  "request must be (file_name, file_offset, IOVs)");
-		if (!request)
-			goto error;
-		if (PySequence_Fast_GET_SIZE(request) != 3) {
-			PyErr_SetString(PyExc_ValueError,
-					"request must be (file_name, file_offset, IOVs)");
-			Py_DECREF(request);
-			goto error;
-		}
-		items = PySequence_Fast_ITEMS(request);
-		file_name = PyUnicode_AsUTF8(items[0]);
-		if (!file_name) {
-			Py_DECREF(request);
-			goto error;
-		}
-		params[i].file_name = strdup(file_name);
-		if (!params[i].file_name) {
-			PyErr_NoMemory();
-			Py_DECREF(request);
-			goto error;
-		}
-		params[i].file_offset = PyLong_AsUnsignedLong(items[1]);
-		if (PyErr_Occurred() ||
-		    parse_iovs(items[2], &params[i].iov, &params[i].iov_nr)) {
-			Py_DECREF(request);
-			goto error;
-		}
-		Py_DECREF(request);
-	}
-
-	Py_BEGIN_ALLOW_THREADS ret = read_file_batch(dev_fd, params, count);
-	Py_END_ALLOW_THREADS
-
-	for (i = 0; i < count; i++) {
-		free((void *)params[i].file_name);
-		free(params[i].iov);
-	}
-	free(params);
-	Py_DECREF(requests);
-	return PyLong_FromLong((long)ret);
-
-error:
-	if (params) {
-		for (i = 0; i < count; i++) {
-			free((void *)params[i].file_name);
-			free(params[i].iov);
-		}
-	}
-	free(params);
-	Py_XDECREF(requests);
-	return NULL;
-}
-
 static PyObject *py_drain_read(PyObject *Py_UNUSED(self), PyObject *args)
 {
 	int dev_fd = 0;
@@ -245,16 +158,6 @@ static PyMethodDef FileP2PMethods[] = {
 	  "    file_name (str): Name of file to read.\n"
 	  "    file_offset (int): Starting file offset.\n"
 	  "    iovs (sequence): Destination (address, size) pairs.\n"
-	  "\n"
-	  "Returns:\n"
-	  "    int: 0 on success, non-zero on error.\n" },
-	{ "read_file_batch", py_read_file_batch, METH_VARARGS,
-	  "read_file_batch(dev_fd, requests) -> int\n\n"
-	  "Read file batch from p2p device.\n"
-	  "\n"
-	  "Parameters:\n"
-	  "    dev_fd (int): File descriptor of p2p device.\n"
-	  "    requests (sequence): (file_name, file_offset, iovs) entries.\n"
 	  "\n"
 	  "Returns:\n"
 	  "    int: 0 on success, non-zero on error.\n" },

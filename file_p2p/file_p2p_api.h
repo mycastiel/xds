@@ -13,8 +13,7 @@ struct read_parameter {
 int new_p2p_fd(void);
 int close_p2p_fd(int dev_fd);
 int add_topo(int dev_fd, const char *dev);
-int read_file(int dev_fd, struct read_parameter *param);
-int read_file_batch(int dev_fd, struct read_parameter *params, int param_num);
+int read_file(int dev_fd, const struct read_parameter *param);
 int drain_read(int dev_fd);
 
 #endif
