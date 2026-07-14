@@ -23,6 +23,7 @@
 #include "file_p2p_api.h"
 
 #define FILE_P2P_SECTOR_SIZE 512U
+#define FILE_P2P_SECTORS_PER_KB (1024U / FILE_P2P_SECTOR_SIZE)
 #define FILE_P2P_DEFAULT_BLOCK_SIZE 4096U
 #define FILE_P2P_DM_CONTROL "/dev/mapper/control"
 #define FILE_P2P_DM_BUFFER_SIZE (16U << 10)
@@ -442,7 +443,7 @@ static int discover_raid0_members(dev_t top_dev, unsigned int raid_disks,
 	for (;;) {
 		struct topo_user_bdev *entry;
 		unsigned long long start_sector;
-		unsigned long long size_sector;
+		unsigned long long size_kb;
 		unsigned long long slot;
 		char member_path[PATH_MAX];
 		char state_path[PATH_MAX];
@@ -492,10 +493,10 @@ static int discover_raid0_members(dev_t top_dev, unsigned int raid_disks,
 		err = read_member_value(member_path, "offset", &start_sector);
 		if (err)
 			goto out;
-		err = read_member_value(member_path, "size", &size_sector);
+		err = read_member_value(member_path, "size", &size_kb);
 		if (err)
 			goto out;
-		if (!size_sector) {
+		if (!size_kb) {
 			err = -EINVAL;
 			goto out;
 		}
@@ -514,7 +515,7 @@ static int discover_raid0_members(dev_t top_dev, unsigned int raid_disks,
 		err = encode_dev(component, &entry->dev_id);
 		if (err)
 			goto out;
-		entry->size_sector = size_sector;
+		entry->size_sector = size_kb * FILE_P2P_SECTORS_PER_KB;
 		entry->start_sector = start_sector;
 		found[slot] = true;
 		active++;
@@ -535,7 +536,6 @@ static int discover_raid0(dev_t top_dev, struct topo_user_cfg *cfg)
 	unsigned long long chunk_bytes;
 	unsigned long long chunk_sectors;
 	unsigned long long raid_disks;
-	unsigned long long degraded;
 	char level[64];
 	unsigned int shift = 0;
 	unsigned int i;
@@ -553,12 +553,9 @@ static int discover_raid0(dev_t top_dev, struct topo_user_cfg *cfg)
 	err = read_sysfs_u64(top_dev, "md/raid_disks", &raid_disks);
 	if (err)
 		return err;
-	err = read_sysfs_u64(top_dev, "md/degraded", &degraded);
-	if (err)
-		return err;
 	if (raid_disks < 2 || raid_disks > P2P_TOPO_MAX_BDEVS)
 		return raid_disks > P2P_TOPO_MAX_BDEVS ? -E2BIG : -EINVAL;
-	if (degraded || !chunk_bytes || chunk_bytes % FILE_P2P_SECTOR_SIZE)
+	if (!chunk_bytes || chunk_bytes % FILE_P2P_SECTOR_SIZE)
 		return -EINVAL;
 	chunk_sectors = chunk_bytes / FILE_P2P_SECTOR_SIZE;
 	if (!chunk_sectors || (chunk_sectors & (chunk_sectors - 1)))
