@@ -96,18 +96,6 @@ static int validate_nvme_component(dev_t devt)
 	return 0;
 }
 
-static int encode_dev(dev_t devt, __u32 *encoded)
-{
-	unsigned int dev_major = major(devt);
-	unsigned int dev_minor = minor(devt);
-
-	if (!devt || dev_major > 0xfffU || dev_minor > 0xfffffU)
-		return -EINVAL;
-	*encoded = (dev_minor & 0xffU) | (dev_major << 8) |
-		   ((dev_minor & ~0xffU) << 12);
-	return 0;
-}
-
 static int parse_u64(const char *text, unsigned long long *value)
 {
 	char *end;
@@ -203,9 +191,7 @@ static int discover_nvme(const char *dev, dev_t top_dev,
 
 	memcpy(cfg->name, "nvme", sizeof("nvme"));
 	cfg->nr_devs = 1;
-	err = encode_dev(top_dev, &cfg->top_dev);
-	if (err)
-		return err;
+	cfg->top_dev = top_dev;
 	cfg->bdevs[0].dev_id = cfg->top_dev;
 	cfg->bdevs[0].size_sector = size_bytes / FILE_P2P_SECTOR_SIZE;
 	return 0;
@@ -297,7 +283,7 @@ static int discover_linear(dev_t top_dev, struct topo_user_cfg *cfg)
 	struct dm_ioctl *dmi;
 	unsigned long long logical_end = 0;
 	char *limit;
-	void *buffer;
+	void *buffer = NULL;
 	unsigned int i;
 	int err;
 
@@ -318,9 +304,7 @@ static int discover_linear(dev_t top_dev, struct topo_user_cfg *cfg)
 	spec = first;
 	strcpy(cfg->name, "linear");
 	cfg->nr_devs = dmi->target_count;
-	err = encode_dev(top_dev, &cfg->top_dev);
-	if (err)
-		goto out;
+	cfg->top_dev = top_dev;
 
 	for (i = 0; i < cfg->nr_devs; i++) {
 		struct topo_user_bdev *entry = &cfg->bdevs[i];
@@ -355,9 +339,7 @@ static int discover_linear(dev_t top_dev, struct topo_user_cfg *cfg)
 		err = parse_linear_params(params, &component, &start_sector);
 		if (err)
 			goto out;
-		err = encode_dev(component, &entry->dev_id);
-		if (err)
-			goto out;
+		entry->dev_id = component;
 		for (j = 0; j < i; j++) {
 			if (cfg->bdevs[j].dev_id == entry->dev_id) {
 				err = -EINVAL;
@@ -512,9 +494,7 @@ static int discover_raid0_members(dev_t top_dev, unsigned int raid_disks,
 		err = parse_devt(block_dev, &component);
 		if (err)
 			goto out;
-		err = encode_dev(component, &entry->dev_id);
-		if (err)
-			goto out;
+		entry->dev_id = component;
 		entry->size_sector = size_kb * FILE_P2P_SECTORS_PER_KB;
 		entry->start_sector = start_sector;
 		found[slot] = true;
@@ -568,9 +548,7 @@ static int discover_raid0(dev_t top_dev, struct topo_user_cfg *cfg)
 	strcpy(cfg->name, "raid0");
 	cfg->nr_devs = raid_disks;
 	cfg->extra[0] = shift;
-	err = encode_dev(top_dev, &cfg->top_dev);
-	if (err)
-		return err;
+	cfg->top_dev = top_dev;
 	err = discover_raid0_members(top_dev, raid_disks, cfg);
 	if (err)
 		return err;
@@ -588,6 +566,25 @@ static int discover_raid0(dev_t top_dev, struct topo_user_cfg *cfg)
 		}
 	}
 	return 0;
+}
+
+static void print_topo_cfg(const struct topo_user_cfg *cfg)
+{
+	unsigned int i;
+
+	printf("topo: name=%s top_dev=%u:%u nr_devs=%u extra={%llu,%llu}\n",
+	       cfg->name, major(cfg->top_dev), minor(cfg->top_dev), cfg->nr_devs,
+	       (unsigned long long)cfg->extra[0],
+	       (unsigned long long)cfg->extra[1]);
+	for (i = 0; i < cfg->nr_devs; i++) {
+		const struct topo_user_bdev *bdev = &cfg->bdevs[i];
+
+		printf("  bdev[%u]: dev=%u:%u start_sector=%llu "
+		       "size_sector=%llu\n", i, major(bdev->dev_id),
+		       minor(bdev->dev_id),
+		       (unsigned long long)bdev->start_sector,
+		       (unsigned long long)bdev->size_sector);
+	}
 }
 
 int add_topo(int dev_fd, const char *dev)
@@ -627,6 +624,7 @@ int add_topo(int dev_fd, const char *dev)
 		err = discover(st.st_rdev, cfg);
 	if (err)
 		goto out;
+	print_topo_cfg(cfg);
 	if (ioctl(dev_fd, IOCTL_ADD_TOPO, cfg) < 0)
 		err = -errno;
 	else

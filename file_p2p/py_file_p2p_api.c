@@ -69,7 +69,7 @@ error:
 	return -1;
 }
 
-static PyObject *py_read_file(PyObject *self, PyObject *args)
+static PyObject *py_read_file(PyObject *Py_UNUSED(self), PyObject *args)
 {
 	int dev_fd = 0;
 	const char *file_name = NULL;
@@ -99,7 +99,7 @@ static PyObject *py_read_file(PyObject *self, PyObject *args)
 	return PyLong_FromLong((long)ret);
 }
 
-static PyObject *py_read_file_batch(PyObject *self, PyObject *args)
+static PyObject *py_read_file_batch(PyObject *Py_UNUSED(self), PyObject *args)
 {
 	int dev_fd = 0;
 	struct read_parameter *params = NULL;
@@ -186,7 +186,7 @@ error:
 	return NULL;
 }
 
-static PyObject *py_drain_read(PyObject *self, PyObject *args)
+static PyObject *py_drain_read(PyObject *Py_UNUSED(self), PyObject *args)
 {
 	int dev_fd = 0;
 	int ret = 0;
@@ -200,14 +200,15 @@ static PyObject *py_drain_read(PyObject *self, PyObject *args)
 	return PyLong_FromLong((long)ret);
 }
 
-static PyObject *py_new_p2p_fd(PyObject *self, PyObject *Py_UNUSED(ignored))
+static PyObject *py_new_p2p_fd(PyObject *Py_UNUSED(self),
+			       PyObject *Py_UNUSED(ignored))
 {
 	int ret = new_p2p_fd();
 
 	return PyLong_FromLong((long)ret);
 }
 
-static PyObject *py_add_topo(PyObject *self, PyObject *args)
+static PyObject *py_add_topo(PyObject *Py_UNUSED(self), PyObject *args)
 {
 	const char *dev;
 	int dev_fd;
@@ -221,16 +222,15 @@ static PyObject *py_add_topo(PyObject *self, PyObject *args)
 	return PyLong_FromLong((long)ret);
 }
 
-static PyObject *py_close_p2p_fd(PyObject *self, PyObject *args)
+static PyObject *py_close_p2p_fd(PyObject *Py_UNUSED(self), PyObject *args)
 {
 	int dev_fd = 0;
-	int ret = 0;
 
 	if (!PyArg_ParseTuple(args, "i", &dev_fd)) {
 		return NULL;
 	}
 
-	ret = close_p2p_fd(dev_fd);
+	close_p2p_fd(dev_fd);
 
 	Py_RETURN_NONE;
 }
@@ -290,8 +290,11 @@ static PyMethodDef FileP2PMethods[] = {
 };
 
 static struct PyModuleDef file_p2p_module = {
-	PyModuleDef_HEAD_INIT, "file_p2p", "p2p file access", -1,
-	FileP2PMethods,
+	.m_base = PyModuleDef_HEAD_INIT,
+	.m_name = "file_p2p",
+	.m_doc = "p2p file access",
+	.m_size = -1,
+	.m_methods = FileP2PMethods,
 };
 
 PyMODINIT_FUNC PyInit_file_p2p(void)
