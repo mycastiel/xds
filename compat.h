@@ -7,6 +7,7 @@
 #include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/version.h>
 
 #include "dev.h"
@@ -23,12 +24,26 @@ typedef struct block_device p2p_bdev_handle;
 static inline struct request *
 p2p_alloc_nvme_read_request(struct request_queue *queue, struct nvme_command *cmd)
 {
-	return nvme_alloc_request(queue, cmd, 0, NVME_QID_ANY);
+	struct nvme_command *owned_cmd;
+	struct request *req;
+
+	owned_cmd = kmemdup(cmd, sizeof(*cmd), GFP_KERNEL);
+	if (!owned_cmd)
+		return ERR_PTR(-ENOMEM);
+
+	req = nvme_alloc_request(queue, owned_cmd, 0, NVME_QID_ANY);
+	if (IS_ERR(req))
+		kfree(owned_cmd);
+	return req;
 }
 
 static inline void p2p_end_read_io(struct request *req, blk_status_t status)
 {
+	struct nvme_command *cmd = nvme_req(req)->cmd;
+
 	p2p_complete_read_io(req, status);
+	kfree(cmd);
+	blk_mq_free_request(req);
 }
 
 static inline p2p_bdev_handle *p2p_bdev_open_by_dev(dev_t dev)
