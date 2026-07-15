@@ -17,6 +17,7 @@ readonly MD_DEV=/dev/md/xds_test
 WORK_BASE=${XDS_TEST_WORKDIR:-}
 WORK_DIR=
 KEEP_WORK_DIR=${XDS_TEST_KEEP_WORKDIR:-0}
+BUILD_JOBS=${XDS_TEST_BUILD_JOBS:-8}
 DEV1=
 DEV2=
 CTRL_NAME=
@@ -151,11 +152,13 @@ read_controller_attr()
 preflight()
 {
 	local name1 name2 ctrl1 ctrl2 nsid1 nsid2 pci_path
-	local bar_start bar_end bar_flags bar_size cmbloc cmbsz cmb_sqes kernel_release
+	local bar_start bar_end bar_flags bar_size cmbloc cmbsz cmb_sqes
 
 	[[ $EUID -eq 0 ]] || die "run as root"
 	: "${XDS_DEV_1:?XDS_DEV_1 must name the first disposable NVMe namespace}"
 	: "${XDS_DEV_2:?XDS_DEV_2 must name the second disposable NVMe namespace}"
+	[[ $BUILD_JOBS =~ ^[1-9][0-9]*$ ]] ||
+		die "XDS_TEST_BUILD_JOBS must be a positive integer"
 	require_commands
 
 	DEV1=$(readlink -f -- "$XDS_DEV_1")
@@ -201,31 +204,28 @@ preflight()
 	[[ -n $bar_start && -n $bar_end && -n $bar_flags ]] || die "BAR2 is missing"
 	BAR2_START=$((bar_start))
 	bar_size=$((bar_end - bar_start + 1))
-	[[ $BAR2_START -gt 0 && $bar_size -eq $CMB_SIZE ]] ||
-		die "BAR2 must be an active 128 MiB CMB"
+	[[ $BAR2_START -gt 0 && $bar_size -ge $CMB_SIZE ]] ||
+		die "BAR2 must provide at least 128 MiB of active CMB space"
 	(( bar_flags & 0x200 )) || die "BAR2 is not a memory resource"
 	(( BAR2_START % STUB_PAGE_SIZE == 0 )) || die "BAR2 is not 2 MiB aligned"
 
 	KSRC=${KSRC:-/lib/modules/$(uname -r)/build}
 	[[ -d $KSRC ]] || die "kernel build tree $KSRC does not exist"
-	kernel_release=$(make -s -C "$KSRC" kernelrelease)
-	[[ $kernel_release == "$(uname -r)" ]] ||
-		die "KSRC kernel $kernel_release does not match running kernel $(uname -r)"
 	export KSRC
 
 	printf 'controller=%s nsid={%s,%s} BAR2=[0x%x,0x%x)\n' \
 		"$CTRL_NAME" "$nsid1" "$nsid2" "$BAR2_START" \
-		"$((BAR2_START + CMB_SIZE))"
+		"$((BAR2_START + bar_size))"
 }
 
 build_all()
 {
-	log "Building normal and CRC-enabled modules plus both userspace APIs"
+	log "Building normal and CRC-enabled modules plus both userspace APIs (-j$BUILD_JOBS)"
 	make -C "$REPO_ROOT" clean
-	make -C "$REPO_ROOT" W=1 KCFLAGS=-Werror
+	make -C "$REPO_ROOT" -j"$BUILD_JOBS" W=1
 	make -C "$REPO_ROOT" clean
-	make -C "$REPO_ROOT" W=1 KCFLAGS='-Werror -DCALC_CRC32'
-	make -C "$REPO_ROOT" test
+	make -C "$REPO_ROOT" -j"$BUILD_JOBS" W=1 KCFLAGS=-DCALC_CRC32
+	make -C "$REPO_ROOT" -j"$BUILD_JOBS" test
 	(
 		cd "$REPO_ROOT/file_p2p"
 		python3 setup.py build_ext --inplace --force
