@@ -82,11 +82,10 @@ struct p2p_batch {
 	struct shared_topo_list shared_topos;
 };
 
-#define RQF_NVME_PT ((__force req_flags_t)(1 << 31))
-
 extern void nvme_init_request(struct request *req, struct nvme_command *cmd);
 
 static void p2p_tp_hook_exit(void);
+static enum rq_end_io_ret p2p_end_read_io(struct request *req, blk_status_t status);
 
 static dev_t dev;
 static struct class *dev_class;
@@ -414,7 +413,7 @@ static struct p2p_io_context *new_io_ctx(struct file *file,
 static void p2p_hook_nvme_setup_cmd(void *ignore, struct request *rq,
 				    struct nvme_command *cmd)
 {
-	if (!(rq->rq_flags & RQF_NVME_PT))
+	if (rq->end_io != p2p_end_read_io)
 		return;
 
 	cmd->rw.flags = NVME_CMD_SGL_METABUF;
@@ -553,7 +552,7 @@ static void p2p_tp_hook_exit(void)
 	module_put(p2p_tp_mod);
 }
 
-static enum rq_end_io_ret end_read_io(struct request *req, blk_status_t status)
+static enum rq_end_io_ret p2p_end_read_io(struct request *req, blk_status_t status)
 {
 	struct p2p_io_context *io_ctx = req->end_io_data;
 
@@ -599,9 +598,8 @@ static int do_read_io(struct p2p_io_context *io_ctx,
 	}
 	nvme_init_request(req, &cmd);
 
-	req->rq_flags |= RQF_NVME_PT;
 	req->end_io_data = io_ctx;
-	req->end_io = end_read_io;
+	req->end_io = p2p_end_read_io;
 	atomic_inc(&io_ctx->io_ref);
 	p2p_stats_io_issued((u64)sector_nr << SECTOR_SHIFT);
 
