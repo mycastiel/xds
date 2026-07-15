@@ -3,7 +3,9 @@
 import argparse
 import collections
 import csv
+import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +44,17 @@ def kernel_results(path: Path) -> Dict[Tuple[str, int], Deque[int]]:
     return results
 
 
+def kernel_file_name(path: Path) -> str:
+    metadata = path.stat()
+    if not stat.S_ISBLK(metadata.st_mode):
+        return path.name
+
+    sysfs_path = Path(
+        f"/sys/dev/block/{os.major(metadata.st_rdev)}:{os.minor(metadata.st_rdev)}"
+    )
+    return sysfs_path.resolve(strict=True).name
+
+
 def userspace_crc(tool: Path, path: Path, offset: int, length: int) -> int:
     output = subprocess.check_output(
         [str(tool), "-f", str(path), "-o", str(offset), "-l", str(length)],
@@ -69,10 +82,11 @@ def main() -> int:
         )
 
     for case_id, source, offset, length in cases:
-        key = (source.name, length)
+        file_name = kernel_file_name(source)
+        key = (file_name, length)
         if not actual[key]:
             raise ValueError(
-                f"{case_id}: no kernel CRC for file={source.name} length=0x{length:x}"
+                f"{case_id}: no kernel CRC for file={file_name} length=0x{length:x}"
             )
         kernel_crc = actual[key].popleft()
         user_crc = userspace_crc(args.crc_tool, source, offset, length)
