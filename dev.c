@@ -699,7 +699,7 @@ static void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
 
 		addr = ioremap(iov->addr, iov->len);
 		if (!addr) {
-			pr_err("crc32 failed file %pD length 0x%llx err %d\n",
+			pr_err("crc32 failed file=%pD length=0x%llx err=%d\n",
 			       io_ctx->file, io_ctx->data_size, -ENOMEM);
 			return;
 		}
@@ -710,7 +710,7 @@ static void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
 	}
 
 	crc ^= ~0U;
-	pr_info("crc32 file %pD length 0x%llx crc32 0x%08x\n",
+	pr_info("crc32 file=%pD length=0x%llx crc32=0x%08x\n",
 		io_ctx->file, io_ctx->data_size, crc);
 }
 #else
@@ -764,7 +764,7 @@ static struct block_device *p2p_bdev_from_file(struct file *file)
 	struct super_block *sb;
 
 	if (S_ISBLK(inode->i_mode))
-		return I_BDEV(inode);
+		return I_BDEV(file->f_mapping->host);
 
 	if (!S_ISREG(inode->i_mode))
 		return ERR_PTR(-EINVAL);
@@ -1066,4 +1066,5 @@ static void __exit p2p_drv_exit(void)
 
 module_init(p2p_drv_init);
 module_exit(p2p_drv_exit);
+MODULE_DESCRIPTION("XDS NVMe peer-to-peer read driver");
 MODULE_LICENSE("GPL");
