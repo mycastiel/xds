@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
+#define pr_fmt(fmt) "p2p: " fmt
+
 #include <linux/blkdev.h>
 #include <linux/err.h>
 #include <linux/kdev_t.h>
@@ -93,6 +95,9 @@ static int linear_map_sector(struct topo *topo, u64 from_sector,
 		*to_bdev = bdev;
 		*to_sector = bdev->start_sector + offset;
 		*out_nr_sectors = min_t(u64, in_nr_sectors, available);
+		pr_debug("linear from 0x%llx+0x%x to %u:%u nsid %u 0x%llx+0x%x\n",
+			 from_sector, in_nr_sectors, MAJOR(bdev->id), MINOR(bdev->id),
+			 bdev->nsid, *to_sector, *out_nr_sectors);
 		return 0;
 	}
 
@@ -133,6 +138,9 @@ static int raid0_map_sector(struct topo *topo, u64 from_sector,
 	*to_sector = topo->bdevs[member_index].start_sector + member_offset;
 	*out_nr_sectors = min_t(u64, in_nr_sectors,
 				    chunk_sectors - offset_in_chunk);
+	pr_debug("raid0 from 0x%llx+0x%x to %u:%u nsid %u 0x%llx+0x%x\n",
+		 from_sector, in_nr_sectors, MAJOR((*to_bdev)->id), MINOR((*to_bdev)->id),
+		 (*to_bdev)->nsid, *to_sector, *out_nr_sectors);
 	return 0;
 }
 
@@ -173,13 +181,13 @@ static void topo_debug_log(const char *action, const struct topo *topo)
 {
 	u32 i;
 
-	pr_debug("p2p: %s %s topology %u:%u with %u components\n",
+	pr_debug("%s %s topology %u:%u with %u components\n",
 		 action, topo->name, MAJOR(topo->top_dev), MINOR(topo->top_dev),
 		 topo->nr_bdevs);
 	for (i = 0; i < topo->nr_bdevs; i++) {
 		const struct topo_bdev *bdev = &topo->bdevs[i];
 
-		pr_debug("p2p: topology component %u is %u:%u nsid %u range 0x%llx+0x%llx\n",
+		pr_debug("topology component %u is %u:%u nsid %u range 0x%llx+0x%llx\n",
 			 i, MAJOR(bdev->id), MINOR(bdev->id), bdev->nsid,
 			 bdev->start_sector, bdev->size_sector);
 	}
@@ -190,7 +198,6 @@ static void topo_release_work(struct work_struct *work)
 	struct rcu_work *rcu_work = to_rcu_work(work);
 	struct topo *topo = container_of(rcu_work, struct topo, rcu_work);
 
-	topo_debug_log("release", topo);
 	topo_destroy_sync(topo);
 }
 

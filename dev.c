@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0
+#define pr_fmt(fmt) "p2p: " fmt
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -187,7 +190,7 @@ static void dump_pa_content(u64 pa, u64 size)
 		return;
 	}
 
-	print_hex_dump(KERN_INFO, "PA %llx content: ", pa, DUMP_PREFIX_ADDRESS,
+	print_hex_dump(KERN_INFO, "PA 0x%llx content: ", pa, DUMP_PREFIX_ADDRESS,
 		       16, 1, addr, data_len, false);
 
 	iounmap(addr);
@@ -280,7 +283,7 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
 						    iov[i].addr, iov[i].size);
 		if (page_size < P2P_MIN_PAGE_SIZE ||
 		    !is_power_of_2(page_size)) {
-			pr_err("p2p: invalid page size %d for addr 0x%lx, iov %u\n",
+			pr_err("invalid page size %d for addr 0x%lx, iov %u\n",
 			       page_size, iov[i].addr, i);
 			err = -EINVAL;
 			goto put_pinned_pa;
@@ -324,7 +327,7 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
 					    maps[i].aligned_addr, maps[i].aligned_size,
 					    maps[i].pa_list, maps[i].pa_num);
 		if (err) {
-			pr_err("p2p: PA list addr 0x%llx size 0x%llx num %u iov %u err %d\n",
+			pr_err("PA list addr 0x%llx size 0x%llx num %u iov %u err %d\n",
 			       maps[i].aligned_addr, maps[i].aligned_size,
 			       maps[i].pa_num, i, err);
 			goto free_pa_iov;
@@ -337,7 +340,7 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
 			new_pa_iov[new_pa_iov_idx].addr = maps[i].pa_list[j] + offset;
 			new_pa_iov[new_pa_iov_idx].len = len;
 			if ((new_pa_iov[new_pa_iov_idx].addr | len) & (SECTOR_SIZE - 1)) {
-				pr_err("p2p: unaligned PA IOV addr 0x%llx, len 0x%llx, iov %u\n",
+				pr_err("unaligned PA IOV addr 0x%llx, len 0x%llx, iov %u\n",
 				       new_pa_iov[new_pa_iov_idx].addr, len, i);
 				err = -EINVAL;
 				break;
@@ -350,7 +353,7 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
 		if (err)
 			goto free_pa_iov;
 		if (remaining) {
-			pr_err("p2p: PA list leaves 0x%llx bytes for iov %u\n",
+			pr_err("PA list leaves 0x%llx bytes for iov %u\n",
 			       remaining, i);
 			err = -EINVAL;
 			goto free_pa_iov;
@@ -431,11 +434,11 @@ static int p2p_register_tp_hook(struct tracepoint *tp)
 	err = tracepoint_probe_register(tp, p2p_hook_nvme_setup_cmd, NULL);
 	if (!err) {
 		p2p_tp = tp;
-		pr_info("p2p: registered nvme_setup_cmd tp hook\n");
+		pr_info("registered nvme_setup_cmd tp hook\n");
 		return 0;
 	}
 
-	pr_warn("p2p: register tp hook err %d\n", err);
+	pr_warn("register tp hook err %d\n", err);
 	return err;
 }
 
@@ -462,7 +465,7 @@ static void p2p_register_tp_from_module(struct tp_module *module_tp)
 			continue;
 
 		if (!try_module_get(mod)) {
-			pr_warn("p2p: failed to pin module\n");
+			pr_warn("failed to pin module\n");
 			return;
 		}
 
@@ -513,7 +516,7 @@ static int p2p_tp_hook_init(void)
 
 	err = register_tracepoint_module_notifier(&p2p_tp_module_nb);
 	if (err) {
-		pr_err("p2p: register tp module notifier err %d\n", err);
+		pr_err("register tp module notifier err %d\n", err);
 		return err;
 	}
 
@@ -524,7 +527,7 @@ static int p2p_tp_hook_init(void)
 	unregister_tracepoint_module_notifier(&p2p_tp_module_nb);
 
 	if (err) {
-		pr_err("p2p: tp not found\n");
+		pr_err("tp not found\n");
 		/*
 		 * Notifier registration can synchronously invoke COMING
 		 * callbacks, so use the shared exit path to undo any hook or
@@ -545,7 +548,7 @@ static void p2p_tp_hook_exit(void)
 
 	err = tracepoint_probe_unregister(p2p_tp, p2p_hook_nvme_setup_cmd, NULL);
 	if (err)
-		pr_warn("p2p: unregister tp hook err %d\n", err);
+		pr_warn("unregister tp hook err %d\n", err);
 
 	tracepoint_synchronize_unregister();
 
@@ -576,8 +579,8 @@ static int do_read_io(struct p2p_io_context *io_ctx,
 	struct request_queue *queue = disk->queue;
 	struct request *req;
 
-	pr_debug("read from blk 0x%x 0x%llx to pa 0x%llx\n",
-		 sector_nr, sector, paddr);
+	pr_debug("read bdev %u:%u nsid %u sector 0x%llx nr_sectors 0x%x pa 0x%llx\n",
+		 MAJOR(bdev->bd_dev), MINOR(bdev->bd_dev), nsid, sector, sector_nr, paddr);
 
 	cmd.rw.opcode = nvme_cmd_read;
 	cmd.rw.nsid = cpu_to_le32(nsid);
@@ -592,7 +595,7 @@ static int do_read_io(struct p2p_io_context *io_ctx,
 
 	req = blk_mq_alloc_request(queue, REQ_OP_DRV_IN, 0);
 	if (IS_ERR(req)) {
-		pr_err("p2p: failed to allocate request: %ld\n",
+		pr_err("failed to allocate request: %ld\n",
 		       PTR_ERR(req));
 		return PTR_ERR(req);
 	}
@@ -624,6 +627,9 @@ static int do_read_ios(struct p2p_io_context *io_ctx, struct topo *topo,
 		u32 left = extents[i].fe_length >> SECTOR_SHIFT;
 		unsigned int to_read;
 
+		pr_debug("ext %u sec 0x%llx+0x%x cnt 0x%llx off 0x%llx cur 0x%llx+0x%llx nr %u\n",
+			 i, sector, left, iter.count, iter.iov_offset,
+			 iter.iov->addr, iter.iov->len, iter.nr_segs);
 		while (left && p2p_iov_iter_count(&iter)) {
 			struct topo_bdev *topo_bdev;
 			struct block_device *to_bdev;
@@ -641,7 +647,7 @@ static int do_read_ios(struct p2p_io_context *io_ctx, struct topo *topo,
 				       p2p_queue_max_sectors(to_bdev),
 				       p2p_iov_iter_single_seg_sectors(&iter));
 			if (!to_read) {
-				pr_err("p2p: zero read size at extent %u, extent sectors 0x%x, IOV bytes 0x%llx\n",
+				pr_err("zero read ext %u sectors 0x%x iov bytes 0x%llx\n",
 				       i, left,
 				       p2p_iov_iter_count(&iter));
 				err = -EINVAL;
@@ -659,7 +665,7 @@ static int do_read_ios(struct p2p_io_context *io_ctx, struct topo *topo,
 		}
 	}
 	if (p2p_iov_iter_count(&iter)) {
-		pr_err("p2p: source extents leave 0x%llx IOV bytes unread\n",
+		pr_err("source extents leave 0x%llx IOV bytes unread\n",
 		       p2p_iov_iter_count(&iter));
 		err = -EINVAL;
 	}
@@ -693,7 +699,7 @@ static void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
 
 		addr = ioremap(iov->addr, iov->len);
 		if (!addr) {
-			pr_err("p2p: crc32 failed file %pD length 0x%llx err %d\n",
+			pr_err("crc32 failed file %pD length 0x%llx err %d\n",
 			       io_ctx->file, io_ctx->data_size, -ENOMEM);
 			return;
 		}
@@ -704,7 +710,7 @@ static void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
 	}
 
 	crc ^= ~0U;
-	pr_info("p2p: crc32 file %pD length 0x%llx crc32 0x%08x\n",
+	pr_info("crc32 file %pD length 0x%llx crc32 0x%08x\n",
 		io_ctx->file, io_ctx->data_size, crc);
 }
 #else
@@ -835,7 +841,7 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 		goto put_reg_file;
 	}
 	if (!topo) {
-		pr_err("p2p: topology for bdev %u:%u is not registered\n",
+		pr_err("topology for bdev %u:%u is not registered\n",
 		       MAJOR(bdev->bd_dev), MINOR(bdev->bd_dev));
 		err = -ENODEV;
 		goto put_reg_file;
@@ -906,7 +912,7 @@ static int p2p_drain_read(struct p2p_batch *batch)
 		io_err = wait_io_done(io_ctx);
 
 		if (io_err && !err) {
-			pr_err("p2p: I/O error status %d errno %d\n", io_err,
+			pr_err("I/O error status %d errno %d\n", io_err,
 			       blk_status_to_errno(io_err));
 			err = blk_status_to_errno(io_err);
 		}
@@ -974,7 +980,7 @@ static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		err = p2p_add_topo(batch, (void __user *)arg);
 		break;
 	default:
-		pr_info("p2p driver: invalid ioctl command 0x%x\n", cmd);
+		pr_info("invalid ioctl command 0x%x\n", cmd);
 		err = -EINVAL;
 		break;
 	}
@@ -988,13 +994,13 @@ static int __init p2p_drv_init(void)
 
 	err = topo_init();
 	if (err) {
-		pr_err("p2p: initialize topology release workqueue err %d\n", err);
+		pr_err("initialize topology release workqueue err %d\n", err);
 		return err;
 	}
 
 	err = p2p_tp_hook_init();
 	if (err) {
-		pr_err("p2p: register tp hook err %d\n", err);
+		pr_err("register tp hook err %d\n", err);
 		goto exit_topo;
 	}
 
@@ -1002,34 +1008,34 @@ static int __init p2p_drv_init(void)
 
 	err = alloc_chrdev_region(&dev, 0, 1, "p2p_device");
 	if (err < 0) {
-		pr_err("p2p: cannot allocate major number err %d\n", err);
+		pr_err("cannot allocate major number err %d\n", err);
 		goto exit_debugfs;
 	}
 
-	pr_info("p2p: Major = %d Minor = %d \n", MAJOR(dev), MINOR(dev));
+	pr_info("Major = %d Minor = %d\n", MAJOR(dev), MINOR(dev));
 	cdev_init(&p2p_cdev, &fops);
 
 	err = cdev_add(&p2p_cdev, dev, 1);
 	if (err < 0) {
-		pr_err("p2p: Cannot add the device to the system. \n");
+		pr_err("Cannot add the device to the system.\n");
 		goto free_dev;
 	}
 
 	dev_class = class_create("p2p_class");
 	if (IS_ERR(dev_class)) {
 		err = PTR_ERR(dev_class);
-		pr_err("p2p: Cannot create the struct class\n");
+		pr_err("Cannot create the struct class\n");
 		goto del_cdev;
 	}
 
 	device = device_create(dev_class, NULL, dev, NULL, "p2p_device");
 	if (IS_ERR(device)) {
 		err = PTR_ERR(device);
-		pr_err("p2p: Cannot create the device\n");
+		pr_err("Cannot create the device\n");
 		goto del_cls;
 	}
 
-	pr_info("p2p: Device Driver Inserted Done\n");
+	pr_info("Device Driver Inserted Done\n");
 	return 0;
 
 del_cls:
@@ -1055,7 +1061,7 @@ static void __exit p2p_drv_exit(void)
 	unregister_chrdev_region(dev, 1);
 	p2p_tp_hook_exit();
 	topo_exit();
-	pr_info("p2p: Device Driver Removed Done\n");
+	pr_info("Device Driver Removed Done\n");
 }
 
 module_init(p2p_drv_init);
