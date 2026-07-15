@@ -9,6 +9,7 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
+#include "compat.h"
 #include "p2p_dev_uapi.h"
 
 struct topo;
@@ -18,7 +19,7 @@ struct topo_bdev {
 	u32 nsid;
 	u64 size_sector;
 	u64 start_sector;
-	struct bdev_handle *handle;
+	p2p_bdev_handle *handle;
 };
 
 union topo_priv {
@@ -38,7 +39,7 @@ struct topo {
 	u64 size_sector;
 	u32 nr_bdevs;
 	struct topo_bdev *bdevs;
-	struct bdev_handle *top_handle;
+	p2p_bdev_handle *top_handle;
 	union topo_priv priv;
 
 	struct kref refcnt;

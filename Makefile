@@ -10,6 +10,8 @@ obj-m += p2p_dev.o
 
 p2p_dev-objs := dev.o topo.o debugfs.o
 
+ccflags-y += -I$(srctree)/drivers/nvme/host
+
 test:
 	$(MAKE) -C test
 

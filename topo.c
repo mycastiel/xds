@@ -60,7 +60,7 @@ static int topo_get_nsid(struct block_device *bdev, u32 *nsid)
 	if (!fops || !fops->ioctl)
 		return -EOPNOTSUPP;
 
-	ret = fops->ioctl(bdev, BLK_OPEN_READ, NVME_IOCTL_ID, 0);
+	ret = fops->ioctl(bdev, P2P_BDEV_READ_MODE, NVME_IOCTL_ID, 0);
 	if (ret < 0)
 		return ret;
 	if (!ret)
@@ -163,11 +163,11 @@ static void topo_release_handles(struct topo *topo)
 	if (topo->bdevs) {
 		for (i = 0; i < topo->nr_bdevs; i++) {
 			if (topo->bdevs[i].handle)
-				bdev_release(topo->bdevs[i].handle);
+				p2p_bdev_release(topo->bdevs[i].handle);
 		}
 	}
 	if (topo->top_handle)
-		bdev_release(topo->top_handle);
+		p2p_bdev_release(topo->top_handle);
 }
 
 static void topo_destroy_sync(struct topo *topo)
@@ -227,7 +227,7 @@ static int topo_validate_linear(struct topo *topo,
 		if (check_add_overflow(size, topo->bdevs[i].size_sector, &size))
 			return -EINVAL;
 	}
-	if (size != bdev_nr_sectors(topo->top_handle->bdev))
+	if (size != p2p_bdev_nr_sectors(p2p_handle_to_bdev(topo->top_handle)))
 		return -EINVAL;
 
 	topo->size_sector = size;
@@ -239,7 +239,7 @@ static int topo_validate_nvme(struct topo *topo,
 			      const struct topo_user_cfg *cfg)
 {
 	struct topo_bdev *bdev = &topo->bdevs[0];
-	u64 size = bdev_nr_sectors(topo->top_handle->bdev);
+	u64 size = p2p_bdev_nr_sectors(p2p_handle_to_bdev(topo->top_handle));
 
 	if (cfg->extra[0] || cfg->extra[1] || bdev->start_sector ||
 	    bdev->size_sector != size)
@@ -270,7 +270,7 @@ static int topo_validate_raid0(struct topo *topo,
 	if (check_mul_overflow(topo->bdevs[0].size_sector,
 			       (u64)topo->nr_bdevs, &size))
 		return -EINVAL;
-	if (size != bdev_nr_sectors(topo->top_handle->bdev))
+	if (size != p2p_bdev_nr_sectors(p2p_handle_to_bdev(topo->top_handle)))
 		return -EINVAL;
 
 	topo->size_sector = size;
@@ -335,8 +335,7 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 	strscpy(topo->name, cfg->name, sizeof(topo->name));
 	INIT_RCU_WORK(&topo->rcu_work, topo_release_work);
 
-	topo->top_handle = bdev_open_by_dev(topo->top_dev, BLK_OPEN_READ,
-					     NULL, NULL);
+	topo->top_handle = p2p_bdev_open_by_dev(topo->top_dev);
 	if (IS_ERR(topo->top_handle)) {
 		err = PTR_ERR(topo->top_handle);
 		topo->top_handle = NULL;
@@ -357,23 +356,22 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 		bdev->id = new_decode_dev(cfg->bdevs[i].dev_id);
 		bdev->size_sector = cfg->bdevs[i].size_sector;
 		bdev->start_sector = cfg->bdevs[i].start_sector;
-		bdev->handle = bdev_open_by_dev(bdev->id, BLK_OPEN_READ,
-						NULL, NULL);
+		bdev->handle = p2p_bdev_open_by_dev(bdev->id);
 		if (IS_ERR(bdev->handle)) {
 			err = PTR_ERR(bdev->handle);
 			bdev->handle = NULL;
 			goto free_topo;
 		}
-		err = topo_validate_nvme_bdev(bdev->handle->bdev);
+		err = topo_validate_nvme_bdev(p2p_handle_to_bdev(bdev->handle));
 		if (err)
 			goto free_topo;
 		if (check_add_overflow(bdev->start_sector, bdev->size_sector,
 				       &end_sector) ||
-		    end_sector > bdev_nr_sectors(bdev->handle->bdev)) {
+		    end_sector > p2p_bdev_nr_sectors(p2p_handle_to_bdev(bdev->handle))) {
 			err = -EINVAL;
 			goto free_topo;
 		}
-		err = topo_get_nsid(bdev->handle->bdev, &bdev->nsid);
+		err = topo_get_nsid(p2p_handle_to_bdev(bdev->handle), &bdev->nsid);
 		if (err)
 			goto free_topo;
 	}

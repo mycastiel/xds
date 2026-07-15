@@ -30,7 +30,9 @@
 
 #include "p2p_dev_uapi.h"
 #include "p2p_mem_query.h"
+#include "compat.h"
 #include "debugfs.h"
+#include "dev.h"
 #include "topo.h"
 
 #define P2P_NVME_MAX_RW_SECTORS ((1U << 20) >> SECTOR_SHIFT)
@@ -85,10 +87,7 @@ struct p2p_batch {
 	struct shared_topo_list shared_topos;
 };
 
-extern void nvme_init_request(struct request *req, struct nvme_command *cmd);
-
 static void p2p_tp_hook_exit(void);
-static enum rq_end_io_ret p2p_end_read_io(struct request *req, blk_status_t status);
 
 static dev_t dev;
 static struct class *dev_class;
@@ -555,7 +554,7 @@ static void p2p_tp_hook_exit(void)
 	module_put(p2p_tp_mod);
 }
 
-static enum rq_end_io_ret p2p_end_read_io(struct request *req, blk_status_t status)
+void p2p_complete_read_io(struct request *req, blk_status_t status)
 {
 	struct p2p_io_context *io_ctx = req->end_io_data;
 
@@ -563,11 +562,8 @@ static enum rq_end_io_ret p2p_end_read_io(struct request *req, blk_status_t stat
 	if (status)
 		cmpxchg(&io_ctx->io_err, 0, status);
 
-	if (!atomic_dec_and_test(&io_ctx->io_ref))
-		return RQ_END_IO_FREE;
-
-	complete(&io_ctx->io_done);
-	return RQ_END_IO_FREE;
+	if (atomic_dec_and_test(&io_ctx->io_ref))
+		complete(&io_ctx->io_done);
 }
 
 static int do_read_io(struct p2p_io_context *io_ctx,
@@ -593,20 +589,19 @@ static int do_read_io(struct p2p_io_context *io_ctx,
 	cmd.rw.dptr.sgl.length = cpu_to_le32(sector_nr << SECTOR_SHIFT);
 	cmd.rw.dptr.sgl.type = NVME_SGL_FMT_DATA_DESC << 4;
 
-	req = blk_mq_alloc_request(queue, REQ_OP_DRV_IN, 0);
+	req = p2p_alloc_nvme_read_request(queue, &cmd);
 	if (IS_ERR(req)) {
 		pr_err("failed to allocate request: %ld\n",
 		       PTR_ERR(req));
 		return PTR_ERR(req);
 	}
-	nvme_init_request(req, &cmd);
 
 	req->end_io_data = io_ctx;
 	req->end_io = p2p_end_read_io;
 	atomic_inc(&io_ctx->io_ref);
 	p2p_stats_io_issued((u64)sector_nr << SECTOR_SHIFT);
 
-	blk_execute_rq_nowait(req, true);
+	p2p_execute_rq_nowait(req, disk);
 
 	return 0;
 }
@@ -641,7 +636,7 @@ static int do_read_ios(struct p2p_io_context *io_ctx, struct topo *topo,
 						     &topo_limit);
 			if (err)
 				goto out;
-			to_bdev = topo_bdev->handle->bdev;
+			to_bdev = p2p_handle_to_bdev(topo_bdev->handle);
 
 			to_read = min3(topo_limit,
 				       p2p_queue_max_sectors(to_bdev),
@@ -1021,7 +1016,7 @@ static int __init p2p_drv_init(void)
 		goto free_dev;
 	}
 
-	dev_class = class_create("p2p_class");
+	dev_class = p2p_class_create("p2p_class");
 	if (IS_ERR(dev_class)) {
 		err = PTR_ERR(dev_class);
 		pr_err("Cannot create the struct class\n");
