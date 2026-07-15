@@ -50,14 +50,23 @@ struct p2p_iov_iter {
 struct p2p_iov_map {
 	u64 aligned_addr;
 	u64 aligned_size;
+	u64 *pa_list;
 	u32 page_size;
 	u32 pa_num;
+};
+
+struct p2p_pinned_pa {
+	struct devmm_svm_process_id process_id;
+	struct p2p_iov_map *maps;
+	unsigned int pinned_map_nr;
+	u64 *pa_list;
 };
 
 struct p2p_io_context {
 	struct file *file;
 	struct p2p_pa_iov *pa_iov;
 	unsigned int pa_iov_nr;
+	struct p2p_pinned_pa *pinned_pa;
 	u64 data_size;
 	struct completion io_done;
 	atomic_t io_ref;
@@ -142,13 +151,30 @@ static int p2p_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static void init_process_id(int host_pid,
-			    struct devmm_svm_process_id *process_id)
+static void init_process_id(int host_pid, struct devmm_svm_process_id *process_id)
 {
-	memset(process_id, 0, sizeof(*process_id));
 	rcu_read_lock();
 	process_id->host_pid = pid_nr(find_vpid(host_pid));
 	rcu_read_unlock();
+}
+
+static void p2p_put_pinned_pa(struct p2p_pinned_pa *pinned_pa)
+{
+	unsigned int i;
+
+	if (!pinned_pa)
+		return;
+
+	for (i = 0; i < pinned_pa->pinned_map_nr; i++) {
+		struct p2p_iov_map *map = &pinned_pa->maps[i];
+
+		devmm_put_mem_pa_list(&pinned_pa->process_id, map->aligned_addr,
+				      map->aligned_size, map->pa_list, map->pa_num);
+	}
+
+	kvfree(pinned_pa->pa_list);
+	kvfree(pinned_pa->maps);
+	kfree(pinned_pa);
 }
 
 #ifdef DUMP_CONTENT
@@ -223,37 +249,42 @@ static void p2p_iov_iter_advance(struct p2p_iov_iter *iter, u64 bytes)
 
 static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
 		      unsigned int iov_nr, struct p2p_pa_iov **pa_iov,
-		      unsigned int *pa_iov_nr)
+		      unsigned int *pa_iov_nr, struct p2p_pinned_pa **pinned_pa_out)
 {
-	struct devmm_svm_process_id pid;
+	struct p2p_pinned_pa *pinned_pa;
 	struct p2p_pa_iov *new_pa_iov;
 	struct p2p_iov_map *maps;
-	u64 *pa_list;
-	unsigned int max_pa_num = 0;
-	unsigned int new_pa_iov_nr = 0;
-	unsigned int new_pa_iov_idx = 0;
+	unsigned int new_pa_iov_nr;
+	unsigned int new_pa_iov_idx;
 	unsigned int i;
 	int err;
 
-	init_process_id(host_pid, &pid);
-	maps = kvmalloc_array(iov_nr, sizeof(*maps), GFP_KERNEL);
-	if (!maps)
+	pinned_pa = kzalloc(sizeof(*pinned_pa), GFP_KERNEL);
+	if (!pinned_pa)
 		return -ENOMEM;
+	init_process_id(host_pid, &pinned_pa->process_id);
+	pinned_pa->maps = kvcalloc(iov_nr, sizeof(*pinned_pa->maps), GFP_KERNEL);
+	if (!pinned_pa->maps) {
+		err = -ENOMEM;
+		goto put_pinned_pa;
+	}
+	maps = pinned_pa->maps;
 
+	new_pa_iov_nr = 0;
 	for (i = 0; i < iov_nr; i++) {
 		u64 range_size;
 		u64 pa_num;
 		u64 offset;
 		int page_size;
 
-		page_size = devmm_get_mem_page_size(&pid, iov[i].addr,
-						    iov[i].size);
+		page_size = devmm_get_mem_page_size(&pinned_pa->process_id,
+						    iov[i].addr, iov[i].size);
 		if (page_size < P2P_MIN_PAGE_SIZE ||
 		    !is_power_of_2(page_size)) {
 			pr_err("p2p: invalid page size %d for addr 0x%lx, iov %u\n",
 			       page_size, iov[i].addr, i);
 			err = -EINVAL;
-			goto free_maps;
+			goto put_pinned_pa;
 		}
 
 		offset = iov[i].addr & (page_size - 1);
@@ -261,47 +292,50 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
 		pa_num = DIV_ROUND_UP_ULL(range_size, page_size);
 		if (!pa_num || pa_num > UINT_MAX || pa_num > UINT_MAX - new_pa_iov_nr) {
 			err = -E2BIG;
-			goto free_maps;
+			goto put_pinned_pa;
 		}
 
 		maps[i].aligned_addr = iov[i].addr - offset;
 		maps[i].page_size = page_size;
-		maps[i].pa_num = pa_num;
+		maps[i].pa_num = (u32)pa_num;
 		maps[i].aligned_size = pa_num * page_size;
 		new_pa_iov_nr += maps[i].pa_num;
-		max_pa_num = max(max_pa_num, maps[i].pa_num);
 	}
 
-	new_pa_iov = kvmalloc_array(new_pa_iov_nr, sizeof(*new_pa_iov),
-				    GFP_KERNEL);
+	pinned_pa->pa_list = kvmalloc_array(new_pa_iov_nr, sizeof(*pinned_pa->pa_list), GFP_KERNEL);
+	if (!pinned_pa->pa_list) {
+		err = -ENOMEM;
+		goto put_pinned_pa;
+	}
+
+	new_pa_iov = kvmalloc_array(new_pa_iov_nr, sizeof(*new_pa_iov), GFP_KERNEL);
 	if (!new_pa_iov) {
 		err = -ENOMEM;
-		goto free_maps;
-	}
-	pa_list = kvmalloc_array(max_pa_num, sizeof(*pa_list), GFP_KERNEL);
-	if (!pa_list) {
-		err = -ENOMEM;
-		goto free_pa_iov;
+		goto put_pinned_pa;
 	}
 
+	new_pa_iov_idx = 0;
 	for (i = 0; i < iov_nr; i++) {
 		u64 remaining = iov[i].size;
 		u64 offset = iov[i].addr - maps[i].aligned_addr;
 		unsigned int j;
 
-		err = devmm_get_mem_pa_list(&pid, maps[i].aligned_addr,
-					    maps[i].aligned_size, pa_list,
-					    maps[i].pa_num);
+		maps[i].pa_list = pinned_pa->pa_list + new_pa_iov_idx;
+		err = devmm_get_mem_pa_list(&pinned_pa->process_id,
+					    maps[i].aligned_addr, maps[i].aligned_size,
+					    maps[i].pa_list, maps[i].pa_num);
 		if (err) {
-			pr_err("p2p: failed to get PA list for addr 0x%llx, size 0x%llx, iov %u, err %d\n",
-			       maps[i].aligned_addr, maps[i].aligned_size, i, err);
-			goto free_pa_list;
+			pr_err("p2p: PA list addr 0x%llx size 0x%llx num %u iov %u err %d\n",
+			       maps[i].aligned_addr, maps[i].aligned_size,
+			       maps[i].pa_num, i, err);
+			goto free_pa_iov;
 		}
+		pinned_pa->pinned_map_nr++;
 
 		for (j = 0; j < maps[i].pa_num; j++) {
 			u64 len = min_t(u64, remaining, maps[i].page_size - offset);
 
-			new_pa_iov[new_pa_iov_idx].addr = pa_list[j] + offset;
+			new_pa_iov[new_pa_iov_idx].addr = maps[i].pa_list[j] + offset;
 			new_pa_iov[new_pa_iov_idx].len = len;
 			if ((new_pa_iov[new_pa_iov_idx].addr | len) & (SECTOR_SIZE - 1)) {
 				pr_err("p2p: unaligned PA IOV addr 0x%llx, len 0x%llx, iov %u\n",
@@ -314,36 +348,31 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
 			offset = 0;
 		}
 
-		devmm_put_mem_pa_list(&pid, maps[i].aligned_addr,
-					  maps[i].aligned_size, pa_list,
-					  maps[i].pa_num);
 		if (err)
-			goto free_pa_list;
+			goto free_pa_iov;
 		if (remaining) {
 			pr_err("p2p: PA list leaves 0x%llx bytes for iov %u\n",
 			       remaining, i);
 			err = -EINVAL;
-			goto free_pa_list;
+			goto free_pa_iov;
 		}
 	}
 
-	kvfree(pa_list);
-	kvfree(maps);
 	*pa_iov = new_pa_iov;
 	*pa_iov_nr = new_pa_iov_nr;
+	*pinned_pa_out = pinned_pa;
 	return 0;
 
-free_pa_list:
-	kvfree(pa_list);
 free_pa_iov:
 	kvfree(new_pa_iov);
-free_maps:
-	kvfree(maps);
+put_pinned_pa:
+	p2p_put_pinned_pa(pinned_pa);
 	return err;
 }
 
 static void free_io_ctx(struct p2p_io_context *io_ctx)
 {
+	p2p_put_pinned_pa(io_ctx->pinned_pa);
 	kvfree(io_ctx->pa_iov);
 	fput(io_ctx->file);
 	kfree(io_ctx);
@@ -360,7 +389,8 @@ static inline unsigned int p2p_queue_max_sectors(struct block_device *bdev)
 
 static struct p2p_io_context *new_io_ctx(struct file *file,
 					 struct p2p_pa_iov *pa_iov,
-					 unsigned int pa_iov_nr, u64 data_size)
+					 unsigned int pa_iov_nr,
+					 struct p2p_pinned_pa *pinned_pa, u64 data_size)
 {
 	struct p2p_io_context *io_ctx;
 
@@ -371,6 +401,7 @@ static struct p2p_io_context *new_io_ctx(struct file *file,
 	io_ctx->file = file;
 	io_ctx->pa_iov = pa_iov;
 	io_ctx->pa_iov_nr = pa_iov_nr;
+	io_ctx->pinned_pa = pinned_pa;
 	io_ctx->data_size = data_size;
 
 	atomic_set(&io_ctx->io_ref, 1);
@@ -751,6 +782,7 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 	struct file *reg_file = NULL;
 	struct block_device *bdev;
 	struct p2p_io_context *io_ctx;
+	struct p2p_pinned_pa *pinned_pa = NULL;
 	struct topo *topo = NULL;
 	u64 data_size;
 	unsigned int pa_iov_nr;
@@ -811,17 +843,18 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 		goto put_reg_file;
 	}
 
-	err = get_pa_iov(param.host_pid, iov, param.iov_nr, &pa_iov, &pa_iov_nr);
+	err = get_pa_iov(param.host_pid, iov, param.iov_nr, &pa_iov, &pa_iov_nr, &pinned_pa);
 	if (err)
 		goto put_topo;
 
-	io_ctx = new_io_ctx(reg_file, pa_iov, pa_iov_nr, data_size);
+	io_ctx = new_io_ctx(reg_file, pa_iov, pa_iov_nr, pinned_pa, data_size);
 	if (IS_ERR(io_ctx)) {
 		err = PTR_ERR(io_ctx);
 		goto free_pa_iov;
 	}
 	reg_file = NULL;
 	pa_iov = NULL;
+	pinned_pa = NULL;
 
 	io_ctx->issue_err = do_read_ios(io_ctx, topo, extents, param.ext_nr);
 	if (io_ctx->issue_err)
@@ -835,6 +868,7 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 	spin_unlock(&batch->io_lock);
 
 free_pa_iov:
+	p2p_put_pinned_pa(pinned_pa);
 	kvfree(pa_iov);
 put_topo:
 	if (topo)
