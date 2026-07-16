@@ -30,9 +30,9 @@ struct topo_user_bdev {
 
 struct topo_user_cfg {
 	/*
-	 * top_dev must be the whole block device hosting the file system.
-	 * Components must be whole, non-multipath NVMe namespaces; partitions
-	 * and NVMe multipath heads are unsupported.
+	 * top_dev is the block device hosting the file system. For an nvme
+	 * topology, it may be a whole namespace or a partition. Components must
+	 * be whole, non-multipath NVMe namespaces.
 	 */
 	char name[P2P_TOPO_NAME_LEN];
 	__u32 top_dev;

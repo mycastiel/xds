@@ -1,16 +1,18 @@
-# Mandatory topology-aware I/O for NVMe, dm-linear, and MD RAID0
+# Mandatory topology-aware I/O for NVMe, NVMe partitions, dm-linear, and MD RAID0
 
 ## 1. Scope
 
 `p2p_dev` resolves the block device from the file descriptor and requires a
-registered topology for every read.  Direct NVMe namespaces use a dedicated
-one-component NVMe backend.  For dm-linear and MD RAID0 devices, the physical
-sectors returned by FIEMAP are translated to sectors on the underlying NVMe
-namespaces before NVMe read commands are submitted.
+registered topology for every read.  Direct NVMe namespaces and their
+partitions share a dedicated one-component NVMe backend.  For an NVMe
+partition, dm-linear, or MD RAID0 device, the physical sectors returned by
+FIEMAP are translated to sectors on the underlying whole NVMe namespaces
+before NVMe read commands are submitted.
 
 The supported configurations are deliberately narrow:
 
-- a directly accessible NVMe namespace registered as an `nvme` topology;
+- a directly accessible NVMe namespace or one of its partitions, registered as
+  an `nvme` topology;
 - a dm device whose active table contains only contiguous `linear` targets;
 - an MD array whose level is `raid0` and whose members form one uniform strip
   zone; and
@@ -291,7 +293,7 @@ topology.  It validates:
 - `reserved` and every topology-specific unused `extra` field are zero;
 - `top_dev` and component device IDs decode to nonzero block-device numbers;
 - `nr_devs` is between one and four;
-- an `nvme` topology has exactly one component equal to `top_dev`;
+- an `nvme` topology has exactly one component;
 - a `linear` or `raid0` component does not equal `top_dev`, and component IDs
   are unique;
 - each component is a whole NVMe namespace rather than a partition or an NVMe
@@ -302,17 +304,27 @@ topology.  It validates:
 - all calculated top sizes and mapped sectors are overflow-safe; and
 - `NVME_IOCTL_ID` is supported and returns a positive NSID for every component.
 
+For `nvme`, the kernel derives the required relationship from the opened top
+bdev.  If the top bdev is a whole namespace, its component must equal
+`top_dev`, `start_sector` must be zero, and `size_sector` must equal the opened
+namespace size.  If the top bdev is a partition, its component must be a whole
+NVMe namespace on the same `gendisk`, `start_sector` must equal
+`get_start_sect(top_bdev)`, and `size_sector` must equal the opened partition
+size.  The common range check also proves that the complete partition range
+fits in the whole namespace.
+
 For `NVME_IOCTL_ID`, the helper verifies that the component's
 `block_device_operations` provides `ioctl`, then calls that operation with the
 opened bdev, `BLK_OPEN_READ`, `NVME_IOCTL_ID`, and argument zero.  It does not
 parse `disk_name` and does not pass this lookup through userspace.
 
-The top device is expected to be a direct NVMe namespace, dm, or MD according
-to `name`.  Component validation also validates the top device for `nvme`,
-because its sole component has the same device ID.  For dm and MD, the kernel
-checks the upper-device identity exposed by sysfs but does not reconstruct the
-live table or metadata.  Exact correspondence with the active stack therefore
-remains part of the userspace operating contract.
+The top device is expected to be a direct NVMe namespace or partition, dm, or
+MD device according to `name`.  The `nvme` whole-device or partition checks
+validate its exact relationship with the component without trusting userspace
+discovery.  For dm and MD, the kernel checks the upper-device identity exposed
+by sysfs but does not reconstruct the live table or metadata.  Exact
+correspondence with the active stack therefore remains part of the userspace
+operating contract.
 
 ## 6. Lifetime and concurrency
 
@@ -400,24 +412,29 @@ remain contiguous on that component without crossing a topology boundary.
 The returned `topo_bdev` supplies both the destination bdev handle and NSID.
 The dm-linear and RAID0 operations return an error for a sector outside the
 registered topology.  Creation-time range and arithmetic validation guarantees
-that mapping an in-range sector cannot overflow.  The direct NVMe operation is
-an unchecked pass-through for FIEMAP sectors from the registered namespace.
+that mapping an in-range sector cannot overflow.  The NVMe operation is an
+unchecked offset mapping for FIEMAP sectors from the registered namespace or
+partition.
 
-### 7.1 Direct NVMe
+### 7.1 NVMe namespace or partition
 
-The `nvme` backend has exactly one component.  Its device ID equals `top_dev`,
-its `start_sector` and both `extra` values are zero, and its `size_sector`
-equals the opened namespace size.  It uses a dedicated `nvme_map_sector()`
-callback:
+The `nvme` backend has exactly one component and both `extra` values are zero.
+For a whole namespace, the component device ID equals `top_dev`,
+`start_sector` is zero, and `size_sector` equals the opened namespace size.  For
+a partition, the component is the containing whole NVMe namespace,
+`start_sector` is the partition start on that namespace, and `size_sector`
+equals the opened partition size.  Both forms use the same dedicated
+`nvme_map_sector()` callback:
 
 ```text
-to_bdev       = bdevs[0]
-to_sector     = from_sector
+to_bdev        = bdevs[0]
+to_sector      = bdevs[0].start_sector + from_sector
 out_nr_sectors = in_nr_sectors
 ```
 
-The callback is a pure pass-through: it selects the only component and returns
-the input sector and sector count unchanged.  It does not reuse the dm-linear
+For a whole namespace, the zero start makes the callback a pure pass-through.
+For a partition, it applies the validated partition offset.  In both cases it
+returns the input sector count unchanged and does not reuse the dm-linear
 mapping callback.
 
 ### 7.2 dm-linear
@@ -545,6 +562,8 @@ int add_topo(int dev_fd, const char *dev);
 `dev` must name the top block device.  The helper obtains its `dev_t` with
 `stat()` and probes `/sys/dev/block/<major>:<minor>/`:
 
+- `partition` identifies a partition.  The helper resolves its parent whole
+  namespace and returns an `nvme` configuration;
 - `device/subsysnqn` identifies a direct NVMe namespace.  The helper returns
   an `nvme` configuration;
 - `dm/` selects dm discovery; and
@@ -553,14 +572,19 @@ int add_topo(int dev_fd, const char *dev);
 Unknown devices and unsupported stacks return `-EOPNOTSUPP`.  System-call and
 library failures are returned as negative errno values.
 
-### 9.1 Direct NVMe discovery
+### 9.1 NVMe discovery
 
-Open the supplied block-device path and issue `BLKGETSIZE64`.  Reject a zero or
-non-512-byte-aligned result.  Set `name = "nvme"`, set `nr_devs = 1`, encode
-the same device as both `top_dev` and `bdevs[0].dev_id`, set `start_sector = 0`,
-and convert the returned byte size to `bdevs[0].size_sector`.  Both `extra`
-values remain zero.  The common `ADD_TOPO` ioctl registers this configuration;
-direct NVMe is not a userspace no-op.
+Open the supplied block-device path and issue `BLKGETSIZE64`, rejecting a zero
+or non-512-byte-aligned result.  Set `name = "nvme"`, `nr_devs = 1`, and
+`top_dev` to the supplied device.  Convert the returned byte size to
+`bdevs[0].size_sector`; both `extra` values remain zero.
+
+For a whole namespace, validate it as a non-multipath NVMe namespace, set
+`bdevs[0].dev_id = top_dev`, and set `start_sector = 0`.  When the top device
+exposes the `partition` sysfs attribute, read `../dev` to obtain and validate
+the containing whole NVMe namespace, set that device as `bdevs[0].dev_id`, and
+read the partition's `start` attribute in 512-byte sectors.  The kernel
+independently verifies the applicable whole-device or partition relationships.
 
 ### 9.2 dm-linear discovery
 
@@ -667,6 +691,7 @@ If no topology is registered for the resolved bdev, the read returns
 ### Mapping tests
 
 - direct NVMe reads at sector zero and the final namespace sector;
+- NVMe-partition reads at the first and final partition-relative sectors;
 - dm-linear reads wholly inside each target and reads crossing every target
   boundary;
 - RAID0 reads at the first/last sector of a chunk, across a chunk boundary,
@@ -677,6 +702,8 @@ If no topology is registered for the resolved bdev, the read returns
 ### Registration and lifetime tests
 
 - direct NVMe `add_topo()` installs and pins an `nvme` topology;
+- NVMe-partition `add_topo()` installs and pins an `nvme` topology keyed
+  by the partition device;
 - two threads concurrently add the same top device and both fds can read;
 - repeated adds on one fd create pins that are all released by close;
 - the topology remains visible after one of multiple owner fds closes;
@@ -690,6 +717,8 @@ If no topology is registered for the resolved bdev, the read returns
 
 - direct NVMe after explicit registration, including a namespace whose NSID is
   not one;
+- an NVMe partition with data comparison across its first and last filesystem
+  allocation regions;
 - dm-linear with two to four NVMe components, including reads crossing target
   boundaries;
 - uniform two- to four-member MD RAID0, including reads crossing chunk and
@@ -706,7 +735,9 @@ If no topology is registered for the resolved bdev, the read returns
 - non-linear dm target, discontinuous dm table, and nested dm/MD component;
 - RAID level other than RAID0, degraded/missing member, duplicate slot,
   unequal member offset or size, and invalid chunk size;
-- NVMe partition, NVMe multipath head, non-NVMe component, invalid NSID ioctl,
-  component range beyond the bdev, and more than four components; and
+- `nvme` with a partition top and a component from another disk, or a
+  mismatched partition start or size;
+- NVMe multipath head, non-NVMe component, invalid NSID ioctl, component range
+  beyond the bdev, and more than four components; and
 - topology reconfiguration attempts while pins exist, which are documented as
   unsupported and must be prevented by the caller.

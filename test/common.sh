@@ -26,6 +26,7 @@ BAR2_START=
 MOUNT_DIR=
 DM_CREATED=0
 MD_CREATED=0
+PARTITION_CREATED=0
 DEBUGFS_MOUNTED=0
 SEED=100
 
@@ -70,6 +71,10 @@ cleanup_storage()
 		wipefs -a -f "$DEV1" "$DEV2" >/dev/null 2>&1
 		MD_CREATED=0
 	fi
+	if (( PARTITION_CREATED )); then
+		wipefs -a -f "$DEV1" >/dev/null 2>&1
+		PARTITION_CREATED=0
+	fi
 	udevadm settle >/dev/null 2>&1
 	set -e
 }
@@ -103,7 +108,7 @@ require_commands()
 
 	for command in awk blockdev cat chmod dmesg dmsetup findmnt grep insmod \
 		lsblk make mdadm mkdir mkfs.ext4 mktemp modinfo mount mountpoint \
-		python3 readlink rm rmmod sed stat sync swapon tr udevadm umount \
+		python3 readlink rm rmmod sed sfdisk stat sync swapon tr udevadm umount \
 		wipefs; do
 		if ! command -v "$command" >/dev/null 2>&1; then
 			printf 'missing required command: %s\n' "$command" >&2
@@ -190,7 +195,8 @@ preflight()
 	[[ $ctrl1 == "$ctrl2" ]] || die "the namespaces must use one NVMe controller"
 	CTRL_NAME=$ctrl1
 	[[ ! -e /sys/class/block/$name1/partition &&
-	   ! -e /sys/class/block/$name2/partition ]] || die "partitions are unsupported"
+	   ! -e /sys/class/block/$name2/partition ]] ||
+		die "the test backing devices must be whole NVMe namespaces"
 	[[ $(blockdev --getsize64 "$DEV1") -eq $NS_SIZE &&
 	   $(blockdev --getsize64 "$DEV2") -eq $NS_SIZE ]] ||
 		die "both namespaces must be exactly 64 MiB"

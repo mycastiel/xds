@@ -109,7 +109,7 @@ static int nvme_map_sector(struct topo *topo, u64 from_sector,
 			   u64 *to_sector, u32 *out_nr_sectors)
 {
 	*to_bdev = &topo->bdevs[0];
-	*to_sector = from_sector;
+	*to_sector = topo->bdevs[0].start_sector + from_sector;
 	*out_nr_sectors = in_nr_sectors;
 	return 0;
 }
@@ -238,12 +238,20 @@ static int topo_validate_linear(struct topo *topo,
 static int topo_validate_nvme(struct topo *topo,
 			      const struct topo_user_cfg *cfg)
 {
+	struct block_device *top_bdev = p2p_handle_to_bdev(topo->top_handle);
 	struct topo_bdev *bdev = &topo->bdevs[0];
-	u64 size = p2p_bdev_nr_sectors(p2p_handle_to_bdev(topo->top_handle));
+	struct block_device *component = p2p_handle_to_bdev(bdev->handle);
+	u64 size = p2p_bdev_nr_sectors(top_bdev);
 
-	if (cfg->extra[0] || cfg->extra[1] || bdev->start_sector ||
-	    bdev->size_sector != size)
+	if (cfg->extra[0] || cfg->extra[1] || bdev->size_sector != size)
 		return -EINVAL;
+	if (bdev_is_partition(top_bdev)) {
+		if (top_bdev->bd_disk != component->bd_disk ||
+		    bdev->start_sector != get_start_sect(top_bdev))
+			return -EINVAL;
+	} else if (bdev->id != topo->top_dev || bdev->start_sector) {
+		return -EINVAL;
+	}
 
 	topo->size_sector = size;
 	topo->ops = &nvme_ops;
@@ -300,7 +308,7 @@ static int topo_validate_cfg(const struct topo_user_cfg *cfg, dev_t top_dev)
 
 		if (!id || cfg->bdevs[i].reserved ||
 		    !cfg->bdevs[i].size_sector ||
-		    (nvme ? id != top_dev : id == top_dev))
+		    (!nvme && id == top_dev))
 			return -EINVAL;
 		for (j = 0; j < i; j++) {
 			if (id == new_decode_dev(cfg->bdevs[j].dev_id))

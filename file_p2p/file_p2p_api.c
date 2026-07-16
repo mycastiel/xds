@@ -165,16 +165,13 @@ static int read_sysfs_u64(dev_t devt, const char *suffix,
 	return parse_u64(buf, value);
 }
 
-static int discover_nvme(const char *dev, dev_t top_dev,
-			 struct topo_user_cfg *cfg)
+static int parse_devt(const char *text, dev_t *devt);
+
+static int get_block_size_sectors(const char *dev, uint64_t *size_sectors)
 {
 	uint64_t size_bytes;
 	int fd;
 	int err;
-
-	err = validate_nvme_component(top_dev);
-	if (err)
-		return err;
 
 	fd = open(dev, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
@@ -189,11 +186,45 @@ static int discover_nvme(const char *dev, dev_t top_dev,
 	if (!size_bytes || size_bytes % FILE_P2P_SECTOR_SIZE)
 		return -EINVAL;
 
+	*size_sectors = size_bytes / FILE_P2P_SECTOR_SIZE;
+	return 0;
+}
+
+static int discover_nvme(const char *dev, dev_t top_dev,
+			 struct topo_user_cfg *cfg)
+{
+	unsigned long long start_sector = 0;
+	uint64_t size_sectors = 0;
+	char parent_devt[64];
+	dev_t component = top_dev;
+	int err;
+
+	if (path_exists(top_dev, "partition")) {
+		err = read_sysfs_text(top_dev, "../dev", parent_devt,
+				      sizeof(parent_devt));
+		if (err)
+			return err;
+		err = parse_devt(parent_devt, &component);
+		if (err)
+			return err;
+		err = read_sysfs_u64(top_dev, "start", &start_sector);
+		if (err)
+			return err;
+	} else {
+		err = validate_nvme_component(top_dev);
+		if (err)
+			return err;
+	}
+	err = get_block_size_sectors(dev, &size_sectors);
+	if (err)
+		return err;
+
 	memcpy(cfg->name, "nvme", sizeof("nvme"));
 	cfg->nr_devs = 1;
 	cfg->top_dev = top_dev;
-	cfg->bdevs[0].dev_id = cfg->top_dev;
-	cfg->bdevs[0].size_sector = size_bytes / FILE_P2P_SECTOR_SIZE;
+	cfg->bdevs[0].dev_id = component;
+	cfg->bdevs[0].size_sector = size_sectors;
+	cfg->bdevs[0].start_sector = start_sector;
 	return 0;
 }
 
@@ -602,7 +633,8 @@ int add_topo(int dev_fd, const char *dev)
 		return -errno;
 	if (!S_ISBLK(st.st_mode))
 		return -EINVAL;
-	if (path_exists(st.st_rdev, "device/subsysnqn"))
+	if (path_exists(st.st_rdev, "partition") ||
+	    path_exists(st.st_rdev, "device/subsysnqn"))
 		nvme = true;
 	else if (path_exists(st.st_rdev, "dm"))
 		discover = discover_linear;

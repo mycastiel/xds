@@ -200,6 +200,29 @@ test_direct_nvme()
 	run_ext4_sizes "$DEV1" direct
 }
 
+test_nvme_partition()
+{
+	local part_dev
+	local -a partitions
+
+	log "NVMe partition block device and ext4"
+	wipe_test_devices
+	printf ',,L\n' | sfdisk --quiet "$DEV1" >/dev/null
+	PARTITION_CREATED=1
+	udevadm settle
+	mapfile -t partitions < <(lsblk -nrpo NAME,TYPE "$DEV1" |
+		awk '$2 == "part" { print $1 }')
+	[[ ${#partitions[@]} -eq 1 ]] ||
+		die "expected exactly one partition on $DEV1"
+	part_dev=${partitions[0]}
+	[[ -b $part_dev ]] || die "$part_dev was not created"
+
+	next_seed
+	run_block_matrix "$part_dev" nvme-part "$SEED"
+	run_ext4_sizes "$part_dev" nvme-part
+	cleanup_storage
+}
+
 test_linear_dm()
 {
 	local usable1
@@ -234,6 +257,7 @@ main()
 	crc_self_test
 	load_modules
 	test_direct_nvme
+	test_nvme_partition
 	test_linear_dm
 	test_raid0
 	log "All XDS C API and Python API tests passed"
