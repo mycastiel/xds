@@ -1,4 +1,4 @@
-# XDS basic KVM test
+# XDS prepared-VM tests
 
 `basic_test.sh` is a destructive end-to-end test for the XDS direct-read path.
 It builds the kernel modules and both userspace APIs, uses a QEMU NVMe
@@ -74,3 +74,40 @@ The sequence is:
 Every filesystem phase runs individual boundary cases, four queued reads of
 different files, and four simultaneous same-fd submissions. The C and Python
 APIs use separate CMB ranges.
+
+## Dynamic-VA stress test
+
+`stress_test.sh` is a separate destructive entry point for concurrent reads
+with runtime-allocated CMB virtual addresses. It uses the same prepared-VM
+contract and mandatory device variables as `basic_test.sh`:
+
+```sh
+sudo XDS_DEV_1=/dev/nvme0n1 \
+     XDS_DEV_2=/dev/nvme0n2 \
+     XDS_STRESS_MODE=raid0 \
+     ./test/stress_test.sh
+```
+
+`XDS_STRESS_MODE` selects the ext4 backing device and defaults to `raid0`:
+
+- `raid0` creates the two-namespace MD RAID0 used by the basic test.
+- `dm` creates the two-segment dm-linear device with a 1 MiB data offset on
+  each namespace.
+- `nvme` uses `XDS_DEV_1` directly.
+
+The test creates 16 files with seeded random, 1 KiB-aligned sizes between
+4 KiB and 4 MiB. Their combined size is greater than 4 MiB and capped at
+48 MiB so the workload fits the direct 64 MiB namespace. Each of 16 worker
+threads owns a different `/dev/p2p_device` fd. On every iteration it
+uses a seeded random 1 KiB-aligned file offset and read length, dynamically
+reserves the required CMB VA in 4 KiB units, and participates in a concurrent
+read. Live allocations must be non-overlapping while at least two files share
+a 2 MiB physical CMB page.
+
+Both the C and Python APIs run against the same generated workload. Each run
+checks its runtime allocation manifest, kernel/userspace CRC32 results, and
+debugfs failure/inflight counters. Set `XDS_STRESS_ITERATIONS` to change the
+default 16 iterations and `XDS_STRESS_SEED` to replay another workload; the
+default seed is `0x584453`. The common `XDS_TEST_WORKDIR`,
+`XDS_TEST_KEEP_WORKDIR`, `XDS_TEST_BUILD_JOBS`, and `KSRC` controls apply to
+both entry points. Shared prepared-VM and storage helpers live in `common.sh`.

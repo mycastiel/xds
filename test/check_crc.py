@@ -9,7 +9,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Deque, Dict, List, Tuple
+from typing import Counter as CounterType, Dict, List, Tuple
 
 
 KERNEL_CRC = re.compile(
@@ -34,13 +34,13 @@ def positive_cases(path: Path) -> List[Tuple[str, Path, int, int]]:
     return cases
 
 
-def kernel_results(path: Path) -> Dict[Tuple[str, int], Deque[int]]:
-    results: Dict[Tuple[str, int], Deque[int]] = collections.defaultdict(
-        collections.deque
+def kernel_results(path: Path) -> Dict[Tuple[str, int], CounterType[int]]:
+    results: Dict[Tuple[str, int], CounterType[int]] = collections.defaultdict(
+        collections.Counter
     )
     for match in KERNEL_CRC.finditer(path.read_text(encoding="utf-8")):
         key = (Path(match.group(1)).name, int(match.group(2), 16))
-        results[key].append(int(match.group(3), 16))
+        results[key][int(match.group(3), 16)] += 1
     return results
 
 
@@ -75,31 +75,37 @@ def main() -> int:
 
     cases = positive_cases(args.manifest)
     actual = kernel_results(args.log)
-    if sum(len(values) for values in actual.values()) != len(cases):
+    actual_count = sum(sum(values.values()) for values in actual.values())
+    if actual_count != len(cases):
         raise ValueError(
-            f"kernel produced {sum(len(values) for values in actual.values())} "
+            f"kernel produced {actual_count} "
             f"CRC lines for {len(cases)} successful cases"
         )
 
+    expected: Dict[Tuple[str, int], CounterType[int]] = collections.defaultdict(
+        collections.Counter
+    )
+    case_results: List[Tuple[str, int]] = []
     for case_id, source, offset, length in cases:
         file_name = kernel_file_name(source)
         key = (file_name, length)
-        if not actual[key]:
-            raise ValueError(
-                f"{case_id}: no kernel CRC for file={file_name} length=0x{length:x}"
-            )
-        kernel_crc = actual[key].popleft()
         user_crc = userspace_crc(args.crc_tool, source, offset, length)
-        if kernel_crc != user_crc:
-            raise ValueError(
-                f"{case_id}: kernel CRC 0x{kernel_crc:08x} != "
-                f"userspace CRC 0x{user_crc:08x}"
-            )
-        print(f"crc-pass case={case_id} crc32=0x{kernel_crc:08x}")
+        expected[key][user_crc] += 1
+        case_results.append((case_id, user_crc))
 
-    leftovers = sum(len(values) for values in actual.values())
-    if leftovers:
-        raise ValueError(f"{leftovers} unmatched kernel CRC lines remain")
+    if set(actual) != set(expected):
+        missing = set(expected) - set(actual)
+        extra = set(actual) - set(expected)
+        raise ValueError(f"kernel CRC keys differ: missing={missing} extra={extra}")
+    for key, expected_values in expected.items():
+        if actual[key] != expected_values:
+            raise ValueError(
+                f"file={key[0]} length=0x{key[1]:x}: kernel CRC multiset "
+                f"{actual[key]} != userspace CRC multiset {expected_values}"
+            )
+
+    for case_id, user_crc in case_results:
+        print(f"crc-pass case={case_id} crc32=0x{user_crc:08x}")
     return 0
 
 
