@@ -43,12 +43,16 @@ static int topo_validate_nvme_bdev(struct block_device *bdev)
 {
 	dev_t devt = bdev->bd_dev;
 
-	if (bdev_is_partition(bdev))
+	if (!topo_sysfs_path_exists(devt, "device/subsysnqn")) {
+		pr_err("component %u:%u is not an NVMe namespace\n",
+		       MAJOR(devt), MINOR(devt));
 		return -EOPNOTSUPP;
-	if (!topo_sysfs_path_exists(devt, "device/subsysnqn"))
+	}
+	if (topo_sysfs_path_exists(devt, "device/iopolicy")) {
+		pr_err("NVMe multipath component %u:%u is unsupported\n",
+		       MAJOR(devt), MINOR(devt));
 		return -EOPNOTSUPP;
-	if (topo_sysfs_path_exists(devt, "device/iopolicy"))
-		return -EOPNOTSUPP;
+	}
 	return 0;
 }
 
@@ -57,17 +61,73 @@ static int topo_get_nsid(struct block_device *bdev, u32 *nsid)
 	const struct block_device_operations *fops = bdev->bd_disk->fops;
 	int ret;
 
-	if (!fops || !fops->ioctl)
-		return -EOPNOTSUPP;
+	if (WARN_ON_ONCE(!fops || !fops->ioctl))
+		return -EINVAL;
 
 	ret = fops->ioctl(bdev, P2P_BDEV_READ_MODE, NVME_IOCTL_ID, 0);
-	if (ret < 0)
+	if (ret < 0) {
+		pr_err("NVME_IOCTL_ID failed for component %u:%u: %d\n",
+		       MAJOR(bdev->bd_dev), MINOR(bdev->bd_dev), ret);
 		return ret;
+	}
 	if (!ret)
 		return -EINVAL;
 
 	*nsid = ret;
 	return 0;
+}
+
+static int topo_open_component(struct topo_bdev *bdev,
+			       const struct topo_user_bdev *cfg)
+{
+	p2p_bdev_handle *input_handle;
+	struct block_device *input_bdev;
+	u64 end_sector;
+	int err;
+
+	bdev->id = new_decode_dev(cfg->dev_id);
+	bdev->size_sector = cfg->size_sector;
+	bdev->start_sector = cfg->start_sector;
+	input_handle = p2p_bdev_open_by_dev(bdev->id);
+	if (IS_ERR(input_handle)) {
+		err = PTR_ERR(input_handle);
+		pr_err("failed to open component %u:%u: %d\n",
+		       MAJOR(bdev->id), MINOR(bdev->id), err);
+		return err;
+	}
+	input_bdev = p2p_handle_to_bdev(input_handle);
+
+	if (check_add_overflow(bdev->start_sector, bdev->size_sector,
+			       &end_sector) ||
+	    end_sector > p2p_bdev_nr_sectors(input_bdev)) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	if (bdev_is_partition(input_bdev)) {
+		bdev->start_sector += get_start_sect(input_bdev);
+		bdev->id = p2p_bdev_whole(input_bdev)->bd_dev;
+		bdev->handle = p2p_bdev_open_by_dev(bdev->id);
+		if (IS_ERR(bdev->handle)) {
+			err = PTR_ERR(bdev->handle);
+			pr_err("failed to open whole component %u:%u: %d\n",
+			       MAJOR(bdev->id), MINOR(bdev->id), err);
+			bdev->handle = NULL;
+			goto out;
+		}
+	} else {
+		bdev->handle = input_handle;
+		input_handle = NULL;
+	}
+
+	err = topo_validate_nvme_bdev(p2p_handle_to_bdev(bdev->handle));
+	if (err)
+		goto out;
+	err = topo_get_nsid(p2p_handle_to_bdev(bdev->handle), &bdev->nsid);
+out:
+	if (input_handle)
+		p2p_bdev_release(input_handle);
+	return err;
 }
 
 static int linear_map_sector(struct topo *topo, u64 from_sector,
@@ -262,9 +322,10 @@ static int topo_validate_raid0(struct topo *topo,
 		return -EINVAL;
 
 	chunk_sectors = 1ULL << cfg->extra[0];
+	/* Compare configured offsets before partition-start translation. */
 	for (i = 0; i < topo->nr_bdevs; i++) {
-		if (topo->bdevs[i].start_sector != topo->bdevs[0].start_sector ||
-		    topo->bdevs[i].size_sector != topo->bdevs[0].size_sector ||
+		if (cfg->bdevs[i].start_sector != cfg->bdevs[0].start_sector ||
+		    cfg->bdevs[i].size_sector != cfg->bdevs[0].size_sector ||
 		    topo->bdevs[i].size_sector % chunk_sectors)
 			return -EINVAL;
 	}
@@ -280,7 +341,7 @@ static int topo_validate_raid0(struct topo *topo,
 	return 0;
 }
 
-static int topo_validate_cfg(const struct topo_user_cfg *cfg, dev_t top_dev)
+static int topo_validate_cfg(const struct topo_user_cfg *cfg)
 {
 	bool nvme;
 	u32 i;
@@ -291,20 +352,16 @@ static int topo_validate_cfg(const struct topo_user_cfg *cfg, dev_t top_dev)
 	     strcmp(cfg->name, "raid0")))
 		return -EINVAL;
 	nvme = !strcmp(cfg->name, "nvme");
-	if (!top_dev || !cfg->nr_devs ||
-	    cfg->nr_devs > P2P_TOPO_MAX_BDEVS ||
+	if (!cfg->nr_devs || cfg->nr_devs > P2P_TOPO_MAX_BDEVS ||
 	    (nvme && cfg->nr_devs != 1))
 		return -EINVAL;
 
 	for (i = 0; i < cfg->nr_devs; i++) {
-		dev_t id = new_decode_dev(cfg->bdevs[i].dev_id);
-
-		if (!id || cfg->bdevs[i].reserved ||
-		    !cfg->bdevs[i].size_sector ||
-		    (!nvme && id == top_dev))
+		if (cfg->bdevs[i].reserved || !cfg->bdevs[i].size_sector ||
+		    (!nvme && cfg->bdevs[i].dev_id == cfg->top_dev))
 			return -EINVAL;
 		for (j = 0; j < i; j++) {
-			if (id == new_decode_dev(cfg->bdevs[j].dev_id))
+			if (cfg->bdevs[i].dev_id == cfg->bdevs[j].dev_id)
 				return -EINVAL;
 		}
 	}
@@ -323,7 +380,7 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 
 	topo->top_dev = new_decode_dev(cfg->top_dev);
 	topo->nr_bdevs = cfg->nr_devs;
-	err = topo_validate_cfg(cfg, topo->top_dev);
+	err = topo_validate_cfg(cfg);
 	if (err)
 		goto free_topo;
 
@@ -339,6 +396,8 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 	topo->top_handle = p2p_bdev_open_by_dev(topo->top_dev);
 	if (IS_ERR(topo->top_handle)) {
 		err = PTR_ERR(topo->top_handle);
+		pr_err("failed to open top bdev %u:%u: %d\n",
+		       MAJOR(topo->top_dev), MINOR(topo->top_dev), err);
 		topo->top_handle = NULL;
 		goto free_topo;
 	}
@@ -352,27 +411,8 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 
 	for (i = 0; i < topo->nr_bdevs; i++) {
 		struct topo_bdev *bdev = &topo->bdevs[i];
-		u64 end_sector;
 
-		bdev->id = new_decode_dev(cfg->bdevs[i].dev_id);
-		bdev->size_sector = cfg->bdevs[i].size_sector;
-		bdev->start_sector = cfg->bdevs[i].start_sector;
-		bdev->handle = p2p_bdev_open_by_dev(bdev->id);
-		if (IS_ERR(bdev->handle)) {
-			err = PTR_ERR(bdev->handle);
-			bdev->handle = NULL;
-			goto free_topo;
-		}
-		err = topo_validate_nvme_bdev(p2p_handle_to_bdev(bdev->handle));
-		if (err)
-			goto free_topo;
-		if (check_add_overflow(bdev->start_sector, bdev->size_sector,
-				       &end_sector) ||
-		    end_sector > p2p_bdev_nr_sectors(p2p_handle_to_bdev(bdev->handle))) {
-			err = -EINVAL;
-			goto free_topo;
-		}
-		err = topo_get_nsid(p2p_handle_to_bdev(bdev->handle), &bdev->nsid);
+		err = topo_open_component(bdev, &cfg->bdevs[i]);
 		if (err)
 			goto free_topo;
 	}
@@ -383,8 +423,11 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 		err = topo_validate_linear(topo, cfg);
 	else
 		err = topo_validate_raid0(topo, cfg);
-	if (err)
+	if (err) {
+		pr_err("invalid %s topology for %u:%u: %d\n", topo->name,
+		       MAJOR(topo->top_dev), MINOR(topo->top_dev), err);
 		goto free_topo;
+	}
 
 	kref_init(&topo->refcnt);
 	kref_init(&topo->pin_refcnt);
@@ -395,8 +438,7 @@ free_topo:
 	return ERR_PTR(err);
 }
 
-struct topo *topo_add(const struct topo_user_cfg *cfg,
-		      struct shared_topo_list *list)
+int topo_add(const struct topo_user_cfg *cfg, struct shared_topo_list *list)
 {
 	struct shared_topo *shared;
 	struct topo *candidate = NULL;
@@ -406,12 +448,9 @@ struct topo *topo_add(const struct topo_user_cfg *cfg,
 	int err;
 
 	top_dev = new_decode_dev(cfg->top_dev);
-	if (!top_dev)
-		return ERR_PTR(-EINVAL);
-
 	shared = kzalloc(sizeof(*shared), GFP_KERNEL);
 	if (!shared)
-		return ERR_PTR(-ENOMEM);
+		return -ENOMEM;
 
 	spin_lock(&topo_lock);
 	installed = radix_tree_lookup(&topo_tree, top_dev);
@@ -456,13 +495,13 @@ link_shared:
 
 	if (candidate && installed != candidate)
 		topo_destroy_sync(candidate);
-	return installed;
+	return 0;
 
 free_candidate:
 	topo_destroy_sync(candidate);
 free_shared:
 	kfree(shared);
-	return ERR_PTR(err);
+	return err;
 }
 
 struct topo *topo_get(struct block_device *top_bdev)
@@ -489,8 +528,8 @@ static void topo_pin_release(struct kref *ref)
 	void *removed;
 
 	removed = radix_tree_delete(&topo_tree, topo->top_dev);
-	WARN_ON_ONCE(removed != topo);
 	spin_unlock(&topo_lock);
+	WARN_ON_ONCE(removed != topo);
 	topo_put(topo);
 }
 

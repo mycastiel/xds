@@ -24,6 +24,7 @@ struct p2p_read_param {
 struct topo_user_bdev {
 	__u32 dev_id;
 	__u32 reserved;
+	/* [start_sector, start_sector + size_sector) */
 	__u64 size_sector;
 	__u64 start_sector;
 };
@@ -31,8 +32,9 @@ struct topo_user_bdev {
 struct topo_user_cfg {
 	/*
 	 * top_dev is the block device hosting the file system. For an nvme
-	 * topology, it may be a whole namespace or a partition. Components must
-	 * be whole, non-multipath NVMe namespaces.
+	 * topology, it may be a whole namespace or a partition. Components may
+	 * also be partitions, but their whole devices must be direct,
+	 * non-multipath NVMe namespaces.
 	 */
 	char name[P2P_TOPO_NAME_LEN];
 	__u32 top_dev;

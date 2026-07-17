@@ -836,8 +836,8 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 		goto put_reg_file;
 	}
 	if (!topo) {
-		pr_err("topology for bdev %u:%u is not registered\n",
-		       MAJOR(bdev->bd_dev), MINOR(bdev->bd_dev));
+		pr_err_ratelimited("topology for bdev %u:%u is not registered\n",
+				   MAJOR(bdev->bd_dev), MINOR(bdev->bd_dev));
 		err = -ENODEV;
 		goto put_reg_file;
 	}
@@ -932,7 +932,6 @@ static int p2p_add_topo(struct p2p_batch *batch, void __user *arg)
 {
 	struct topo_user_cfg header;
 	struct topo_user_cfg *cfg;
-	struct topo *topo;
 	size_t size;
 	int err;
 
@@ -953,8 +952,7 @@ static int p2p_add_topo(struct p2p_batch *batch, void __user *arg)
 		return -EINVAL;
 	}
 
-	topo = topo_add(cfg, &batch->shared_topos);
-	err = PTR_ERR_OR_ZERO(topo);
+	err = topo_add(cfg, &batch->shared_topos);
 	kfree(cfg);
 	return err;
 }
@@ -1003,34 +1001,34 @@ static int __init p2p_drv_init(void)
 
 	err = alloc_chrdev_region(&dev, 0, 1, "p2p_device");
 	if (err < 0) {
-		pr_err("cannot allocate major number err %d\n", err);
+		pr_err("allocate major number err %d\n", err);
 		goto exit_debugfs;
 	}
 
-	pr_info("Major = %d Minor = %d\n", MAJOR(dev), MINOR(dev));
+	pr_info("major = %d minor = %d\n", MAJOR(dev), MINOR(dev));
 	cdev_init(&p2p_cdev, &fops);
 
 	err = cdev_add(&p2p_cdev, dev, 1);
 	if (err < 0) {
-		pr_err("Cannot add the device to the system.\n");
+		pr_err("add the device to the system err %d\n", err);
 		goto free_dev;
 	}
 
 	dev_class = p2p_class_create("p2p_class");
 	if (IS_ERR(dev_class)) {
 		err = PTR_ERR(dev_class);
-		pr_err("Cannot create the struct class\n");
+		pr_err("create class err %d\n", err);
 		goto del_cdev;
 	}
 
 	device = device_create(dev_class, NULL, dev, NULL, "p2p_device");
 	if (IS_ERR(device)) {
 		err = PTR_ERR(device);
-		pr_err("Cannot create the device\n");
+		pr_err("create device err %d\n", err);
 		goto del_cls;
 	}
 
-	pr_info("Device Driver Inserted Done\n");
+	pr_info("driver inserted done\n");
 	return 0;
 
 del_cls:
@@ -1056,7 +1054,7 @@ static void __exit p2p_drv_exit(void)
 	unregister_chrdev_region(dev, 1);
 	p2p_tp_hook_exit();
 	topo_exit();
-	pr_info("Device Driver Removed Done\n");
+	pr_info("driver removed done\n");
 }
 
 module_init(p2p_drv_init);

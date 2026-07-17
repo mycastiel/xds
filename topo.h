@@ -59,8 +59,7 @@ struct shared_topo_list {
 
 int topo_init(void);
 void topo_exit(void);
-struct topo *topo_add(const struct topo_user_cfg *cfg,
-		      struct shared_topo_list *list);
+int topo_add(const struct topo_user_cfg *cfg, struct shared_topo_list *list);
 void topo_del(struct topo *topo);
 struct topo *topo_get(struct block_device *top_bdev);
 void topo_put(struct topo *topo);
