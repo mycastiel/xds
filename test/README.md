@@ -71,8 +71,13 @@ The sequence is:
    namespace. Each segment starts at a 1 MiB underlying-device offset to match
    the real LVM data layout. It is tested as a block device and with all three
    ext4 block sizes, and is created and removed directly with `dmsetup`.
-4. A two-member, 64 KiB-chunk MD RAID0, tested as a block device and with all
+4. The same dm-linear coverage with equal-sized partitions starting at
+   different namespace sectors as its components.
+5. A two-member, 64 KiB-chunk MD RAID0, tested as a block device and with all
    three ext4 block sizes.
+6. The same RAID0 coverage with equal-sized partitions starting at different
+   namespace sectors as its members. The MD member offsets and component sizes
+   remain equal.
 
 Every filesystem phase runs individual boundary cases, four queued reads of
 different files, and four simultaneous same-fd submissions. The C and Python

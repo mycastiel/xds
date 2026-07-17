@@ -11,6 +11,9 @@ readonly NS_SIZE=$((64 << 20))
 readonly STUB_PAGE_SIZE=$((2 << 20))
 readonly DM_DATA_OFFSET=$((1 << 20))
 readonly DM_DATA_OFFSET_SECTORS=$((DM_DATA_OFFSET / 512))
+readonly PART1_START_SECTORS=2048
+readonly PART2_START_SECTORS=4096
+readonly PART_SIZE_SECTORS=$((60 * 1024 * 1024 / 512))
 readonly DM_NAME=xds_linear
 readonly DM_PATH=/dev/mapper/$DM_NAME
 readonly MD_DEV=/dev/md/xds_test
@@ -27,6 +30,8 @@ MOUNT_DIR=
 DM_CREATED=0
 MD_CREATED=0
 PARTITION_CREATED=0
+PART_DEV1=
+PART_DEV2=
 DEBUGFS_MOUNTED=0
 SEED=100
 
@@ -68,12 +73,15 @@ cleanup_storage()
 	fi
 	if (( MD_CREATED )); then
 		mdadm --stop "$MD_DEV" >/dev/null 2>&1
-		wipefs -a -f "$DEV1" "$DEV2" >/dev/null 2>&1
+		wipefs -a -f "${PART_DEV1:-$DEV1}" "${PART_DEV2:-$DEV2}" \
+			>/dev/null 2>&1
 		MD_CREATED=0
 	fi
 	if (( PARTITION_CREATED )); then
-		wipefs -a -f "$DEV1" >/dev/null 2>&1
+		wipefs -a -f "$DEV1" "$DEV2" >/dev/null 2>&1
 		PARTITION_CREATED=0
+		PART_DEV1=
+		PART_DEV2=
 	fi
 	udevadm settle >/dev/null 2>&1
 	set -e
@@ -361,25 +369,56 @@ wipe_test_devices()
 	udevadm settle
 }
 
+find_single_partition()
+{
+	local dev=$1
+	local -a partitions
+
+	mapfile -t partitions < <(lsblk -nrpo NAME,TYPE "$dev" |
+		awk '$2 == "part" { print $1 }')
+	[[ ${#partitions[@]} -eq 1 ]] ||
+		die "expected exactly one partition on $dev"
+	[[ -b ${partitions[0]} ]] || die "${partitions[0]} was not created"
+	printf '%s\n' "${partitions[0]}"
+}
+
+create_component_partitions()
+{
+	wipe_test_devices
+	printf '%s,%s,L\n' "$PART1_START_SECTORS" "$PART_SIZE_SECTORS" |
+		sfdisk --quiet "$DEV1" >/dev/null
+	PARTITION_CREATED=1
+	printf '%s,%s,L\n' "$PART2_START_SECTORS" "$PART_SIZE_SECTORS" |
+		sfdisk --quiet "$DEV2" >/dev/null
+	udevadm settle
+	PART_DEV1=$(find_single_partition "$DEV1")
+	PART_DEV2=$(find_single_partition "$DEV2")
+}
+
 create_linear_dm()
 {
+	local dev1=${1:-$DEV1}
+	local dev2=${2:-$DEV2}
 	local actual_sectors sectors1 sectors2 table usable1 usable2
 
-	wipe_test_devices
+	(( $# == 0 || $# == 2 )) || die "create_linear_dm accepts zero or two devices"
+	if (( $# == 0 )); then
+		wipe_test_devices
+	fi
 	if dmsetup info "$DM_NAME" >/dev/null 2>&1 || [[ -e $DM_PATH ]]; then
 		die "$DM_NAME already exists"
 	fi
-	sectors1=$(blockdev --getsz "$DEV1")
-	sectors2=$(blockdev --getsz "$DEV2")
+	sectors1=$(blockdev --getsz "$dev1")
+	sectors2=$(blockdev --getsz "$dev2")
 	(( sectors1 > DM_DATA_OFFSET_SECTORS )) ||
-		die "$DEV1 is too small for the 1 MiB data offset"
+		die "$dev1 is too small for the 1 MiB data offset"
 	(( sectors2 > DM_DATA_OFFSET_SECTORS )) ||
-		die "$DEV2 is too small for the 1 MiB data offset"
+		die "$dev2 is too small for the 1 MiB data offset"
 	usable1=$((sectors1 - DM_DATA_OFFSET_SECTORS))
 	usable2=$((sectors2 - DM_DATA_OFFSET_SECTORS))
 	printf -v table '0 %s linear %s %s\n%s %s linear %s %s' \
-		"$usable1" "$DEV1" "$DM_DATA_OFFSET_SECTORS" \
-		"$usable1" "$usable2" "$DEV2" "$DM_DATA_OFFSET_SECTORS"
+		"$usable1" "$dev1" "$DM_DATA_OFFSET_SECTORS" \
+		"$usable1" "$usable2" "$dev2" "$DM_DATA_OFFSET_SECTORS"
 	if ! dmsetup create "$DM_NAME" --table "$table"; then
 		dmsetup remove --retry "$DM_NAME" >/dev/null 2>&1 || true
 		die "failed to create $DM_PATH"
@@ -407,13 +446,21 @@ create_linear_dm()
 
 create_raid0()
 {
-	wipe_test_devices
+	local dev1=${1:-$DEV1}
+	local dev2=${2:-$DEV2}
+
+	(( $# == 0 || $# == 2 )) || die "create_raid0 accepts zero or two devices"
+	if (( $# == 0 )); then
+		wipe_test_devices
+	fi
 	mkdir -p /dev/md
 	[[ ! -e $MD_DEV ]] || die "$MD_DEV already exists"
 	if ! mdadm --create "$MD_DEV" --run --metadata=1.2 --level=0 \
-		--raid-devices=2 --chunk=64 "$DEV1" "$DEV2"; then
+		--raid-devices=2 --chunk=64 "$dev1" "$dev2"; then
 		mdadm --stop "$MD_DEV" >/dev/null 2>&1 || true
-		wipe_test_devices
+		if (( $# == 0 )); then
+			wipe_test_devices
+		fi
 		die "failed to create $MD_DEV"
 	fi
 	MD_CREATED=1

@@ -236,6 +236,20 @@ test_linear_dm()
 	cleanup_storage
 }
 
+test_linear_dm_partitions()
+{
+	local usable1
+
+	log "dm-linear with NVMe partition components"
+	create_component_partitions
+	create_linear_dm "$PART_DEV1" "$PART_DEV2"
+	usable1=$(($(blockdev --getsz "$PART_DEV1") - DM_DATA_OFFSET_SECTORS))
+	next_seed
+	run_block_matrix "$DM_PATH" linear-part "$SEED" $((usable1 * 512))
+	run_ext4_sizes "$DM_PATH" linear-part
+	cleanup_storage
+}
+
 test_raid0()
 {
 	log "MD RAID0 block device and ext4"
@@ -243,6 +257,17 @@ test_raid0()
 	next_seed
 	run_block_matrix "$MD_DEV" raid0 "$SEED" $((64 * 1024))
 	run_ext4_sizes "$MD_DEV" raid0
+	cleanup_storage
+}
+
+test_raid0_partitions()
+{
+	log "MD RAID0 with NVMe partition members"
+	create_component_partitions
+	create_raid0 "$PART_DEV1" "$PART_DEV2"
+	next_seed
+	run_block_matrix "$MD_DEV" raid0-part "$SEED" $((64 * 1024))
+	run_ext4_sizes "$MD_DEV" raid0-part
 	cleanup_storage
 }
 
@@ -259,7 +284,9 @@ main()
 	test_direct_nvme
 	test_nvme_partition
 	test_linear_dm
+	test_linear_dm_partitions
 	test_raid0
+	test_raid0_partitions
 	log "All XDS C API and Python API tests passed"
 }
 

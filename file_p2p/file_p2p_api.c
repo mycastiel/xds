@@ -167,6 +167,25 @@ static int read_sysfs_u64(dev_t devt, const char *suffix,
 
 static int parse_devt(const char *text, dev_t *devt);
 
+static int validate_nvme_component_input(dev_t devt)
+{
+	char parent_devt[64];
+	dev_t whole_dev;
+	int err;
+
+	if (!path_exists(devt, "partition"))
+		return validate_nvme_component(devt);
+
+	err = read_sysfs_text(devt, "../dev", parent_devt,
+			      sizeof(parent_devt));
+	if (err)
+		return err;
+	err = parse_devt(parent_devt, &whole_dev);
+	if (err)
+		return err;
+	return validate_nvme_component(whole_dev);
+}
+
 static int get_block_size_sectors(const char *dev, uint64_t *size_sectors)
 {
 	uint64_t size_bytes;
@@ -207,6 +226,9 @@ static int discover_nvme(const char *dev, dev_t top_dev,
 		err = parse_devt(parent_devt, &component);
 		if (err)
 			return err;
+		err = validate_nvme_component(component);
+		if (err)
+			return err;
 		err = read_sysfs_u64(top_dev, "start", &start_sector);
 		if (err)
 			return err;
@@ -233,7 +255,6 @@ static int parse_devt(const char *text, dev_t *devt)
 	unsigned int dev_major;
 	unsigned int dev_minor;
 	char trailing;
-	int err;
 
 	if (sscanf(text, "%u:%u %c", &dev_major, &dev_minor, &trailing) != 2)
 		return -EINVAL;
@@ -241,8 +262,7 @@ static int parse_devt(const char *text, dev_t *devt)
 	if (major(*devt) != dev_major || minor(*devt) != dev_minor)
 		return -EINVAL;
 
-	err = validate_nvme_component(*devt);
-	return err;
+	return 0;
 }
 
 static int parse_linear_params(const char *params, dev_t *devt,
@@ -263,7 +283,7 @@ static int parse_linear_params(const char *params, dev_t *devt,
 	*devt = makedev(dev_major, dev_minor);
 	if (major(*devt) != dev_major || minor(*devt) != dev_minor)
 		return -EINVAL;
-	return validate_nvme_component(*devt);
+	return validate_nvme_component_input(*devt);
 }
 
 static int dm_table_query(dev_t top_dev, void **buffer_out)
@@ -523,6 +543,9 @@ static int discover_raid0_members(dev_t top_dev, unsigned int raid_disks,
 		if (err)
 			goto out;
 		err = parse_devt(block_dev, &component);
+		if (err)
+			goto out;
+		err = validate_nvme_component_input(component);
 		if (err)
 			goto out;
 		entry->dev_id = component;
