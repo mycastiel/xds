@@ -79,9 +79,6 @@ static int linear_map_sector(struct topo *topo, u64 from_sector,
 	u64 available;
 	u32 i;
 
-	if (!in_nr_sectors || from_sector >= topo->size_sector)
-		return -EINVAL;
-
 	for (i = 0; i < topo->nr_bdevs; i++) {
 		struct topo_bdev *bdev = &topo->bdevs[i];
 
@@ -125,7 +122,7 @@ static int raid0_map_sector(struct topo *topo, u64 from_sector,
 	u64 member_offset;
 	u32 member_index;
 
-	if (!in_nr_sectors || from_sector >= topo->size_sector)
+	if (from_sector >= topo->size_sector)
 		return -EINVAL;
 
 	chunk_index = from_sector >> topo->priv.chunk_sectors_shift;
