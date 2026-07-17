@@ -85,7 +85,7 @@ struct topo_user_cfg {
 	struct topo_user_bdev bdevs[];
 };
 
-#define IOCTL_ADD_TOPO _IOW('k', 5, struct topo_user_cfg)
+#define IOCTL_ADD_TOPO _IOW('k', 1, struct topo_user_cfg)
 ```
 
 The flexible array is not included in the encoded ioctl size.  The kernel

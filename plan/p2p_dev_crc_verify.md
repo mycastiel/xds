@@ -11,7 +11,7 @@ same as the bytes read through the filesystem interface.
 
 This is an opt-in debug feature guarded by `CALC_CRC32`.  It is not enabled in
 normal module builds because CPU-reading all P2P destination memory adds a full
-extra pass over the data and serializes that work in `IOCTL_DRAIN_READ`.
+extra pass over the data and serializes that work in `IOCTL_DRAIN_IO`.
 
 ## Current State
 
@@ -21,7 +21,7 @@ The current read path already retains everything needed for CRC calculation:
 - `pa_iov` contains the exact destination physical address and length segments
   in logical read order, with first- and last-page padding removed;
 - `data_size` is the sum of the requested destination IOV lengths; and
-- `p2p_drain_read()` calls `wait_io_done()` before freeing the context.
+- `p2p_drain_io()` calls `wait_io_done()` before freeing the context.
 
 Therefore, do not add a second list of PAs used during request submission and
 do not copy the dentry name into the context.  Reuse `io_ctx->pa_iov` for the
@@ -99,7 +99,7 @@ Every successful mapping must be unmapped before advancing to the next PA IOV.
 
 ### 3. Drain integration and errors
 
-Keep checksum calculation in `p2p_drain_read()` immediately after
+Keep checksum calculation in `p2p_drain_io()` immediately after
 `wait_io_done()` has reported success and before `free_io_ctx()`:
 
 1. Preserve the existing `issue_err` and block-completion error handling.
@@ -173,7 +173,7 @@ binary without removing its source or directory.
 2. Run `make test` to build `test/crc32_verify`.
 3. Submit a P2P read and do not modify or reuse any destination IOV until its
    covering drain returns.
-4. Call `IOCTL_DRAIN_READ` and collect the kernel checksum line.
+4. Call `IOCTL_DRAIN_IO` and collect the kernel checksum line.
 5. Run `test/crc32_verify -f <file> -o <offset> -l <iov-byte-count>` for the
    same stable source range.
 6. Compare the two eight-digit CRC values.

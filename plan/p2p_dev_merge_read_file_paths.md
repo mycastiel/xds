@@ -187,7 +187,7 @@ This removes the existing final-entry overrun and naturally handles:
 
 Preserve the current asynchronous ownership model: once the I/O context is
 created, enqueue it on `batch->io_list` even if submission stops partway, store
-the synchronous submission failure in `issue_err`, and let `drain_read` wait
+the synchronous submission failure in `issue_err`, and let `drain_io` wait
 for already-issued commands before freeing the context.
 
 ### 5. Simplify ioctl dispatch and cleanup
@@ -218,7 +218,7 @@ internal submit helper:
 - `read_file()` submits one parameter with `IOCTL_READ_FILE`.
 - `read_file_batch()` iterates its parameter array and submits each parameter
   with `IOCTL_READ_FILE`; all resulting contexts remain asynchronous on the
-  same device fd and are collected by `drain_read()`.
+  same device fd and are collected by `drain_io()`.
 
 Using several destination buffers for one contiguous file range no longer
 requires `read_file_batch()`; callers put those buffers in one parameter's IOV
@@ -239,7 +239,7 @@ construct this contract and remove references to the deleted `bdev_name`,
 
 ### Focused behavior checks
 
-- Submit one aligned IOV and verify `read_file()` plus `drain_read()` succeeds.
+- Submit one aligned IOV and verify `read_file()` plus `drain_io()` succeeds.
 - Submit one IOV with a valid page offset and a length smaller than one device
   page.
 - Submit multiple unequal IOVs whose boundaries do not match FIEMAP extent
