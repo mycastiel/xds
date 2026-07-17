@@ -260,6 +260,17 @@ test_raid0()
 	cleanup_storage
 }
 
+test_raid0_slot_order()
+{
+	log "MD RAID0 discovery ordered by member slot"
+	wipe_test_devices
+	create_raid0 "$DEV2" "$DEV1"
+	verify_raid0_slots "$DEV2" "$DEV1"
+	next_seed
+	run_block_matrix "$MD_DEV" raid0-slot-order "$SEED" $((64 * 1024))
+	cleanup_storage
+}
+
 test_raid0_partitions()
 {
 	log "MD RAID0 with NVMe partition members"
@@ -286,6 +297,7 @@ main()
 	test_linear_dm
 	test_linear_dm_partitions
 	test_raid0
+	test_raid0_slot_order
 	test_raid0_partitions
 	log "All XDS C API and Python API tests passed"
 }

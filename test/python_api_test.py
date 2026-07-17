@@ -119,9 +119,9 @@ def check_result(test: TestCase) -> None:
 
 
 def drain(dev_fd: int) -> None:
-    result = file_p2p.drain_read(dev_fd)
+    result = file_p2p.drain_io(dev_fd)
     if result:
-        raise RuntimeError(f"drain_read returned {result}")
+        raise RuntimeError(f"drain_io returned {result}")
 
 
 def run_single(dev_fd: int, tests: List[TestCase]) -> None:

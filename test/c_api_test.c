@@ -442,7 +442,7 @@ static int run_single(int dev_fd, struct test_case *tests, size_t count)
 		if (err)
 			return err;
 		if (!tests[i].expected) {
-			err = drain_read(dev_fd);
+			err = drain_io(dev_fd);
 			if (err) {
 				fprintf(stderr, "drain after %s failed: %d\n",
 					tests[i].id, err);
@@ -450,7 +450,7 @@ static int run_single(int dev_fd, struct test_case *tests, size_t count)
 			}
 		}
 	}
-	return drain_read(dev_fd);
+	return drain_io(dev_fd);
 }
 
 static int run_queued(int dev_fd, struct test_case *tests, size_t count)
@@ -468,7 +468,7 @@ static int run_queued(int dev_fd, struct test_case *tests, size_t count)
 		if (err)
 			return err;
 	}
-	return drain_read(dev_fd);
+	return drain_io(dev_fd);
 }
 
 static int run_threaded(int dev_fd, struct test_case *tests, size_t count)
@@ -523,7 +523,7 @@ static int run_threaded(int dev_fd, struct test_case *tests, size_t count)
 			goto out;
 		}
 	}
-	err = drain_read(dev_fd);
+	err = drain_io(dev_fd);
 
 out:
 	free(threads);
@@ -724,9 +724,9 @@ static int submit_stress_case(int dev_fd, struct stress_case *test)
 	       test->cmb_va, test->result);
 	if (test->result)
 		return test->result;
-	err = drain_read(dev_fd);
+	err = drain_io(dev_fd);
 	if (err)
-		fprintf(stderr, "%s: drain_read failed: %d\n", test->id, err);
+		fprintf(stderr, "%s: drain_io failed: %d\n", test->id, err);
 	return err;
 }
 

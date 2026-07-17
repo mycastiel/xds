@@ -75,7 +75,10 @@ The sequence is:
    different namespace sectors as its components.
 5. A two-member, 64 KiB-chunk MD RAID0, tested as a block device and with all
    three ext4 block sizes.
-6. The same RAID0 coverage with equal-sized partitions starting at different
+6. A two-member RAID0 created with the namespace arguments reversed, verifying
+   topology discovery orders components by MD slot rather than sysfs directory
+   enumeration order.
+7. The same RAID0 coverage with equal-sized partitions starting at different
    namespace sectors as its members. The MD member offsets and component sizes
    remain equal.
 

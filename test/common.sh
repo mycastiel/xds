@@ -467,3 +467,25 @@ create_raid0()
 	udevadm settle
 	[[ -b $MD_DEV ]] || die "$MD_DEV was not created"
 }
+
+verify_raid0_slots()
+{
+	local expected0 expected1 md_name member slot device
+	local -a actual=()
+
+	expected0=$(readlink -f -- "$1")
+	expected0=${expected0##*/}
+	expected1=$(readlink -f -- "$2")
+	expected1=${expected1##*/}
+	md_name=$(lsblk -ndo KNAME "$MD_DEV")
+	for member in "/sys/class/block/$md_name/md"/dev-*; do
+		[[ -d $member ]] || continue
+		slot=$(<"$member/slot")
+		[[ $slot =~ ^[0-9]+$ ]] && (( slot < 2 )) ||
+			die "invalid RAID0 slot $slot"
+		device=$(readlink -f -- "$member/block")
+		actual[$slot]=${device##*/}
+	done
+	[[ ${actual[0]:-} == "$expected0" && ${actual[1]:-} == "$expected1" ]] ||
+		die "RAID0 slots are ${actual[0]:-missing},${actual[1]:-missing}; expected $expected0,$expected1"
+}
