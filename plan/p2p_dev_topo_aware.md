@@ -16,8 +16,8 @@ The supported configurations are deliberately narrow:
 - a dm device whose active table contains only contiguous `linear` targets;
 - an MD array whose level is `raid0` and whose members form one uniform strip
   zone; and
-- at most four component devices, all of which must be directly accessible
-  whole NVMe namespaces.
+- at most four component devices, each of which must be a directly accessible
+  whole NVMe namespace or a partition backed by one.
 
 The topology is a userspace-supplied, kernel-validated snapshot.  This design
 does not introspect dm or MD internals in `p2p_dev`, monitor topology changes,
@@ -67,7 +67,7 @@ struct topo_user_bdev {
 	__u32 reserved;
 	/* Usable target/member length in 512-byte sectors. */
 	__u64 size_sector;
-	/* First usable sector on this component device. */
+	/* First usable sector relative to this configured component device. */
 	__u64 start_sector;
 };
 
@@ -164,7 +164,7 @@ struct topo_bdev {
 	u32 nsid;
 	/* Usable target/member length in 512-byte sectors. */
 	u64 size_sector;
-	/* First usable sector on the component device. */
+	/* First usable sector on the normalized whole NVMe namespace. */
 	u64 start_sector;
 	struct bdev_handle *handle;
 };
@@ -232,22 +232,20 @@ The ioctl handler uses the interface declared by `topo.h`:
 ```c
 int topo_init(void);
 void topo_exit(void);
-struct topo *topo_add(const struct topo_user_cfg *cfg,
-		      struct shared_topo_list *list);
+int topo_add(const struct topo_user_cfg *cfg, struct shared_topo_list *list);
 void topo_del(struct topo *topo);
 struct topo *topo_get(struct block_device *top_bdev);
 void topo_put(struct topo *topo);
 ```
 
-`topo_add()` returns `ERR_PTR(error)` on failure.  On success it returns the
-topology installed in or found in the radix tree with one `pin_refcnt` owned
-by the caller.  Before calling it, the ioctl handler copies the complete
-variable-length userspace configuration into kernel memory.  `topo_add()`
-allocates a `shared_topo` and, on success, stores the returned topology in that
-node and links it into the supplied `shared_topo_list`.  The ioctl handler
-frees the copied configuration and returns `PTR_ERR_OR_ZERO(topo)`.  The
-returned pointer is not a read-path `refcnt`; its pin is released by
-`topo_del()` when the related p2p fd closes.
+`topo_add()` returns zero on success or a negative errno on failure.  Before
+calling it, the ioctl handler copies the complete variable-length userspace
+configuration into kernel memory.  `topo_add()` allocates a `shared_topo` and,
+on success, stores the topology installed in or found in the radix tree in that
+node, links it into the supplied `shared_topo_list`, and owns one `pin_refcnt`
+for the caller.  The ioctl handler frees the copied configuration and returns
+the integer result directly.  The pin is released by `topo_del()` when the
+related p2p fd closes.
 
 `topo_get()` returns NULL when the top bdev has no registered topology,
 `ERR_PTR(-ESTALE)` when the topology found by an RCU reader has already reached
@@ -258,10 +256,10 @@ result with `-ENODEV`.
 
 `topo_add()` performs these steps:
 
-1. Decode and validate `top_dev`, then allocate a `shared_topo` tracking entry.
+1. Decode `top_dev`, then allocate a `shared_topo` tracking entry.
 2. Under the topology spinlock, look up `top_dev`.  If it already exists,
    increment its `pin_refcnt`, link it into the supplied per-fd list, and return
-   it without validating or opening the duplicate caller's component list.
+   success without validating or opening the duplicate caller's component list.
 3. If the initial lookup misses, validate the copied header and component array
    and allocate a candidate `topo` and its component array.
 4. Open the top and component bdevs read-only with `bdev_open_by_dev()`.  The
@@ -280,9 +278,9 @@ result with `-ENODEV`.
    release the unused candidate and all bdev handles outside both spinlocks.
 
 Failures before insertion synchronously destroy the candidate.  Once a
-candidate is inserted, every exit path must either return its pinned pointer
-or undo the insertion and its initial references.  Linking that pinned pointer
-into the preallocated `shared_topo` does not allocate and cannot fail.
+candidate is inserted, every exit path must either link its pinned pointer into
+the preallocated `shared_topo` and return success or undo the insertion and its
+initial references.  Linking the pointer does not allocate and cannot fail.
 
 ### 5.1 Common kernel validation
 
@@ -291,18 +289,30 @@ topology.  It validates:
 
 - `name` is NUL-terminated and is exactly `nvme`, `linear`, or `raid0`;
 - `reserved` and every topology-specific unused `extra` field are zero;
-- `top_dev` and component device IDs decode to nonzero block-device numbers;
 - `nr_devs` is between one and four;
 - an `nvme` topology has exactly one component;
-- a `linear` or `raid0` component does not equal `top_dev`, and component IDs
-  are unique;
-- each component is a whole NVMe namespace rather than a partition or an NVMe
-  multipath head, using the existing NVMe-bdev validation;
+- a `linear` or `raid0` component does not equal `top_dev`, and configured
+  component IDs are unique;
+- each configured component is a whole NVMe namespace or a partition whose
+  containing whole device is a supported namespace, never an NVMe multipath
+  head;
 - every size is nonzero;
-- `start_sector + size_sector` does not overflow and does not exceed
-  `bdev_nr_sectors(component)`;
+- the configured `start_sector + size_sector` does not overflow and does not
+  exceed the configured whole device or partition;
+- for a partition component, the kernel-provided partition geometry guarantees
+  that adding `get_start_sect(component)` produces a range within the
+  containing whole namespace;
 - all calculated top sizes and mapped sectors are overflow-safe; and
 - `NVME_IOCTL_ID` is supported and returns a positive NSID for every component.
+
+The kernel opens each configured component before classifying it.  A whole
+namespace handle is retained directly.  For a partition, the kernel first
+validates the configured range relative to that partition, obtains its exact
+whole bdev with the same 5.10/6.6 compatibility helper, adds the partition
+start to the configured start, opens and retains an independent handle to the
+whole namespace, and releases the temporary partition handle.  The internal
+`topo_bdev` therefore always contains a whole-namespace device ID, handle,
+NSID, and effective namespace-relative start sector.
 
 For `nvme`, the kernel derives the required relationship from the opened top
 bdev.  It obtains the exact containing whole bdev through a compatibility
@@ -314,7 +324,7 @@ namespace size.  If the top bdev is a partition, `start_sector` must equal
 size.  The common range check also proves that the complete partition range
 fits in the whole namespace.
 
-For `NVME_IOCTL_ID`, the helper verifies that the component's
+For `NVME_IOCTL_ID`, the helper asserts that the validated component's
 `block_device_operations` provides `ioctl`, then calls that operation with the
 opened bdev, `BLK_OPEN_READ`, `NVME_IOCTL_ID`, and argument zero.  It does not
 parse `disk_name` and does not pass this lookup through userspace.
@@ -444,6 +454,9 @@ Userspace orders entries by the logical start of their dm table targets.  The
 kernel requires the sum of their `size_sector` values to equal the top bdev
 size.  Because the table is required to start at logical sector zero and be
 contiguous, an entry's logical start is the sum of the preceding entry sizes.
+If a target component is a partition, its configured target offset is relative
+to that partition and the kernel adds the partition start when constructing
+the internal entry.
 
 For the entry containing `from_sector`:
 
@@ -467,7 +480,8 @@ orders entries by MD slot.  The kernel requires:
 - `nr_devs >= 2`;
 - a nonzero power-of-two chunk size represented by
   `1U << chunk_sectors_shift` sectors, with `chunk_sectors_shift < 32`;
-- identical `start_sector` and `size_sector` for every member;
+- identical configured member offsets and `size_sector` values for every
+  member;
 - `size_sector` is a multiple of the chunk size; and
 - the top bdev size equals `nr_devs * size_sector`.
 
@@ -489,7 +503,10 @@ out_nr_sectors = min(in_nr_sectors,
 
 The returned length never crosses a RAID0 chunk boundary.  Equal member sizes
 exclude the multiple-strip-zone behavior used by RAID0 arrays with unequal
-members.
+members.  A member offset is relative to its configured member device.  For a
+partition member, the kernel adds that partition's start only to the internal
+namespace-relative mapping offset.  Partition starts may differ without
+relaxing the requirement that the MD-reported member offsets and sizes match.
 
 ## 8. Read-path integration
 
@@ -606,12 +623,14 @@ Reject the table unless:
 - every target length is nonzero;
 - each target parameter contains exactly one component device and component
   start sector; and
-- every component is a whole NVMe namespace according to sysfs.
+- every component is a whole NVMe namespace or a partition whose parent is a
+  whole NVMe namespace according to sysfs.
 
-For each target, encode its component `dev_t`, set `size_sector` to the target
-length, and set `start_sector` to the component offset from the linear target
-parameters.  Preserve target order in `bdevs[]`.  Set `name = "linear"` and
-both `extra` values to zero.
+For each target, encode its configured whole-device or partition `dev_t`, set
+`size_sector` to the target length, and set `start_sector` to the offset from
+the linear target parameters.  The offset remains relative to the configured
+device; the kernel performs partition translation.  Preserve target order in
+`bdevs[]`.  Set `name = "linear"` and both `extra` values to zero.
 
 ### 9.3 MD RAID0 discovery
 
@@ -627,11 +646,16 @@ Read `/sys/dev/block/<major>:<minor>/md/level`, `chunk_size`, `raid_disks`,
   `raid_disks - 1`;
 - all member offsets are equal;
 - all member sizes are equal and are multiples of the chunk size; and
-- every member is a whole NVMe namespace according to sysfs.
+- every member is a whole NVMe namespace or a partition whose parent is a
+  whole NVMe namespace according to sysfs.
 
 Read each member's `slot`, `offset`, and `size`, sort by slot, and fill the
 component array in that order.  Set `name = "raid0"`, set `extra[0]` to
 `ilog2(chunk_size / 512)`, and set `extra[1]` to zero.
+
+Member offsets and sizes are compared before partition translation and retain
+the existing equality requirements.  The kernel independently adds each
+partition start when building the internal whole-namespace mapping.
 
 Userspace takes one snapshot while assembling the structure.  It does not
 repeat the full discovery because a second snapshot cannot close the remaining
@@ -650,7 +674,7 @@ Use consistent errors for topology operations:
 - `-ESTALE`: `topo_get()` found an RCU-visible topology whose lifetime
   reference count had already reached zero;
 - `-EOPNOTSUPP`: unsupported top-device type, component type, NVMe multipath
-  head, nested topology, or unavailable `NVME_IOCTL_ID`;
+  head, or nested topology;
 - `-ENOMEM`: allocation or radix-tree preload failed; and
 - the underlying bdev-open or ioctl error when it gives more precise failure
   information.
@@ -721,9 +745,10 @@ If no topology is registered for the resolved bdev, the read returns
 - an NVMe partition with data comparison across its first and last filesystem
   allocation regions;
 - dm-linear with two to four NVMe components, including reads crossing target
-  boundaries;
+  boundaries, and with whole-namespace or partition components;
 - uniform two- to four-member MD RAID0, including reads crossing chunk and
-  stripe boundaries;
+  stripe boundaries, and with whole-namespace or partition members whose raw
+  MD offsets and sizes remain equal;
 - mixed component queue limits;
 - enough small RAID0 chunks to produce more requests than the old `* 10`
   command estimate; and
@@ -739,6 +764,7 @@ If no topology is registered for the resolved bdev, the read returns
 - `nvme` with a partition top and a component from another disk, or a
   mismatched partition start or size;
 - NVMe multipath head, non-NVMe component, invalid NSID ioctl, component range
-  beyond the bdev, and more than four components; and
+  beyond a configured partition or its whole bdev, and more than four
+  components; and
 - topology reconfiguration attempts while pins exist, which are documented as
   unsupported and must be prevented by the caller.
