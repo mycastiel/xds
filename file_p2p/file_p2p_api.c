@@ -6,13 +6,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
-#include <time.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 #include <ctype.h>
 #include <dirent.h>
-#include <stdbool.h>
 #include <sys/sysmacros.h>
 
 #include <linux/dm-ioctl.h>
@@ -33,11 +31,21 @@
 	 FIEMAP_EXTENT_NOT_ALIGNED | FIEMAP_EXTENT_DATA_INLINE | \
 	 FIEMAP_EXTENT_DATA_TAIL | FIEMAP_EXTENT_UNWRITTEN)
 
-long long timespec_diff_ms(const struct timespec *start,
-			   const struct timespec *end)
+struct raid0_member {
+	int slot;
+	struct topo_user_bdev bdev;
+};
+
+static int parse_devt(const char *text, dev_t *devt)
 {
-	return (end->tv_sec - start->tv_sec) * 1000LL +
-	       (end->tv_nsec - start->tv_nsec) / 1000000LL;
+	unsigned int dev_major;
+	unsigned int dev_minor;
+	char trailing;
+
+	if (sscanf(text, "%u:%u %c", &dev_major, &dev_minor, &trailing) != 2)
+		return -EINVAL;
+	*devt = makedev(dev_major, dev_minor);
+	return 0;
 }
 
 int close_p2p_fd(int dev_fd)
@@ -50,11 +58,10 @@ int new_p2p_fd(void)
 	int dev_fd;
 	int err;
 
-	dev_fd = open("/dev/p2p_device", O_RDWR);
+	dev_fd = open("/dev/p2p_device", O_RDWR | O_CLOEXEC);
 	if (dev_fd < 0) {
 		err = -errno;
-		fprintf(stderr, "open /dev/p2p_device failed, errno: %d\n",
-			err);
+		fprintf(stderr, "open /dev/p2p_device failed, errno: %d\n", err);
 		return err;
 	}
 
@@ -89,41 +96,20 @@ static int path_exists(dev_t devt, const char *suffix)
 
 static int validate_nvme_component(dev_t devt)
 {
-	if (!devt || path_exists(devt, "partition") ||
+	if (path_exists(devt, "partition") ||
 	    !path_exists(devt, "device/subsysnqn") ||
 	    path_exists(devt, "device/iopolicy"))
 		return -EOPNOTSUPP;
 	return 0;
 }
 
-static int parse_u64(const char *text, unsigned long long *value)
-{
-	char *end;
-
-	while (isspace((unsigned char)*text))
-		text++;
-	if (!*text || *text == '-')
-		return -EINVAL;
-	errno = 0;
-	*value = strtoull(text, &end, 10);
-	if (errno)
-		return -errno;
-	if (end == text)
-		return -EINVAL;
-	while (isspace((unsigned char)*end))
-		end++;
-	return *end ? -EINVAL : 0;
-}
-
-static int read_text(const char *path, char *buf, size_t size)
+static int read_text_at(int dir_fd, const char *path, char *buf, size_t size)
 {
 	ssize_t got;
 	int fd;
 	int err;
 
-	if (size < 2)
-		return -EINVAL;
-	fd = open(path, O_RDONLY | O_CLOEXEC);
+	fd = openat(dir_fd, path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		return -errno;
 	got = read(fd, buf, size - 1);
@@ -139,6 +125,11 @@ static int read_text(const char *path, char *buf, size_t size)
 	close(fd);
 	buf[got] = '\0';
 	return 0;
+}
+
+static int read_text(const char *path, char *buf, size_t size)
+{
+	return read_text_at(AT_FDCWD, path, buf, size);
 }
 
 static int read_sysfs_text(dev_t devt, const char *suffix, char *buf,
@@ -162,10 +153,9 @@ static int read_sysfs_u64(dev_t devt, const char *suffix,
 	err = read_sysfs_text(devt, suffix, buf, sizeof(buf));
 	if (err)
 		return err;
-	return parse_u64(buf, value);
+	*value = strtoull(buf, NULL, 10);
+	return 0;
 }
-
-static int parse_devt(const char *text, dev_t *devt);
 
 static int validate_nvme_component_input(dev_t devt)
 {
@@ -202,8 +192,11 @@ static int get_block_size_sectors(const char *dev, uint64_t *size_sectors)
 	close(fd);
 	if (err)
 		return err;
-	if (!size_bytes || size_bytes % FILE_P2P_SECTOR_SIZE)
+	if (!size_bytes || size_bytes % FILE_P2P_SECTOR_SIZE) {
+		fprintf(stderr, "invalid block-device size %llu for %s\n",
+			(unsigned long long)size_bytes, dev);
 		return -EINVAL;
+	}
 
 	*size_sectors = size_bytes / FILE_P2P_SECTOR_SIZE;
 	return 0;
@@ -212,31 +205,12 @@ static int get_block_size_sectors(const char *dev, uint64_t *size_sectors)
 static int discover_nvme(const char *dev, dev_t top_dev,
 			 struct topo_user_cfg *cfg)
 {
-	unsigned long long start_sector = 0;
 	uint64_t size_sectors = 0;
-	char parent_devt[64];
-	dev_t component = top_dev;
 	int err;
 
-	if (path_exists(top_dev, "partition")) {
-		err = read_sysfs_text(top_dev, "../dev", parent_devt,
-				      sizeof(parent_devt));
-		if (err)
-			return err;
-		err = parse_devt(parent_devt, &component);
-		if (err)
-			return err;
-		err = validate_nvme_component(component);
-		if (err)
-			return err;
-		err = read_sysfs_u64(top_dev, "start", &start_sector);
-		if (err)
-			return err;
-	} else {
-		err = validate_nvme_component(top_dev);
-		if (err)
-			return err;
-	}
+	err = validate_nvme_component_input(top_dev);
+	if (err)
+		return err;
 	err = get_block_size_sectors(dev, &size_sectors);
 	if (err)
 		return err;
@@ -244,24 +218,9 @@ static int discover_nvme(const char *dev, dev_t top_dev,
 	memcpy(cfg->name, "nvme", sizeof("nvme"));
 	cfg->nr_devs = 1;
 	cfg->top_dev = top_dev;
-	cfg->bdevs[0].dev_id = component;
+	cfg->bdevs[0].dev_id = top_dev;
 	cfg->bdevs[0].size_sector = size_sectors;
-	cfg->bdevs[0].start_sector = start_sector;
-	return 0;
-}
-
-static int parse_devt(const char *text, dev_t *devt)
-{
-	unsigned int dev_major;
-	unsigned int dev_minor;
-	char trailing;
-
-	if (sscanf(text, "%u:%u %c", &dev_major, &dev_minor, &trailing) != 2)
-		return -EINVAL;
-	*devt = makedev(dev_major, dev_minor);
-	if (major(*devt) != dev_major || minor(*devt) != dev_minor)
-		return -EINVAL;
-
+	cfg->bdevs[0].start_sector = 0;
 	return 0;
 }
 
@@ -281,8 +240,6 @@ static int parse_linear_params(const char *params, dev_t *devt,
 		return -EINVAL;
 
 	*devt = makedev(dev_major, dev_minor);
-	if (major(*devt) != dev_major || minor(*devt) != dev_minor)
-		return -EINVAL;
 	return validate_nvme_component_input(*devt);
 }
 
@@ -294,16 +251,22 @@ static int dm_table_query(dev_t top_dev, void **buffer_out)
 	int err;
 
 	control_fd = open(FILE_P2P_DM_CONTROL, O_RDWR | O_CLOEXEC);
-	if (control_fd < 0)
-		return -errno;
+	if (control_fd < 0) {
+		err = -errno;
+		fprintf(stderr, "open %s failed, errno: %d\n",
+			FILE_P2P_DM_CONTROL, err);
+		return err;
+	}
 
 	buffer = calloc(1, FILE_P2P_DM_BUFFER_SIZE);
 	if (!buffer) {
-		close(control_fd);
-		return -ENOMEM;
+		err = -ENOMEM;
+		fprintf(stderr, "allocate device-mapper table buffer failed: %d\n",
+			err);
+		goto out;
 	}
 	dmi = buffer;
-	dmi->version[0] = DM_VERSION_MAJOR;
+	dmi->version[0] = 4;
 	/* DM_TABLE_STATUS has existed since interface version 4.0. */
 	dmi->version[1] = 0;
 	dmi->version[2] = 0;
@@ -312,22 +275,29 @@ static int dm_table_query(dev_t top_dev, void **buffer_out)
 	dmi->flags = DM_STATUS_TABLE_FLAG;
 	dmi->dev = top_dev;
 
-	if (ioctl(control_fd, DM_TABLE_STATUS, dmi) < 0)
+	if (ioctl(control_fd, DM_TABLE_STATUS, dmi) < 0) {
 		err = -errno;
-	else if (dmi->flags & DM_BUFFER_FULL_FLAG)
+		fprintf(stderr, "DM_TABLE_STATUS failed, errno: %d\n", err);
+		goto out;
+	}
+	if (dmi->flags & DM_BUFFER_FULL_FLAG) {
 		err = -E2BIG;
-	else {
-		*buffer_out = buffer;
-		close(control_fd);
-		return 0;
+		fprintf(stderr, "device-mapper table exceeds %u bytes\n",
+			FILE_P2P_DM_BUFFER_SIZE);
+		goto out;
 	}
 
+	*buffer_out = buffer;
+	buffer = NULL;
+	err = 0;
+out:
 	free(buffer);
 	close(control_fd);
 	return err;
 }
 
-static int discover_linear(dev_t top_dev, struct topo_user_cfg *cfg)
+static int discover_linear(const char *dev, dev_t top_dev,
+			   struct topo_user_cfg *cfg)
 {
 	struct dm_target_spec *first;
 	struct dm_target_spec *spec;
@@ -339,8 +309,11 @@ static int discover_linear(dev_t top_dev, struct topo_user_cfg *cfg)
 	int err;
 
 	err = dm_table_query(top_dev, &buffer);
-	if (err)
+	if (err) {
+		fprintf(stderr, "discover linear topology for %s failed: %d\n",
+			dev, err);
 		return err;
+	}
 	dmi = buffer;
 	if (!(dmi->flags & DM_ACTIVE_PRESENT_FLAG) || !dmi->target_count ||
 	    dmi->target_count > P2P_TOPO_MAX_BDEVS ||
@@ -363,7 +336,6 @@ static int discover_linear(dev_t top_dev, struct topo_user_cfg *cfg)
 		char *params;
 		char *params_end;
 		dev_t component;
-		unsigned int j;
 
 		if ((char *)(spec + 1) > limit ||
 		    !memchr(spec->target_type, '\0', sizeof(spec->target_type)) ||
@@ -391,12 +363,6 @@ static int discover_linear(dev_t top_dev, struct topo_user_cfg *cfg)
 		if (err)
 			goto out;
 		entry->dev_id = component;
-		for (j = 0; j < i; j++) {
-			if (cfg->bdevs[j].dev_id == entry->dev_id) {
-				err = -EINVAL;
-				goto out;
-			}
-		}
 		entry->size_sector = spec->length;
 		entry->start_sector = start_sector;
 		if (__builtin_add_overflow(logical_end,
@@ -414,77 +380,124 @@ out:
 	return err;
 }
 
-static int state_is_active(const char *state)
+static int compare_raid0_member_slot(const void *left, const void *right)
 {
-	const char *token = state;
+	const struct raid0_member *a = left;
+	const struct raid0_member *b = right;
 
-	while (*token) {
-		const char *end = strchr(token, ',');
-		size_t len = end ? (size_t)(end - token) : strlen(token);
+	return a->slot - b->slot;
+}
 
-		while (len && isspace((unsigned char)token[len - 1]))
-			len--;
-		while (len && isspace((unsigned char)*token)) {
-			token++;
-			len--;
-		}
-		if (len == strlen("in_sync") && !memcmp(token, "in_sync", len))
-			return 1;
-		if (!end)
-			break;
-		token = end + 1;
-	}
+static int read_member_value(int member_fd, const char *name,
+			     unsigned long long *value)
+{
+	char text[64];
+	int err;
+
+	err = read_text_at(member_fd, name, text, sizeof(text));
+	if (err)
+		return err;
+	*value = strtoull(text, NULL, 10);
 	return 0;
 }
 
-static int read_member_value(const char *member_path, const char *name,
-			     unsigned long long *value)
+static int read_raid0_member(int md_fd, const char *name,
+			     unsigned int raid_disks,
+			     struct raid0_member *member)
 {
-	char path[PATH_MAX];
-	char text[64];
-	int len;
+	unsigned long long start_sector;
+	unsigned long long size_kb;
+	char state[128];
+	char block_dev[64];
+	char slot_text[64];
+	dev_t component;
+	int slot;
+	int member_fd;
 	int err;
 
-	len = snprintf(path, sizeof(path), "%s/%s", member_path, name);
-	if (len < 0)
+	member_fd = openat(md_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (member_fd < 0)
 		return -errno;
-	if ((size_t)len >= sizeof(path))
-		return -ENAMETOOLONG;
-	err = read_text(path, text, sizeof(text));
+	err = read_text_at(member_fd, "state", state, sizeof(state));
 	if (err)
-		return err;
-	return parse_u64(text, value);
+		goto out;
+	state[strcspn(state, "\r\n")] = '\0';
+	if (strcmp(state, "in_sync")) {
+		err = 0;
+		goto out;
+	}
+
+	err = read_text_at(member_fd, "slot", slot_text, sizeof(slot_text));
+	if (err)
+		goto out;
+	slot_text[strcspn(slot_text, "\r\n")] = '\0';
+	if (!strcmp(slot_text, "none")) {
+		err = 0;
+		goto out;
+	}
+	slot = atoi(slot_text);
+	if (slot < 0 || slot >= (int)raid_disks) {
+		err = -EINVAL;
+		goto out;
+	}
+	err = read_member_value(member_fd, "offset", &start_sector);
+	if (err)
+		goto out;
+	err = read_member_value(member_fd, "size", &size_kb);
+	if (err)
+		goto out;
+	if (!size_kb) {
+		err = -EINVAL;
+		goto out;
+	}
+	err = read_text_at(member_fd, "block/dev", block_dev,
+			   sizeof(block_dev));
+	if (err)
+		goto out;
+	err = parse_devt(block_dev, &component);
+	if (err)
+		goto out;
+	err = validate_nvme_component_input(component);
+	if (err)
+		goto out;
+
+	member->slot = slot;
+	member->bdev.dev_id = component;
+	member->bdev.size_sector = size_kb * FILE_P2P_SECTORS_PER_KB;
+	member->bdev.start_sector = start_sector;
+	err = 1;
+out:
+	close(member_fd);
+	return err;
 }
 
 static int discover_raid0_members(dev_t top_dev, unsigned int raid_disks,
 				  struct topo_user_cfg *cfg)
 {
-	bool found[P2P_TOPO_MAX_BDEVS] = { };
+	struct raid0_member members[P2P_TOPO_MAX_BDEVS];
 	char md_path[PATH_MAX];
 	struct dirent *dirent;
 	unsigned int active = 0;
+	unsigned int i;
 	DIR *dir;
+	int dir_fd;
 	int err;
 
 	err = sysfs_path(md_path, sizeof(md_path), top_dev, "md");
 	if (err)
 		return err;
-	dir = opendir(md_path);
-	if (!dir)
+	dir_fd = open(md_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dir_fd < 0)
 		return -errno;
+	dir = fdopendir(dir_fd);
+	if (!dir) {
+		err = -errno;
+		close(dir_fd);
+		return err;
+	}
 
 	for (;;) {
-		struct topo_user_bdev *entry;
-		unsigned long long start_sector;
-		unsigned long long size_kb;
-		unsigned long long slot;
-		char member_path[PATH_MAX];
-		char state_path[PATH_MAX];
-		char block_dev_path[PATH_MAX];
-		char state[128];
-		char block_dev[64];
-		dev_t component;
-		int len;
+		struct raid0_member member;
 
 		errno = 0;
 		dirent = readdir(dir);
@@ -497,67 +510,33 @@ static int discover_raid0_members(dev_t top_dev, unsigned int raid_disks,
 		}
 		if (strncmp(dirent->d_name, "dev-", 4))
 			continue;
-		len = snprintf(member_path, sizeof(member_path), "%s/%s",
-			       md_path, dirent->d_name);
-		if (len < 0 || (size_t)len >= sizeof(member_path)) {
-			err = -ENAMETOOLONG;
+		err = read_raid0_member(dirfd(dir), dirent->d_name, raid_disks,
+					&member);
+		if (err < 0)
 			goto out;
-		}
-		len = snprintf(state_path, sizeof(state_path), "%s/state",
-			       member_path);
-		if (len < 0 || (size_t)len >= sizeof(state_path)) {
-			err = -ENAMETOOLONG;
-			goto out;
-		}
-		err = read_text(state_path, state, sizeof(state));
-		if (err)
-			goto out;
-		if (!state_is_active(state))
+		if (!err)
 			continue;
-
-		err = read_member_value(member_path, "slot", &slot);
-		if (err)
-			goto out;
-		if (slot >= raid_disks || found[slot]) {
+		if (active >= raid_disks) {
 			err = -EINVAL;
 			goto out;
 		}
-		entry = &cfg->bdevs[slot];
-		err = read_member_value(member_path, "offset", &start_sector);
-		if (err)
-			goto out;
-		err = read_member_value(member_path, "size", &size_kb);
-		if (err)
-			goto out;
-		if (!size_kb) {
-			err = -EINVAL;
-			goto out;
-		}
-		len = snprintf(block_dev_path, sizeof(block_dev_path),
-			       "%s/block/dev", member_path);
-		if (len < 0 || (size_t)len >= sizeof(block_dev_path)) {
-			err = -ENAMETOOLONG;
-			goto out;
-		}
-		err = read_text(block_dev_path, block_dev, sizeof(block_dev));
-		if (err)
-			goto out;
-		err = parse_devt(block_dev, &component);
-		if (err)
-			goto out;
-		err = validate_nvme_component_input(component);
-		if (err)
-			goto out;
-		entry->dev_id = component;
-		entry->size_sector = size_kb * FILE_P2P_SECTORS_PER_KB;
-		entry->start_sector = start_sector;
-		found[slot] = true;
-		active++;
+		members[active++] = member;
 	}
-
 	if (active != raid_disks) {
+		fprintf(stderr, "RAID0 has %u in-sync members, expected %u\n",
+			active, raid_disks);
 		err = -EINVAL;
 		goto out;
+	}
+
+	qsort(members, active, sizeof(members[0]), compare_raid0_member_slot);
+	for (i = 0; i < active; i++) {
+		if (members[i].slot != (int)i) {
+			fprintf(stderr, "RAID0 slot %u is missing or duplicated\n", i);
+			err = -EINVAL;
+			goto out;
+		}
+		cfg->bdevs[i] = members[i].bdev;
 	}
 	err = 0;
 out:
@@ -565,22 +544,24 @@ out:
 	return err;
 }
 
-static int discover_raid0(dev_t top_dev, struct topo_user_cfg *cfg)
+static int discover_raid0(const char *dev, dev_t top_dev,
+			  struct topo_user_cfg *cfg)
 {
 	unsigned long long chunk_bytes;
 	unsigned long long chunk_sectors;
 	unsigned long long raid_disks;
 	char level[64];
 	unsigned int shift = 0;
-	unsigned int i;
 	int err;
 
 	err = read_sysfs_text(top_dev, "md/level", level, sizeof(level));
 	if (err)
 		return err;
 	level[strcspn(level, "\r\n")] = '\0';
-	if (strcmp(level, "raid0"))
+	if (strcmp(level, "raid0")) {
+		fprintf(stderr, "%s uses unsupported MD level %s\n", dev, level);
 		return -EOPNOTSUPP;
+	}
 	err = read_sysfs_u64(top_dev, "md/chunk_size", &chunk_bytes);
 	if (err)
 		return err;
@@ -605,21 +586,9 @@ static int discover_raid0(dev_t top_dev, struct topo_user_cfg *cfg)
 	cfg->top_dev = top_dev;
 	err = discover_raid0_members(top_dev, raid_disks, cfg);
 	if (err)
-		return err;
-
-	for (i = 0; i < cfg->nr_devs; i++) {
-		unsigned int j;
-
-		if (cfg->bdevs[i].start_sector != cfg->bdevs[0].start_sector ||
-		    cfg->bdevs[i].size_sector != cfg->bdevs[0].size_sector ||
-		    cfg->bdevs[i].size_sector % chunk_sectors)
-			return -EINVAL;
-		for (j = 0; j < i; j++) {
-			if (cfg->bdevs[i].dev_id == cfg->bdevs[j].dev_id)
-				return -EINVAL;
-		}
-	}
-	return 0;
+		fprintf(stderr, "discover RAID0 members for %s failed: %d\n",
+			dev, err);
+	return err;
 }
 
 static void print_topo_cfg(const struct topo_user_cfg *cfg)
@@ -646,19 +615,16 @@ int add_topo(int dev_fd, const char *dev)
 	struct topo_user_cfg *cfg = NULL;
 	struct stat st;
 	size_t cfg_size;
-	int (*discover)(dev_t, struct topo_user_cfg *);
-	bool nvme = false;
+	int (*discover)(const char *, dev_t, struct topo_user_cfg *);
 	int err;
 
-	if (dev_fd < 0 || !dev)
-		return -EINVAL;
 	if (stat(dev, &st) < 0)
 		return -errno;
 	if (!S_ISBLK(st.st_mode))
 		return -EINVAL;
 	if (path_exists(st.st_rdev, "partition") ||
 	    path_exists(st.st_rdev, "device/subsysnqn"))
-		nvme = true;
+		discover = discover_nvme;
 	else if (path_exists(st.st_rdev, "dm"))
 		discover = discover_linear;
 	else if (path_exists(st.st_rdev, "md"))
@@ -673,17 +639,17 @@ int add_topo(int dev_fd, const char *dev)
 		err = -ENOMEM;
 		goto out;
 	}
-	if (nvme)
-		err = discover_nvme(dev, st.st_rdev, cfg);
-	else
-		err = discover(st.st_rdev, cfg);
+	err = discover(dev, st.st_rdev, cfg);
 	if (err)
 		goto out;
 	print_topo_cfg(cfg);
-	if (ioctl(dev_fd, IOCTL_ADD_TOPO, cfg) < 0)
+	if (ioctl(dev_fd, IOCTL_ADD_TOPO, cfg) < 0) {
 		err = -errno;
-	else
+		fprintf(stderr, "add topology for %s failed, errno: %d\n",
+			dev, err);
+	} else {
 		err = 0;
+	}
 out:
 	free(cfg);
 	return err;
@@ -911,8 +877,6 @@ int read_file(int dev_fd, const struct read_parameter *param)
 	int file_fd = -1;
 	int err = 0;
 
-	if (!param || !param->file_name)
-		return -EINVAL;
 	err = get_iov_size(param->iov, param->iov_nr, &read_size);
 	if (err)
 		return err;
@@ -920,7 +884,7 @@ int read_file(int dev_fd, const struct read_parameter *param)
 		return -EOVERFLOW;
 
 	name = param->file_name;
-	file_fd = open(name, O_RDONLY);
+	file_fd = open(name, O_RDONLY | O_CLOEXEC);
 	if (file_fd < 0) {
 		err = -errno;
 		fprintf(stderr, "open %s failed, errno: %d\n", name, err);
@@ -988,9 +952,9 @@ close_fds_out:
 	return err;
 }
 
-int drain_read(int dev_fd)
+int drain_io(int dev_fd)
 {
-	if (ioctl(dev_fd, IOCTL_DRAIN_READ) < 0)
+	if (ioctl(dev_fd, IOCTL_DRAIN_IO) < 0)
 		return -errno;
 	return 0;
 }

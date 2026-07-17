@@ -92,14 +92,15 @@ static PyObject *py_read_file(PyObject *Py_UNUSED(self), PyObject *args)
 		.iov_nr = iov_nr,
 	};
 
-	Py_BEGIN_ALLOW_THREADS ret = read_file(dev_fd, &param);
+	Py_BEGIN_ALLOW_THREADS
+	ret = read_file(dev_fd, &param);
 	Py_END_ALLOW_THREADS
 
 	free(iov);
 	return PyLong_FromLong((long)ret);
 }
 
-static PyObject *py_drain_read(PyObject *Py_UNUSED(self), PyObject *args)
+static PyObject *py_drain_io(PyObject *Py_UNUSED(self), PyObject *args)
 {
 	int dev_fd = 0;
 	int ret = 0;
@@ -108,7 +109,9 @@ static PyObject *py_drain_read(PyObject *Py_UNUSED(self), PyObject *args)
 		return NULL;
 	}
 
-	ret = drain_read(dev_fd);
+	Py_BEGIN_ALLOW_THREADS
+	ret = drain_io(dev_fd);
+	Py_END_ALLOW_THREADS
 
 	return PyLong_FromLong((long)ret);
 }
@@ -130,7 +133,8 @@ static PyObject *py_add_topo(PyObject *Py_UNUSED(self), PyObject *args)
 	if (!PyArg_ParseTuple(args, "is", &dev_fd, &dev))
 		return NULL;
 
-	Py_BEGIN_ALLOW_THREADS ret = add_topo(dev_fd, dev);
+	Py_BEGIN_ALLOW_THREADS
+	ret = add_topo(dev_fd, dev);
 	Py_END_ALLOW_THREADS
 	return PyLong_FromLong((long)ret);
 }
@@ -161,9 +165,9 @@ static PyMethodDef FileP2PMethods[] = {
 	  "\n"
 	  "Returns:\n"
 	  "    int: 0 on success, non-zero on error.\n" },
-	{ "drain_read", py_drain_read, METH_VARARGS,
-	  "drain_read(dev_fd) -> int\n\n"
-	  "Drain read from p2p device.\n"
+	{ "drain_io", py_drain_io, METH_VARARGS,
+	  "drain_io(dev_fd) -> int\n\n"
+	  "Drain I/O from p2p device.\n"
 	  "\n"
 	  "Parameters:\n"
 	  "    dev_fd (int): File descriptor of p2p device.\n"

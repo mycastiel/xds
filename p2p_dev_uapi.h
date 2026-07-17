@@ -43,12 +43,12 @@ struct topo_user_cfg {
 	struct topo_user_bdev bdevs[];
 };
 
+#define IOCTL_ADD_TOPO _IOW('k', 1, struct topo_user_cfg)
 #define IOCTL_READ_FILE _IOWR('k', 2, struct p2p_read_param)
 /*
  * Drain snapshots I/O contexts already published by read ioctls. A read or
  * another drain that overlaps this ioctl need not be covered by its wait.
  */
-#define IOCTL_DRAIN_READ _IOC(_IOC_READ, 'k', 4, 0)
-#define IOCTL_ADD_TOPO _IOW('k', 5, struct topo_user_cfg)
+#define IOCTL_DRAIN_IO _IOC(_IOC_READ, 'k', 3, 0)
 
 #endif

@@ -100,7 +100,7 @@ static struct module *p2p_tp_mod;
 static int p2p_open(struct inode *inode, struct file *file);
 static int p2p_release(struct inode *inode, struct file *file);
 static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
-static int p2p_drain_read(struct p2p_batch *batch);
+static int p2p_drain_io(struct p2p_batch *batch);
 
 static struct file_operations fops = {
 	.owner = THIS_MODULE,
@@ -134,7 +134,7 @@ static int p2p_release(struct inode *inode, struct file *file)
 	LIST_HEAD(topos);
 
 	if (!list_empty(&batch->io_list) || batch->io_cnt > 0)
-		p2p_drain_read(batch);
+		p2p_drain_io(batch);
 
 	spin_lock(&batch->shared_topos.lock);
 	list_splice_init(&batch->shared_topos.head, &topos);
@@ -882,7 +882,7 @@ free_iov:
 	return err;
 }
 
-static int p2p_drain_read(struct p2p_batch *batch)
+static int p2p_drain_io(struct p2p_batch *batch)
 {
 	struct p2p_io_context *io_ctx, *next_io_ctx;
 	int first_err = 0;
@@ -966,8 +966,8 @@ static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case IOCTL_READ_FILE:
 		err = p2p_read_file(batch, (void __user *)arg);
 		break;
-	case IOCTL_DRAIN_READ:
-		err = p2p_drain_read(batch);
+	case IOCTL_DRAIN_IO:
+		err = p2p_drain_io(batch);
 		break;
 	case IOCTL_ADD_TOPO:
 		err = p2p_add_topo(batch, (void __user *)arg);

@@ -14,6 +14,6 @@ int new_p2p_fd(void);
 int close_p2p_fd(int dev_fd);
 int add_topo(int dev_fd, const char *dev);
 int read_file(int dev_fd, const struct read_parameter *param);
-int drain_read(int dev_fd);
+int drain_io(int dev_fd);
 
 #endif
