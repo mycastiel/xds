@@ -241,17 +241,13 @@ static int topo_validate_nvme(struct topo *topo,
 	struct block_device *top_bdev = p2p_handle_to_bdev(topo->top_handle);
 	struct topo_bdev *bdev = &topo->bdevs[0];
 	struct block_device *component = p2p_handle_to_bdev(bdev->handle);
+	u64 start = bdev_is_partition(top_bdev) ? get_start_sect(top_bdev) : 0;
 	u64 size = p2p_bdev_nr_sectors(top_bdev);
 
-	if (cfg->extra[0] || cfg->extra[1] || bdev->size_sector != size)
+	if (cfg->extra[0] || cfg->extra[1] ||
+	    component != p2p_bdev_whole(top_bdev) ||
+	    bdev->start_sector != start || bdev->size_sector != size)
 		return -EINVAL;
-	if (bdev_is_partition(top_bdev)) {
-		if (top_bdev->bd_disk != component->bd_disk ||
-		    bdev->start_sector != get_start_sect(top_bdev))
-			return -EINVAL;
-	} else if (bdev->id != topo->top_dev || bdev->start_sector) {
-		return -EINVAL;
-	}
 
 	topo->size_sector = size;
 	topo->ops = &nvme_ops;

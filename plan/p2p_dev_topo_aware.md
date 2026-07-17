@@ -305,11 +305,12 @@ topology.  It validates:
 - `NVME_IOCTL_ID` is supported and returns a positive NSID for every component.
 
 For `nvme`, the kernel derives the required relationship from the opened top
-bdev.  If the top bdev is a whole namespace, its component must equal
-`top_dev`, `start_sector` must be zero, and `size_sector` must equal the opened
-namespace size.  If the top bdev is a partition, its component must be a whole
-NVMe namespace on the same `gendisk`, `start_sector` must equal
-`get_start_sect(top_bdev)`, and `size_sector` must equal the opened partition
+bdev.  It obtains the exact containing whole bdev through a compatibility
+helper that uses `bd_contains` on Linux 5.10 and `bdev_whole()` on Linux 6.6.
+The configured component must be that exact bdev.  If the top bdev is a whole
+namespace, `start_sector` must be zero and `size_sector` must equal the opened
+namespace size.  If the top bdev is a partition, `start_sector` must equal
+`get_start_sect(top_bdev)` and `size_sector` must equal the opened partition
 size.  The common range check also proves that the complete partition range
 fits in the whole namespace.
 

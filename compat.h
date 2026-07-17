@@ -61,6 +61,11 @@ static inline struct block_device *p2p_handle_to_bdev(p2p_bdev_handle *handle)
 	return handle;
 }
 
+static inline struct block_device *p2p_bdev_whole(struct block_device *bdev)
+{
+	return bdev->bd_contains;
+}
+
 static inline sector_t p2p_bdev_nr_sectors(struct block_device *bdev)
 {
 	return i_size_read(bdev->bd_inode) >> SECTOR_SHIFT;
@@ -114,6 +119,11 @@ static inline void p2p_bdev_release(p2p_bdev_handle *handle)
 static inline struct block_device *p2p_handle_to_bdev(p2p_bdev_handle *handle)
 {
 	return handle->bdev;
+}
+
+static inline struct block_device *p2p_bdev_whole(struct block_device *bdev)
+{
+	return bdev_whole(bdev);
 }
 
 static inline sector_t p2p_bdev_nr_sectors(struct block_device *bdev)
