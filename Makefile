@@ -1,6 +1,6 @@
 KSRC ?= /lib/modules/$(shell uname -r)/build
 
-.PHONY: all clean
+.PHONY: all clean test
 
 all:
 	$(MAKE) M=$(shell pwd) -C $(KSRC) modules
@@ -8,6 +8,14 @@ all:
 obj-m := stub.o
 obj-m += p2p_dev.o
 
+p2p_dev-objs := dev.o topo.o debugfs.o
+
+ccflags-y += -I$(srctree)/drivers/nvme/host
+
+test:
+	$(MAKE) -C test
+
 clean:
 	rm -rf *.o *.ko *.mod.c *.mod.o *.mod modules.* Module.* .*.ko.cmd .*.mod.o.cmd .*.o.cmd
 	rm -rf .*.mod.cmd .tmp_versions/
+	$(MAKE) -C test clean
