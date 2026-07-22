@@ -332,6 +332,7 @@ check_stats()
 run_manifest()
 {
 	local api=$1 topology=$2 mode=$3 manifest=$4 label=$5
+	local registered_mem=${6:-}
 	local output="$WORK_DIR/$label.$api.$mode.out"
 	local kernel_log="$WORK_DIR/$label.$api.$mode.dmesg"
 	local status
@@ -346,6 +347,9 @@ run_manifest()
 		command=(env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
 			"$SCRIPT_DIR/python_api_test.py" --topology "$topology" \
 			--manifest "$manifest" --mode "$mode")
+	fi
+	if [[ -n $registered_mem ]]; then
+		command+=(--registered-mem)
 	fi
 
 	set +e

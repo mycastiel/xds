@@ -86,6 +86,33 @@ make_block_manifest()
 	printf '%s\n' "$manifest"
 }
 
+make_registered_manifest()
+{
+	local api=$1 source=$2 label=$3
+	local manifest="$WORK_DIR/$label.$api.queued.tsv"
+	local base
+
+	if [[ $api == c ]]; then
+		base=0
+	else
+		base=$((16 * 1024 * 1024))
+	fi
+	: >"$manifest"
+	append_case "$manifest" "$label-$api-tiny" "$source" 0 \
+		$((base + 512)) 512 0
+	append_case "$manifest" "$label-$api-offset" "$source" 512 \
+		$((base + 1024 * 1024 + 512)) 1024 0
+	append_case "$manifest" "$label-$api-page-cross" "$source" \
+		$((2 * 1024 * 1024 - 512)) \
+		$((base + 2 * 1024 * 1024 - 512)) \
+		$((1024 * 1024 + 512)) 0
+	append_case "$manifest" "$label-$api-reuse" "$source" \
+		$((4 * 1024 * 1024 + 512)) \
+		$((base + 4 * 1024 * 1024 + 512)) \
+		$((2 * 1024 * 1024 + 1536)) 0
+	printf '%s\n' "$manifest"
+}
+
 make_concurrent_manifest()
 {
 	local api=$1 mode=$2 directory=$3 block_size=$4 label=$5
@@ -131,6 +158,27 @@ prepare_fs_files()
 			$(((i + 2) * 1024 * 1024)) $((phase_seed + 10 + i))
 	done
 	sync
+}
+
+run_mem_registration_case()
+{
+	local label=$1 expected_calls=$2
+	local get_param=/sys/module/stub/parameters/get_pa_calls
+	local put_param=/sys/module/stub/parameters/put_pa_calls
+	local get_before put_before get_after put_after
+	shift 2
+
+	[[ -r $get_param && -r $put_param ]] ||
+		die "stub PA-list counters are unavailable"
+	get_before=$(<"$get_param")
+	put_before=$(<"$put_param")
+	"$@"
+	get_after=$(<"$get_param")
+	put_after=$(<"$put_param")
+	(( get_after - get_before == expected_calls )) ||
+		die "$label used $((get_after - get_before)) PA-list gets, expected $expected_calls"
+	(( put_after - put_before == expected_calls )) ||
+		die "$label used $((put_after - put_before)) PA-list puts, expected $expected_calls"
 }
 
 run_block_matrix()
@@ -191,10 +239,25 @@ run_ext4_sizes()
 
 test_direct_nvme()
 {
+	local api manifest
+
 	log "Direct NVMe block devices and ext4"
 	wipe_test_devices
 	next_seed
 	run_block_matrix "$DEV1" direct-nsid-1 "$SEED"
+	log "Registered-memory API and lifetime"
+	run_mem_registration_case c 5 \
+		"$SCRIPT_DIR/mem_registration_test" --topology "$DEV1"
+	run_mem_registration_case python 3 env \
+		"PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
+		"$SCRIPT_DIR/python_mem_registration_test.py" --topology "$DEV1"
+	log "Registered-memory CRC32"
+	for api in c python; do
+		manifest=$(make_registered_manifest "$api" "$DEV1" registered-mem)
+		run_mem_registration_case "$api registered CRC32" 1 \
+			run_manifest "$api" "$DEV1" queued "$manifest" \
+			registered-mem registered
+	done
 	next_seed
 	run_block_matrix "$DEV2" direct-nsid-2 "$SEED"
 	run_ext4_sizes "$DEV1" direct

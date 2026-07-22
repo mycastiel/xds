@@ -86,6 +86,27 @@ Every filesystem phase runs individual boundary cases, four queued reads of
 different files, and four simultaneous same-fd submissions. The C and Python
 APIs use separate CMB ranges.
 
+The direct first-namespace phase also runs the C and Python registered-memory
+tests. They register one sector-aligned but device-page-unaligned CMB range,
+reuse its cached PA list across multi-IOV and queued reads, and unregister
+after calling `drain_io()`. The C test also races several submitting threads
+with unregister and drains accepted contexts before waiting for unregister.
+Coverage includes invalid flags and bounds, zero and stale handles, globally
+distinct handles, simultaneous use of multiple registered ranges,
+same-process reads through another p2p fd, cross-process read and unregister
+rejection, owner-fd unregister enforcement, final-fd cleanup, and stub counters
+proving PA-list reuse.
+
+A separate deterministic registered-memory CRC32 phase runs after those API
+and lifetime tests. Its C and Python runners each register the destination
+envelope from a static manifest once, queue four non-overlapping reads through
+the same handle on a separate I/O fd, drain them, and unregister the range
+through the registration fd. The cases use distinct file offsets and cover
+small, offset, device-page-crossing, and larger reads. Their isolated kernel
+logs are checked against userspace CRC32 results, while stub counters verify
+one PA-list get and put per runner. The unregister race is not part of the
+CRC32 phase.
+
 ## Dynamic-VA stress test
 
 `stress_test.sh` is a separate destructive entry point for concurrent reads
@@ -115,11 +136,15 @@ reserves the required CMB VA in 4 KiB units, and participates in a concurrent
 read. Live allocations must be non-overlapping while at least two files share
 a 2 MiB physical CMB page.
 
-Both the C and Python APIs run against the same generated workload. Each run
-checks its runtime allocation manifest, kernel/userspace CRC32 results, and
-debugfs failure/inflight counters. Set `XDS_STRESS_ITERATIONS` to change the
-default 16 iterations and `XDS_STRESS_SEED` to replay another workload; the
-default seed is `0x584453`. The common `XDS_TEST_WORKDIR`,
+Both the C and Python APIs run normal-memory and registered-memory variants
+against the same generated workload. A registered run pins the whole CMB once
+through a dedicated registration fd before starting the worker threads. Each
+worker issues I/O through its own distinct fd, and the run verifies one PA-list
+get and put. Each variant checks its runtime allocation manifest,
+kernel/userspace CRC32 results, and debugfs failure/inflight counters. Set
+`XDS_STRESS_ITERATIONS` to change the default 16 iterations and
+`XDS_STRESS_SEED` to replay another workload; the default seed is `0x584453`.
+The common `XDS_TEST_WORKDIR`,
 `XDS_TEST_KEEP_WORKDIR`, `XDS_TEST_BUILD_JOBS`, and `KSRC` controls apply to
 both entry points. Shared prepared-VM and storage helpers live in `common.sh`.
 

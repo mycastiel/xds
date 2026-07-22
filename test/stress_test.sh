@@ -54,12 +54,15 @@ prepare_topology()
 
 run_stress_api()
 {
-	local api=$1 workload=$2
-	local label="stress-$STRESS_MODE.$api"
+	local api=$1 workload=$2 memory_mode=$3
+	local label="stress-$STRESS_MODE.$api.$memory_mode"
 	local output="$WORK_DIR/$label.out"
 	local result="$WORK_DIR/$label.result.tsv"
 	local kernel_log="$WORK_DIR/$label.dmesg"
 	local summary="$WORK_DIR/$label.summary"
+	local get_param=/sys/module/stub/parameters/get_pa_calls
+	local put_param=/sys/module/stub/parameters/put_pa_calls
+	local get_before=0 put_before=0 get_after put_after
 	local status
 	local -a command common_options
 
@@ -69,6 +72,13 @@ run_stress_api()
 		--va-granularity "$VA_GRANULARITY" \
 		--backing-page-size "$BACKING_PAGE_SIZE" \
 		--result-manifest "$result")
+	if [[ $memory_mode == registered ]]; then
+		common_options+=(--registered-mem)
+		[[ -r $get_param && -r $put_param ]] ||
+			die "stub PA-list counters are unavailable"
+		get_before=$(<"$get_param")
+		put_before=$(<"$put_param")
+	fi
 	if [[ $api == c ]]; then
 		command=("$SCRIPT_DIR/c_api_test" "${common_options[@]}")
 	else
@@ -76,7 +86,7 @@ run_stress_api()
 			"$SCRIPT_DIR/python_api_test.py" "${common_options[@]}")
 	fi
 
-	log "$STRESS_MODE: running $api API dynamic-VA stress"
+	log "$STRESS_MODE: running $api API $memory_mode-memory dynamic-VA stress"
 	: >/sys/kernel/debug/p2p_device/summary
 	dmesg -C
 	set +e
@@ -88,7 +98,15 @@ run_stress_api()
 	cat "$output"
 	if (( status != 0 )); then
 		cat "$kernel_log" >&2
-		die "$STRESS_MODE $api stress runner failed"
+		die "$STRESS_MODE $api $memory_mode stress runner failed"
+	fi
+	if [[ $memory_mode == registered ]]; then
+		get_after=$(<"$get_param")
+		put_after=$(<"$put_param")
+		(( get_after - get_before == 1 )) ||
+			die "$api registered stress used $((get_after - get_before)) PA-list gets"
+		(( put_after - put_before == 1 )) ||
+			die "$api registered stress used $((put_after - put_before)) PA-list puts"
 	fi
 
 	python3 "$SCRIPT_DIR/check_stress.py" --workload "$workload" \
@@ -107,6 +125,7 @@ main()
 	local data_dir
 	local workload
 	local api
+	local memory_mode
 
 	(( $# == 0 )) || die "stress_test.sh does not accept positional arguments"
 	validate_stress_options
@@ -135,9 +154,11 @@ main()
 	sync
 
 	for api in c python; do
-		run_stress_api "$api" "$workload"
+		for memory_mode in normal registered; do
+			run_stress_api "$api" "$workload" "$memory_mode"
+		done
 	done
-	log "$STRESS_MODE dynamic-VA C and Python stress tests passed"
+	log "$STRESS_MODE normal and registered dynamic-VA stress tests passed"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

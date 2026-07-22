@@ -43,6 +43,8 @@ struct start_gate {
 struct worker {
 	struct start_gate *gate;
 	struct test_case *test;
+	uint64_t mem_handle;
+	unsigned long flags;
 	int dev_fd;
 };
 
@@ -86,15 +88,22 @@ struct stress_context {
 	unsigned long cmb_size;
 	unsigned long granularity;
 	unsigned long backing_page_size;
+	uint64_t mem_handle;
+	unsigned long flags;
+	int registration_fd;
 	int error;
 };
+
+static int register_memory(int dev_fd, uint64_t addr, uint64_t size,
+			   uint64_t *mem_handle);
+static int unregister_memory(int dev_fd, uint64_t mem_handle);
 
 static void usage(const char *program)
 {
 	fprintf(stderr,
 		"Usage: %s --topology <block-device> --manifest <tsv> "
 		"--mode <single|queued|threaded|stress> "
-		"[stress options]\n",
+		"[--registered-mem] [stress options]\n",
 		program);
 }
 
@@ -400,7 +409,8 @@ static int load_stress_manifest(const char *path,
 	return 0;
 }
 
-static int submit_case(int dev_fd, struct test_case *test)
+static int submit_case(int dev_fd, struct test_case *test,
+		       unsigned long flags, uint64_t mem_handle)
 {
 	struct p2p_iov iov = {
 		.addr = test->cmb_va,
@@ -411,6 +421,8 @@ static int submit_case(int dev_fd, struct test_case *test)
 		.file_offset = test->file_offset,
 		.iov = &iov,
 		.iov_nr = 1,
+		.mem_handle = mem_handle,
+		.flags = flags,
 	};
 
 	test->result = read_file(dev_fd, &param);
@@ -428,17 +440,19 @@ static void *thread_worker(void *argument)
 		pthread_cond_wait(&worker->gate->cond, &worker->gate->lock);
 	pthread_mutex_unlock(&worker->gate->lock);
 
-	submit_case(worker->dev_fd, worker->test);
+	submit_case(worker->dev_fd, worker->test, worker->flags,
+		    worker->mem_handle);
 	return NULL;
 }
 
-static int run_single(int dev_fd, struct test_case *tests, size_t count)
+static int run_single(int dev_fd, struct test_case *tests, size_t count,
+		      unsigned long flags, uint64_t mem_handle)
 {
 	size_t i;
 	int err;
 
 	for (i = 0; i < count; i++) {
-		err = submit_case(dev_fd, &tests[i]);
+		err = submit_case(dev_fd, &tests[i], flags, mem_handle);
 		if (err)
 			return err;
 		if (!tests[i].expected) {
@@ -453,7 +467,8 @@ static int run_single(int dev_fd, struct test_case *tests, size_t count)
 	return drain_io(dev_fd);
 }
 
-static int run_queued(int dev_fd, struct test_case *tests, size_t count)
+static int run_queued(int dev_fd, struct test_case *tests, size_t count,
+		      unsigned long flags, uint64_t mem_handle)
 {
 	size_t i;
 	int err;
@@ -464,14 +479,15 @@ static int run_queued(int dev_fd, struct test_case *tests, size_t count)
 				"queued mode only accepts successful cases\n");
 			return -EINVAL;
 		}
-		err = submit_case(dev_fd, &tests[i]);
+		err = submit_case(dev_fd, &tests[i], flags, mem_handle);
 		if (err)
 			return err;
 	}
 	return drain_io(dev_fd);
 }
 
-static int run_threaded(int dev_fd, struct test_case *tests, size_t count)
+static int run_threaded(int dev_fd, struct test_case *tests, size_t count,
+			unsigned long flags, uint64_t mem_handle)
 {
 	struct start_gate gate = {
 		.lock = PTHREAD_MUTEX_INITIALIZER,
@@ -500,6 +516,8 @@ static int run_threaded(int dev_fd, struct test_case *tests, size_t count)
 	for (i = 0; i < count; i++) {
 		workers[i].gate = &gate;
 		workers[i].test = &tests[i];
+		workers[i].flags = flags;
+		workers[i].mem_handle = mem_handle;
 		workers[i].dev_fd = dev_fd;
 		err = pthread_create(&threads[i], NULL, thread_worker,
 				     &workers[i]);
@@ -705,7 +723,8 @@ static int validate_stress_round(struct stress_context *context,
 	return shared ? 0 : -ENODATA;
 }
 
-static int submit_stress_case(int dev_fd, struct stress_case *test)
+static int submit_stress_case(int dev_fd, struct stress_case *test,
+			      unsigned long flags, uint64_t mem_handle)
 {
 	struct p2p_iov iov = {
 		.addr = test->cmb_va,
@@ -716,6 +735,8 @@ static int submit_stress_case(int dev_fd, struct stress_case *test)
 		.file_offset = test->file_offset,
 		.iov = &iov,
 		.iov_nr = 1,
+		.mem_handle = mem_handle,
+		.flags = flags,
 	};
 	int err;
 
@@ -767,6 +788,11 @@ static void *stress_thread_worker(void *argument)
 				stress_fail(context, -EBADF, "fd validation", i);
 				break;
 			}
+			if (context->fds[i] == context->registration_fd) {
+				stress_fail(context, -EEXIST,
+					    "registration fd validation", i);
+				break;
+			}
 			for (j = i + 1; j < context->workers; j++) {
 				if (context->fds[i] == context->fds[j]) {
 					stress_fail(context, -EEXIST,
@@ -800,7 +826,8 @@ static void *stress_thread_worker(void *argument)
 		pthread_barrier_wait(&context->phase);
 
 		if (!stress_failed(context) && dev_fd >= 0 && va != ULONG_MAX) {
-			err = submit_stress_case(dev_fd, test);
+			err = submit_stress_case(dev_fd, test, context->flags,
+						 context->mem_handle);
 			if (err)
 				stress_fail(context, err, "read", worker_id);
 		}
@@ -908,7 +935,7 @@ static int run_stress(const char *topology, struct stress_case *tests,
 		      unsigned int iterations, unsigned long cmb_size,
 		      unsigned long granularity,
 		      unsigned long backing_page_size,
-		      const char *result_manifest)
+		      const char *result_manifest, bool registered_mem)
 {
 	struct stress_context context = {
 		.topology = topology,
@@ -917,6 +944,7 @@ static int run_stress(const char *topology, struct stress_case *tests,
 		.cmb_size = cmb_size,
 		.granularity = granularity,
 		.backing_page_size = backing_page_size,
+		.registration_fd = -1,
 		.gate = {
 			.lock = PTHREAD_MUTEX_INITIALIZER,
 			.cond = PTHREAD_COND_INITIALIZER,
@@ -934,6 +962,18 @@ static int run_stress(const char *topology, struct stress_case *tests,
 	    !backing_page_size || cmb_size % granularity ||
 	    backing_page_size % granularity)
 		return -EINVAL;
+	if (registered_mem) {
+		context.registration_fd = new_p2p_fd();
+		if (context.registration_fd < 0) {
+			err = context.registration_fd;
+			goto out;
+		}
+		err = register_memory(context.registration_fd, 0, cmb_size,
+				      &context.mem_handle);
+		if (err)
+			goto out;
+		context.flags = P2P_IO_F_REGISTERED_MEM;
+	}
 	err = prepare_stress_matrix(tests, count, workers, iterations,
 				    &context.matrix);
 	if (err)
@@ -988,6 +1028,16 @@ static int run_stress(const char *topology, struct stress_case *tests,
 					   workers, iterations);
 
 out:
+	if (context.mem_handle) {
+		int unregister_err;
+
+		unregister_err = unregister_memory(context.registration_fd,
+						   context.mem_handle);
+		if (unregister_err && !err)
+			err = unregister_err;
+	}
+	if (context.registration_fd >= 0)
+		close_p2p_fd(context.registration_fd);
 	if (barrier_initialized)
 		pthread_barrier_destroy(&context.phase);
 	free(threads);
@@ -999,6 +1049,61 @@ out:
 	pthread_mutex_destroy(&context.gate.lock);
 	pthread_mutex_destroy(&context.error_lock);
 	return err;
+}
+
+static int register_memory(int dev_fd, uint64_t addr, uint64_t size,
+			   uint64_t *mem_handle)
+{
+	struct p2p_mem_register_param param = {
+		.addr = addr,
+		.size = size,
+	};
+	int err;
+
+	err = register_mem(dev_fd, &param);
+	if (err)
+		return err;
+	if (!param.mem_handle)
+		return -EINVAL;
+	*mem_handle = param.mem_handle;
+	return 0;
+}
+
+static int unregister_memory(int dev_fd, uint64_t mem_handle)
+{
+	struct p2p_mem_unregister_param param = {
+		.mem_handle = mem_handle,
+	};
+
+	return unregister_mem(dev_fd, &param);
+}
+
+static int register_test_cases(int dev_fd, const struct test_case *tests,
+			       size_t count, uint64_t *mem_handle)
+{
+	unsigned long range_start = ULONG_MAX;
+	unsigned long range_end = 0;
+	size_t i;
+
+	for (i = 0; i < count; i++) {
+		unsigned long end;
+
+		if (tests[i].expected) {
+			fprintf(stderr,
+				"registered-memory mode only accepts successful cases\n");
+			return -EINVAL;
+		}
+		if (tests[i].length > ULONG_MAX - tests[i].cmb_va)
+			return -EOVERFLOW;
+		end = tests[i].cmb_va + tests[i].length;
+		if (tests[i].cmb_va < range_start)
+			range_start = tests[i].cmb_va;
+		if (end > range_end)
+			range_end = end;
+	}
+
+	return register_memory(dev_fd, range_start, range_end - range_start,
+			       mem_handle);
 }
 
 int main(int argc, char **argv)
@@ -1024,6 +1129,9 @@ int main(int argc, char **argv)
 	unsigned long cmb_size = 0;
 	unsigned long va_granularity = 0;
 	unsigned long backing_page_size = 0;
+	uint64_t mem_handle = 0;
+	bool registered_mem = false;
+	int registration_fd = -1;
 	int dev_fd = -1;
 	int option;
 	int err;
@@ -1039,11 +1147,12 @@ int main(int argc, char **argv)
 		  OPT_BACKING_PAGE_SIZE },
 		{ "result-manifest", required_argument, NULL,
 		  OPT_RESULT_MANIFEST },
+		{ "registered-mem", no_argument, NULL, 'r' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
 
-	while ((option = getopt_long(argc, argv, "t:m:M:h", options, NULL)) !=
+	while ((option = getopt_long(argc, argv, "t:m:M:rh", options, NULL)) !=
 	       -1) {
 		switch (option) {
 		case 't':
@@ -1095,6 +1204,9 @@ int main(int argc, char **argv)
 		case OPT_RESULT_MANIFEST:
 			result_manifest = optarg;
 			break;
+		case 'r':
+			registered_mem = true;
+			break;
 		case 'h':
 			usage(argv[0]);
 			return EXIT_SUCCESS;
@@ -1121,7 +1233,8 @@ int main(int argc, char **argv)
 		}
 		err = run_stress(topology, stress_tests, count, workers,
 				 iterations, cmb_size, va_granularity,
-				 backing_page_size, result_manifest);
+				 backing_page_size, result_manifest,
+				 registered_mem);
 		if (err)
 			fprintf(stderr, "stress run failed: %s (%d)\n",
 				strerror(-err), err);
@@ -1151,16 +1264,38 @@ int main(int argc, char **argv)
 			strerror(-err));
 		goto out;
 	}
+	if (registered_mem) {
+		registration_fd = new_p2p_fd();
+		if (registration_fd < 0) {
+			err = registration_fd;
+			fprintf(stderr, "new registration fd failed: %s\n",
+				strerror(-err));
+			goto out;
+		}
+		err = register_test_cases(registration_fd, tests, count,
+					  &mem_handle);
+		if (err) {
+			fprintf(stderr, "register test memory failed: %s\n",
+				strerror(-err));
+			goto out;
+		}
+	}
 
 	switch (mode) {
 	case MODE_SINGLE:
-		err = run_single(dev_fd, tests, count);
+		err = run_single(dev_fd, tests, count,
+				 registered_mem ? P2P_IO_F_REGISTERED_MEM : 0,
+				 mem_handle);
 		break;
 	case MODE_QUEUED:
-		err = run_queued(dev_fd, tests, count);
+		err = run_queued(dev_fd, tests, count,
+				 registered_mem ? P2P_IO_F_REGISTERED_MEM : 0,
+				 mem_handle);
 		break;
 	case MODE_THREADED:
-		err = run_threaded(dev_fd, tests, count);
+		err = run_threaded(dev_fd, tests, count,
+				   registered_mem ? P2P_IO_F_REGISTERED_MEM : 0,
+				   mem_handle);
 		break;
 	case MODE_STRESS:
 		err = -EINVAL;
@@ -1171,6 +1306,19 @@ int main(int argc, char **argv)
 			err);
 
 out:
+	if (mem_handle) {
+		int drain_err;
+		int unregister_err;
+
+		drain_err = drain_io(dev_fd);
+		if (drain_err && !err)
+			err = drain_err;
+		unregister_err = unregister_memory(registration_fd, mem_handle);
+		if (unregister_err && !err)
+			err = unregister_err;
+	}
+	if (registration_fd >= 0)
+		close_p2p_fd(registration_fd);
 	if (dev_fd >= 0)
 		close_p2p_fd(dev_fd);
 	free_cases(tests, count);
