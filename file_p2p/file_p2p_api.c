@@ -655,6 +655,20 @@ out:
 	return err;
 }
 
+int register_mem(int dev_fd, struct p2p_mem_register_param *param)
+{
+	if (ioctl(dev_fd, IOCTL_REGISTER_MEM, param) < 0)
+		return -errno;
+	return 0;
+}
+
+int unregister_mem(int dev_fd, const struct p2p_mem_unregister_param *param)
+{
+	if (ioctl(dev_fd, IOCTL_UNREGISTER_MEM, param) < 0)
+		return -errno;
+	return 0;
+}
+
 static int is_power_of_two(unsigned int value)
 {
 	return value && !(value & (value - 1));
@@ -877,6 +891,13 @@ int read_file(int dev_fd, const struct read_parameter *param)
 	int file_fd = -1;
 	int err = 0;
 
+	if (!param)
+		return -EINVAL;
+	if (param->flags & ~P2P_IO_F_MASK)
+		return -EOPNOTSUPP;
+	if ((param->flags & P2P_IO_F_REGISTERED_MEM) && !param->mem_handle)
+		return -EINVAL;
+
 	err = get_iov_size(param->iov, param->iov_nr, &read_size);
 	if (err)
 		return err;
@@ -927,12 +948,13 @@ int read_file(int dev_fd, const struct read_parameter *param)
 	}
 
 	read->file_fd = file_fd;
-	read->host_pid = getpid();
+	read->host_pid = param->flags & P2P_IO_F_REGISTERED_MEM ? 0 : getpid();
+	read->flags = param->flags;
+	read->mem_handle = param->flags & P2P_IO_F_REGISTERED_MEM ? param->mem_handle : 0;
 	read->iov = param->iov;
 	read->iov_nr = param->iov_nr;
 	read->ext_nr = ext_num;
-	memcpy(read->extents, exts->fm_extents,
-	       ext_num * sizeof(read->extents[0]));
+	memcpy(read->extents, exts->fm_extents, ext_num * sizeof(read->extents[0]));
 
 	err = ioctl(dev_fd, IOCTL_READ_FILE, read);
 	if (err < 0) {
@@ -948,7 +970,6 @@ free_ext_out:
 close_fds_out:
 	if (file_fd >= 0)
 		close(file_fd);
-
 	return err;
 }
 

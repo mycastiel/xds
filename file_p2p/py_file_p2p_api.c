@@ -77,10 +77,12 @@ static PyObject *py_read_file(PyObject *Py_UNUSED(self), PyObject *args)
 	struct p2p_iov *iov = NULL;
 	unsigned int iov_nr = 0;
 	PyObject *py_iovs = NULL;
+	long long mem_handle = 0;
+	unsigned long flags = 0;
 	int ret = 0;
 
-	if (!PyArg_ParseTuple(args, "iskO", &dev_fd, &file_name, &file_offset,
-			      &py_iovs))
+	if (!PyArg_ParseTuple(args, "iskOLk", &dev_fd, &file_name,
+			      &file_offset, &py_iovs, &mem_handle, &flags))
 		return NULL;
 	if (parse_iovs(py_iovs, &iov, &iov_nr))
 		return NULL;
@@ -90,6 +92,8 @@ static PyObject *py_read_file(PyObject *Py_UNUSED(self), PyObject *args)
 		.file_offset = file_offset,
 		.iov = iov,
 		.iov_nr = iov_nr,
+		.flags = flags,
+		.mem_handle = (uint64_t)mem_handle,
 	};
 
 	Py_BEGIN_ALLOW_THREADS
@@ -97,6 +101,42 @@ static PyObject *py_read_file(PyObject *Py_UNUSED(self), PyObject *args)
 	Py_END_ALLOW_THREADS
 
 	free(iov);
+	return PyLong_FromLong((long)ret);
+}
+
+static PyObject *py_register_mem(PyObject *Py_UNUSED(self), PyObject *args)
+{
+	struct p2p_mem_register_param param = { };
+	int dev_fd;
+	int ret;
+
+	if (!PyArg_ParseTuple(args, "iKK", &dev_fd, &param.addr, &param.size))
+		return NULL;
+
+	Py_BEGIN_ALLOW_THREADS
+	ret = register_mem(dev_fd, &param);
+	Py_END_ALLOW_THREADS
+
+	if (ret)
+		Py_RETURN_NONE;
+	return PyLong_FromLongLong((long long)param.mem_handle);
+}
+
+static PyObject *py_unregister_mem(PyObject *Py_UNUSED(self), PyObject *args)
+{
+	struct p2p_mem_unregister_param param = { };
+	long long mem_handle;
+	int dev_fd;
+	int ret;
+
+	if (!PyArg_ParseTuple(args, "iL", &dev_fd, &mem_handle))
+		return NULL;
+	param.mem_handle = (uint64_t)mem_handle;
+
+	Py_BEGIN_ALLOW_THREADS
+	ret = unregister_mem(dev_fd, &param);
+	Py_END_ALLOW_THREADS
+
 	return PyLong_FromLong((long)ret);
 }
 
@@ -154,7 +194,7 @@ static PyObject *py_close_p2p_fd(PyObject *Py_UNUSED(self), PyObject *args)
 
 static PyMethodDef FileP2PMethods[] = {
 	{ "read_file", py_read_file, METH_VARARGS,
-	  "read_file(dev_fd, file_name, file_offset, iovs) -> int\n\n"
+	  "read_file(dev_fd, file_name, file_offset, iovs, mem_handle, flags) -> int\n\n"
 	  "Read file from p2p device.\n"
 	  "\n"
 	  "Parameters:\n"
@@ -162,9 +202,18 @@ static PyMethodDef FileP2PMethods[] = {
 	  "    file_name (str): Name of file to read.\n"
 	  "    file_offset (int): Starting file offset.\n"
 	  "    iovs (sequence): Destination (address, size) pairs.\n"
+	  "    mem_handle (int): Registered-memory handle, or zero.\n"
+	  "    flags (int): P2P I/O flags.\n"
 	  "\n"
 	  "Returns:\n"
 	  "    int: 0 on success, non-zero on error.\n" },
+	{ "register_mem", py_register_mem, METH_VARARGS,
+	  "register_mem(dev_fd, addr, size) -> int | None\n\n"
+	  "Register a device-memory VA range and return its handle.\n"
+	  "The handle may be negative. Returns None on failure.\n" },
+	{ "unregister_mem", py_unregister_mem, METH_VARARGS,
+	  "unregister_mem(dev_fd, mem_handle) -> int\n\n"
+	  "Synchronously unregister a device-memory handle.\n" },
 	{ "drain_io", py_drain_io, METH_VARARGS,
 	  "drain_io(dev_fd) -> int\n\n"
 	  "Drain I/O from p2p device.\n"
@@ -206,5 +255,15 @@ static struct PyModuleDef file_p2p_module = {
 
 PyMODINIT_FUNC PyInit_file_p2p(void)
 {
-	return PyModule_Create(&file_p2p_module);
+	PyObject *module;
+
+	module = PyModule_Create(&file_p2p_module);
+	if (!module)
+		return NULL;
+	if (PyModule_AddIntConstant(module, "P2P_IO_F_REGISTERED_MEM",
+				    P2P_IO_F_REGISTERED_MEM)) {
+		Py_DECREF(module);
+		return NULL;
+	}
+	return module;
 }
