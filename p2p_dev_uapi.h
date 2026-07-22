@@ -9,13 +9,30 @@ struct p2p_iov {
 	unsigned long size;
 };
 
+#define P2P_IO_F_REGISTERED_MEM (1UL << 0)
+#define P2P_IO_F_MASK P2P_IO_F_REGISTERED_MEM
+
 struct p2p_read_param {
 	int file_fd;
 	int host_pid;
+	unsigned long flags;
+	__u64 mem_handle;
 	struct p2p_iov *iov;
 	unsigned int iov_nr;
 	unsigned int ext_nr;
 	struct fiemap_extent extents[];
+};
+
+struct p2p_mem_register_param {
+	__u64 addr;
+	__u64 size;
+	__u64 reserved;
+	__u64 mem_handle;
+};
+
+struct p2p_mem_unregister_param {
+	__u64 mem_handle;
+	__u64 reserved;
 };
 
 #define P2P_TOPO_NAME_LEN 32
@@ -50,5 +67,7 @@ struct topo_user_cfg {
  * another drain that overlaps this ioctl need not be covered by its wait.
  */
 #define IOCTL_DRAIN_IO _IOC(_IOC_READ, 'k', 3, 0)
+#define IOCTL_REGISTER_MEM _IOWR('k', 4, struct p2p_mem_register_param)
+#define IOCTL_UNREGISTER_MEM _IOW('k', 5, struct p2p_mem_unregister_param)
 
 #endif

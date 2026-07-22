@@ -19,6 +19,25 @@ static unsigned int max_pages = STUB_DEFAULT_MAX_PAGES;
 module_param(max_pages, uint, 0444);
 MODULE_PARM_DESC(max_pages, "CMB-backed VA window size in 4 KiB pages");
 
+static atomic_t get_pa_calls = ATOMIC_INIT(0);
+static atomic_t put_pa_calls = ATOMIC_INIT(0);
+
+static int stub_param_get_atomic(char *buffer, const struct kernel_param *kp)
+{
+	atomic_t *value = kp->arg;
+
+	return scnprintf(buffer, PAGE_SIZE, "%d\n", atomic_read(value));
+}
+
+static const struct kernel_param_ops stub_atomic_param_ops = {
+	.get = stub_param_get_atomic,
+};
+
+module_param_cb(get_pa_calls, &stub_atomic_param_ops, &get_pa_calls, 0444);
+MODULE_PARM_DESC(get_pa_calls, "Successful and failed PA-list get calls");
+module_param_cb(put_pa_calls, &stub_atomic_param_ops, &put_pa_calls, 0444);
+MODULE_PARM_DESC(put_pa_calls, "PA-list put calls");
+
 static u64 stub_va_size(void)
 {
 	return (u64)max_pages << STUB_ADDR_SHIFT;
@@ -42,6 +61,7 @@ int devmm_get_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
 	unsigned int i;
 	int err;
 
+	atomic_inc(&get_pa_calls);
 	(void)process_id;
 	if (!pa_list)
 		return -EINVAL;
@@ -71,6 +91,7 @@ EXPORT_SYMBOL(devmm_get_mem_pa_list);
 void devmm_put_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
 			   u64 size, u64 *pa_list, u32 pa_num)
 {
+	atomic_inc(&put_pa_calls);
 	(void)process_id;
 	(void)addr;
 	(void)size;

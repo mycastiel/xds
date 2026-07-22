@@ -16,6 +16,12 @@
 #include <linux/tracepoint.h>
 #include <linux/limits.h>
 #include <linux/overflow.h>
+#include <linux/mutex.h>
+#include <linux/percpu-refcount.h>
+#include <linux/pid.h>
+#include <linux/random.h>
+#include <linux/rcupdate.h>
+#include <linux/xarray.h>
 #ifdef CALC_CRC32
 #include <linux/crc32.h>
 #endif
@@ -39,6 +45,8 @@
 #define P2P_MAX_IOV 65536U
 #define P2P_MAX_EXTENTS 1048576U
 #define P2P_MIN_PAGE_SIZE (64U << 10)
+#define P2P_MEM_COOKIE_SHIFT 48
+#define P2P_MEM_ID_MASK GENMASK_ULL(P2P_MEM_COOKIE_SHIFT - 1, 0)
 
 struct p2p_pa_iov {
 	u64 addr;
@@ -67,11 +75,36 @@ struct p2p_pinned_pa {
 	u64 *pa_list;
 };
 
+struct p2p_batch;
+
+struct p2p_registered_mem {
+	u64 handle;
+	u64 addr;
+	u64 size;
+	struct p2p_pinned_pa *pinned_pa;
+	struct p2p_batch *owner;
+	struct pid *owner_tgid;
+
+	struct percpu_ref io_refs;
+	struct completion io_zero;
+	struct rcu_head rcu;
+	struct list_head owner_node;
+};
+
+struct p2p_pinned_io_mem {
+	bool pinned;
+	bool reg_mem;
+	union {
+		struct p2p_pinned_pa *pinned_pa;
+		struct p2p_registered_mem *registered_mem;
+	};
+};
+
 struct p2p_io_context {
 	struct file *file;
 	struct p2p_pa_iov *pa_iov;
 	unsigned int pa_iov_nr;
-	struct p2p_pinned_pa *pinned_pa;
+	struct p2p_pinned_io_mem pinned_mem;
 	u64 data_size;
 	struct completion io_done;
 	atomic_t io_ref;
@@ -85,9 +118,8 @@ struct p2p_batch {
 	unsigned int io_cnt;
 	spinlock_t io_lock;
 	struct shared_topo_list shared_topos;
+	struct list_head owned_mems;
 };
-
-static void p2p_tp_hook_exit(void);
 
 static dev_t dev;
 static struct class *dev_class;
@@ -97,10 +129,18 @@ static struct tracepoint *p2p_tp;
 static DEFINE_MUTEX(p2p_tp_lock);
 static struct module *p2p_tp_mod;
 
+static DEFINE_XARRAY(registered_mems);
+static DEFINE_MUTEX(registered_mem_lock);
+static atomic64_t registered_mem_id = ATOMIC64_INIT(0);
+
 static int p2p_open(struct inode *inode, struct file *file);
 static int p2p_release(struct inode *inode, struct file *file);
 static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 static int p2p_drain_io(struct p2p_batch *batch);
+static void p2p_tp_hook_exit(void);
+static void p2p_revoke_all_registered_mem(struct p2p_batch *batch,
+					  struct list_head *revoked);
+static void p2p_destroy_registered_mem_list(struct list_head *revoked);
 
 static struct file_operations fops = {
 	.owner = THIS_MODULE,
@@ -121,6 +161,7 @@ static int p2p_open(struct inode *inode, struct file *file)
 	INIT_LIST_HEAD(&batch->io_list);
 	spin_lock_init(&batch->shared_topos.lock);
 	INIT_LIST_HEAD(&batch->shared_topos.head);
+	INIT_LIST_HEAD(&batch->owned_mems);
 	batch->io_cnt = 0;
 	file->private_data = batch;
 
@@ -132,9 +173,14 @@ static int p2p_release(struct inode *inode, struct file *file)
 	struct p2p_batch *batch = file->private_data;
 	struct shared_topo *shared, *next;
 	LIST_HEAD(topos);
+	LIST_HEAD(revoked_mems);
+
+	p2p_revoke_all_registered_mem(batch, &revoked_mems);
 
 	if (!list_empty(&batch->io_list) || batch->io_cnt > 0)
 		p2p_drain_io(batch);
+
+	p2p_destroy_registered_mem_list(&revoked_mems);
 
 	spin_lock(&batch->shared_topos.lock);
 	list_splice_init(&batch->shared_topos.head, &topos);
@@ -159,12 +205,14 @@ static void init_process_id(int host_pid, struct devmm_svm_process_id *process_i
 	rcu_read_unlock();
 }
 
+static void init_current_process_id(struct devmm_svm_process_id *process_id)
+{
+	process_id->host_pid = task_tgid_nr(current);
+}
+
 static void p2p_put_pinned_pa(struct p2p_pinned_pa *pinned_pa)
 {
 	unsigned int i;
-
-	if (!pinned_pa)
-		return;
 
 	for (i = 0; i < pinned_pa->pinned_map_nr; i++) {
 		struct p2p_iov_map *map = &pinned_pa->maps[i];
@@ -176,6 +224,284 @@ static void p2p_put_pinned_pa(struct p2p_pinned_pa *pinned_pa)
 	kvfree(pinned_pa->pa_list);
 	kvfree(pinned_pa->maps);
 	kfree(pinned_pa);
+}
+
+static void p2p_registered_mem_release(struct percpu_ref *ref)
+{
+	struct p2p_registered_mem *mem;
+
+	mem = container_of(ref, struct p2p_registered_mem, io_refs);
+	pr_debug("registered memory handle 0x%llx released\n", mem->handle);
+	complete(&mem->io_zero);
+}
+
+static void p2p_free_registered_mem_rcu(struct rcu_head *rcu)
+{
+	struct p2p_registered_mem *mem;
+
+	mem = container_of(rcu, struct p2p_registered_mem, rcu);
+	percpu_ref_exit(&mem->io_refs);
+	kfree(mem);
+}
+
+static void p2p_destroy_registered_mem(struct p2p_registered_mem *mem)
+{
+	wait_for_completion(&mem->io_zero);
+	p2p_put_pinned_pa(mem->pinned_pa);
+	put_pid(mem->owner_tgid);
+	call_rcu(&mem->rcu, p2p_free_registered_mem_rcu);
+}
+
+static int p2p_pin_registered_pa(u64 addr, u64 size,
+				 struct p2p_pinned_pa **pinned_pa_out)
+{
+	struct p2p_pinned_pa *pinned_pa;
+	struct p2p_iov_map *map;
+	u64 aligned_end;
+	u64 end;
+	u64 pa_num;
+	int page_size;
+	int err;
+
+	if (!size)
+		return -EINVAL;
+	if (check_add_overflow(addr, size, &end))
+		return -EOVERFLOW;
+
+	pinned_pa = kzalloc(sizeof(*pinned_pa), GFP_KERNEL);
+	if (!pinned_pa)
+		return -ENOMEM;
+	init_current_process_id(&pinned_pa->process_id);
+
+	page_size = devmm_get_mem_page_size(&pinned_pa->process_id, addr, size);
+	if (page_size < 0) {
+		err = page_size;
+		goto put_pinned_pa;
+	}
+	if (page_size < P2P_MIN_PAGE_SIZE || !is_power_of_2(page_size)) {
+		pr_err("invalid page size %d for registered range 0x%llx+0x%llx\n",
+		       page_size, addr, size);
+		err = -EINVAL;
+		goto put_pinned_pa;
+	}
+
+	if (check_add_overflow(end, (u64)page_size - 1, &aligned_end)) {
+		err = -EOVERFLOW;
+		goto put_pinned_pa;
+	}
+	aligned_end &= ~((u64)page_size - 1);
+
+	pinned_pa->maps = kzalloc(sizeof(*pinned_pa->maps), GFP_KERNEL);
+	if (!pinned_pa->maps) {
+		err = -ENOMEM;
+		goto put_pinned_pa;
+	}
+	map = pinned_pa->maps;
+	map->aligned_addr = addr & ~((u64)page_size - 1);
+	map->aligned_size = aligned_end - map->aligned_addr;
+	map->page_size = page_size;
+	pa_num = map->aligned_size / map->page_size;
+	if (!pa_num || pa_num > U32_MAX) {
+		err = -E2BIG;
+		goto put_pinned_pa;
+	}
+	map->pa_num = pa_num;
+
+	pinned_pa->pa_list = kvmalloc_array(map->pa_num, sizeof(*pinned_pa->pa_list), GFP_KERNEL);
+	if (!pinned_pa->pa_list) {
+		err = -ENOMEM;
+		goto put_pinned_pa;
+	}
+	map->pa_list = pinned_pa->pa_list;
+
+	err = devmm_get_mem_pa_list(&pinned_pa->process_id, map->aligned_addr,
+				    map->aligned_size, map->pa_list,
+				    map->pa_num);
+	if (err) {
+		pr_err("registered PA list addr 0x%llx size 0x%llx num %u err %d\n",
+		       map->aligned_addr, map->aligned_size, map->pa_num, err);
+		goto put_pinned_pa;
+	}
+	pinned_pa->pinned_map_nr = 1;
+
+	*pinned_pa_out = pinned_pa;
+	return 0;
+
+put_pinned_pa:
+	p2p_put_pinned_pa(pinned_pa);
+	return err;
+}
+
+static u64 p2p_new_registered_mem_handle(void)
+{
+	u64 id = atomic64_inc_return(&registered_mem_id) & P2P_MEM_ID_MASK;
+	u64 cookie = get_random_u32() & U16_MAX;
+
+	return cookie << P2P_MEM_COOKIE_SHIFT | id;
+}
+
+static int p2p_publish_registered_mem(struct p2p_batch *batch,
+				      struct p2p_registered_mem *mem)
+{
+	int err;
+
+	mutex_lock(&registered_mem_lock);
+	mem->owner = batch;
+	err = xa_insert(&registered_mems, mem->handle, mem, GFP_KERNEL);
+	if (!err) {
+		list_add_tail(&mem->owner_node, &batch->owned_mems);
+		percpu_ref_reinit(&mem->io_refs);
+	} else {
+		pr_err("publish registered memory handle 0x%llx err %d\n", mem->handle, err);
+	}
+	mutex_unlock(&registered_mem_lock);
+
+	return err;
+}
+
+static int p2p_unpublish_registered_mem(struct p2p_batch *batch, u64 handle,
+					struct p2p_registered_mem **mem_out)
+{
+	struct p2p_registered_mem *mem;
+	int err = 0;
+
+	mutex_lock(&registered_mem_lock);
+	rcu_read_lock();
+	mem = xa_load(&registered_mems, handle);
+	if (!mem) {
+		err = -ENOENT;
+		goto unlock_rcu;
+	}
+	if (mem->owner != batch) {
+		pr_err("registered memory handle 0x%llx belongs to another p2p fd\n", handle);
+		err = -EPERM;
+		goto unlock_rcu;
+	}
+	if (mem->owner_tgid != task_tgid(current)) {
+		pr_err("registered memory handle 0x%llx belongs to another process\n", handle);
+		err = -EPERM;
+		goto unlock_rcu;
+	}
+	rcu_read_unlock();
+
+	xa_erase(&registered_mems, handle);
+	list_del_init(&mem->owner_node);
+	*mem_out = mem;
+	mutex_unlock(&registered_mem_lock);
+	return 0;
+
+unlock_rcu:
+	rcu_read_unlock();
+	mutex_unlock(&registered_mem_lock);
+	return err;
+}
+
+static void p2p_revoke_all_registered_mem(struct p2p_batch *batch,
+					  struct list_head *revoked)
+{
+	struct p2p_registered_mem *mem, *next;
+
+	if (list_empty(&batch->owned_mems))
+		return;
+
+	list_for_each_entry_safe(mem, next, &batch->owned_mems, owner_node) {
+		xa_erase(&registered_mems, mem->handle);
+		list_move_tail(&mem->owner_node, revoked);
+		pr_info("unregister memory handle 0x%llx through p2p fd release\n",
+			mem->handle);
+	}
+
+	list_for_each_entry(mem, revoked, owner_node)
+		percpu_ref_kill(&mem->io_refs);
+}
+
+static void p2p_destroy_registered_mem_list(struct list_head *revoked)
+{
+	struct p2p_registered_mem *mem;
+	struct p2p_registered_mem *next;
+
+	list_for_each_entry_safe(mem, next, revoked, owner_node) {
+		list_del_init(&mem->owner_node);
+		p2p_destroy_registered_mem(mem);
+	}
+}
+
+static int p2p_register_mem(struct p2p_batch *batch, void __user *arg)
+{
+	struct p2p_mem_register_param __user *user_param = arg;
+	struct p2p_mem_register_param param;
+	struct p2p_registered_mem *mem;
+	int err;
+
+	if (copy_from_user(&param, arg, sizeof(param)))
+		return -EFAULT;
+	if (param.reserved)
+		return -EINVAL;
+
+	mem = kzalloc(sizeof(*mem), GFP_KERNEL);
+	if (!mem)
+		return -ENOMEM;
+	mem->addr = param.addr;
+	mem->size = param.size;
+	mem->owner_tgid = get_task_pid(current, PIDTYPE_TGID);
+	init_completion(&mem->io_zero);
+	INIT_LIST_HEAD(&mem->owner_node);
+
+	err = percpu_ref_init(&mem->io_refs, p2p_registered_mem_release,
+			      PERCPU_REF_INIT_DEAD, GFP_KERNEL);
+	if (err)
+		goto put_owner_tgid;
+
+	err = p2p_pin_registered_pa(mem->addr, mem->size, &mem->pinned_pa);
+	if (err)
+		goto exit_io_refs;
+
+	mem->handle = p2p_new_registered_mem_handle();
+	if (put_user(mem->handle, &user_param->mem_handle)) {
+		err = -EFAULT;
+		goto put_pinned_pa;
+	}
+
+	err = p2p_publish_registered_mem(batch, mem);
+	if (err)
+		goto put_pinned_pa;
+
+	pr_info("registered memory handle 0x%llx addr 0x%llx size 0x%llx\n",
+		mem->handle, mem->addr, mem->size);
+	return 0;
+
+put_pinned_pa:
+	p2p_put_pinned_pa(mem->pinned_pa);
+exit_io_refs:
+	percpu_ref_exit(&mem->io_refs);
+put_owner_tgid:
+	put_pid(mem->owner_tgid);
+	kfree(mem);
+	return err;
+}
+
+static int p2p_unregister_mem(struct p2p_batch *batch, void __user *arg)
+{
+	struct p2p_mem_unregister_param param;
+	struct p2p_registered_mem *mem;
+	int err;
+
+	if (copy_from_user(&param, arg, sizeof(param)))
+		return -EFAULT;
+	if (param.reserved || !param.mem_handle)
+		return -EINVAL;
+
+	err = p2p_unpublish_registered_mem(batch, param.mem_handle, &mem);
+	if (err) {
+		pr_err("unregister memory handle 0x%llx err %d\n", param.mem_handle, err);
+		return err;
+	}
+
+	percpu_ref_kill(&mem->io_refs);
+	p2p_destroy_registered_mem(mem);
+
+	pr_info("unregistered memory handle 0x%llx\n", param.mem_handle);
+	return 0;
 }
 
 #ifdef DUMP_CONTENT
@@ -371,9 +697,131 @@ put_pinned_pa:
 	return err;
 }
 
+static int p2p_get_registered_mem(u64 handle, struct p2p_registered_mem **mem_out)
+{
+	struct p2p_registered_mem *mem;
+	int err;
+
+	rcu_read_lock();
+	mem = xa_load(&registered_mems, handle);
+	if (!mem) {
+		err = -ENOENT;
+		goto unlock;
+	}
+	if (!percpu_ref_tryget_live(&mem->io_refs)) {
+		err = -ESTALE;
+		goto unlock;
+	}
+	rcu_read_unlock();
+	if (mem->owner_tgid != task_tgid(current)) {
+		percpu_ref_put(&mem->io_refs);
+		return -EPERM;
+	}
+
+	*mem_out = mem;
+	return 0;
+
+unlock:
+	rcu_read_unlock();
+	return err;
+}
+
+static int get_registered_pa_iov(u64 handle, const struct p2p_iov *iov,
+				 unsigned int iov_nr,
+				 struct p2p_pa_iov **pa_iov_out,
+				 unsigned int *pa_iov_nr_out,
+				 struct p2p_registered_mem **mem_out)
+{
+	struct p2p_registered_mem *mem;
+	const struct p2p_iov_map *map;
+	struct p2p_pa_iov *pa_iov;
+	unsigned int pa_iov_nr = 0;
+	unsigned int pa_iov_idx = 0;
+	unsigned int i;
+	int err;
+
+	err = p2p_get_registered_mem(handle, &mem);
+	if (err)
+		return err;
+	map = &mem->pinned_pa->maps[0];
+
+	for (i = 0; i < iov_nr; i++) {
+		u64 map_offset;
+		u64 first_page;
+		u64 last_page;
+		u64 iov_end;
+		u64 nr_pages;
+
+		if (iov[i].addr < mem->addr || iov[i].size > mem->size ||
+		    iov[i].addr - mem->addr > mem->size - iov[i].size) {
+			err = -ERANGE;
+			goto put_mem;
+		}
+		map_offset = iov[i].addr - map->aligned_addr;
+		iov_end = map_offset + (u64)iov[i].size - 1;
+		first_page = map_offset / map->page_size;
+		last_page = iov_end / map->page_size;
+		nr_pages = last_page - first_page + 1;
+		pa_iov_nr += (unsigned int)nr_pages;
+	}
+
+	pa_iov = kvmalloc_array(pa_iov_nr, sizeof(*pa_iov), GFP_KERNEL);
+	if (!pa_iov) {
+		err = -ENOMEM;
+		goto put_mem;
+	}
+
+	for (i = 0; i < iov_nr; i++) {
+		u64 remaining = iov[i].size;
+		u64 map_offset = iov[i].addr - map->aligned_addr;
+		u64 page_idx = map_offset / map->page_size;
+		u64 page_offset = map_offset % map->page_size;
+
+		while (remaining) {
+			u64 len = min_t(u64, remaining,
+					map->page_size - page_offset);
+			u64 pa = map->pa_list[page_idx] + page_offset;
+
+			if ((pa | len) & (SECTOR_SIZE - 1)) {
+				err = -EINVAL;
+				goto free_pa_iov;
+			}
+			pa_iov[pa_iov_idx].addr = pa;
+			pa_iov[pa_iov_idx].len = len;
+			pa_iov_idx++;
+			remaining -= len;
+			page_idx++;
+			page_offset = 0;
+		}
+	}
+
+	*pa_iov_out = pa_iov;
+	*pa_iov_nr_out = pa_iov_nr;
+	*mem_out = mem;
+	return 0;
+
+free_pa_iov:
+	kvfree(pa_iov);
+put_mem:
+	percpu_ref_put(&mem->io_refs);
+	return err;
+}
+
+static void p2p_unpin_io_mem(struct p2p_pinned_io_mem *pinned_mem)
+{
+	if (!pinned_mem->pinned)
+		return;
+
+	if (pinned_mem->reg_mem)
+		percpu_ref_put(&pinned_mem->registered_mem->io_refs);
+	else
+		p2p_put_pinned_pa(pinned_mem->pinned_pa);
+	pinned_mem->pinned = false;
+}
+
 static void free_io_ctx(struct p2p_io_context *io_ctx)
 {
-	p2p_put_pinned_pa(io_ctx->pinned_pa);
+	p2p_unpin_io_mem(&io_ctx->pinned_mem);
 	kvfree(io_ctx->pa_iov);
 	fput(io_ctx->file);
 	kfree(io_ctx);
@@ -391,7 +839,8 @@ static inline unsigned int p2p_queue_max_sectors(struct block_device *bdev)
 static struct p2p_io_context *new_io_ctx(struct file *file,
 					 struct p2p_pa_iov *pa_iov,
 					 unsigned int pa_iov_nr,
-					 struct p2p_pinned_pa *pinned_pa, u64 data_size)
+					 struct p2p_pinned_io_mem *pinned_mem,
+					 u64 data_size)
 {
 	struct p2p_io_context *io_ctx;
 
@@ -402,7 +851,7 @@ static struct p2p_io_context *new_io_ctx(struct file *file,
 	io_ctx->file = file;
 	io_ctx->pa_iov = pa_iov;
 	io_ctx->pa_iov_nr = pa_iov_nr;
-	io_ctx->pinned_pa = pinned_pa;
+	io_ctx->pinned_mem = *pinned_mem;
 	io_ctx->data_size = data_size;
 
 	atomic_set(&io_ctx->io_ref, 1);
@@ -671,8 +1120,7 @@ out:
 
 static int wait_io_done(struct p2p_io_context *io_ctx)
 {
-	if (!atomic_dec_and_test(&io_ctx->io_ref))
-		wait_for_completion_io(&io_ctx->io_done);
+	wait_for_completion_io(&io_ctx->io_done);
 	return io_ctx->io_err;
 }
 
@@ -771,6 +1219,19 @@ static struct block_device *p2p_bdev_from_file(struct file *file)
 	return sb->s_bdev;
 }
 
+static int validate_read_param(const struct p2p_read_param *param)
+{
+	if (param->flags & ~P2P_IO_F_MASK)
+		return -EOPNOTSUPP;
+	if (!param->iov_nr || param->iov_nr > P2P_MAX_IOV ||
+	    !param->ext_nr || param->ext_nr > P2P_MAX_EXTENTS)
+		return -EINVAL;
+	if (param->flags & P2P_IO_F_REGISTERED_MEM)
+		return !param->mem_handle || param->host_pid ? -EINVAL : 0;
+
+	return param->host_pid <= 0 ? -EINVAL : 0;
+}
+
 static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 {
 	struct p2p_read_param __user *user_param = arg;
@@ -781,7 +1242,7 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 	struct file *reg_file = NULL;
 	struct block_device *bdev;
 	struct p2p_io_context *io_ctx;
-	struct p2p_pinned_pa *pinned_pa = NULL;
+	struct p2p_pinned_io_mem pinned_mem = { };
 	struct topo *topo = NULL;
 	u64 data_size;
 	unsigned int pa_iov_nr;
@@ -789,10 +1250,9 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 
 	if (copy_from_user(&param, user_param, sizeof(param)))
 		return -EFAULT;
-	if (param.host_pid <= 0 || !param.iov_nr ||
-	    param.iov_nr > P2P_MAX_IOV || !param.ext_nr ||
-	    param.ext_nr > P2P_MAX_EXTENTS)
-		return -EINVAL;
+	err = validate_read_param(&param);
+	if (err)
+		return err;
 
 	iov = kvmalloc_array(param.iov_nr, sizeof(*iov), GFP_KERNEL);
 	if (!iov)
@@ -815,8 +1275,7 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 		goto free_extents;
 	}
 
-	err = validate_read_data(iov, param.iov_nr, extents, param.ext_nr,
-				 &data_size);
+	err = validate_read_data(iov, param.iov_nr, extents, param.ext_nr, &data_size);
 	if (err)
 		goto free_extents;
 
@@ -842,22 +1301,33 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 		goto put_reg_file;
 	}
 
-	err = get_pa_iov(param.host_pid, iov, param.iov_nr, &pa_iov, &pa_iov_nr, &pinned_pa);
+	if (param.flags & P2P_IO_F_REGISTERED_MEM) {
+		pinned_mem.reg_mem = true;
+		err = get_registered_pa_iov(param.mem_handle, iov, param.iov_nr,
+					    &pa_iov, &pa_iov_nr,
+					    &pinned_mem.registered_mem);
+	} else {
+		err = get_pa_iov(param.host_pid, iov, param.iov_nr, &pa_iov,
+				 &pa_iov_nr, &pinned_mem.pinned_pa);
+	}
 	if (err)
 		goto put_topo;
+	pinned_mem.pinned = true;
 
-	io_ctx = new_io_ctx(reg_file, pa_iov, pa_iov_nr, pinned_pa, data_size);
+	io_ctx = new_io_ctx(reg_file, pa_iov, pa_iov_nr, &pinned_mem, data_size);
 	if (IS_ERR(io_ctx)) {
 		err = PTR_ERR(io_ctx);
 		goto free_pa_iov;
 	}
 	reg_file = NULL;
 	pa_iov = NULL;
-	pinned_pa = NULL;
+	pinned_mem.pinned = false;
 
 	io_ctx->issue_err = do_read_ios(io_ctx, topo, extents, param.ext_nr);
 	if (io_ctx->issue_err)
 		p2p_stats_io_issue_failed();
+	if (atomic_dec_and_test(&io_ctx->io_ref))
+		complete(&io_ctx->io_done);
 	topo_put(topo);
 	topo = NULL;
 
@@ -867,7 +1337,7 @@ static int p2p_read_file(struct p2p_batch *batch, void __user *arg)
 	spin_unlock(&batch->io_lock);
 
 free_pa_iov:
-	p2p_put_pinned_pa(pinned_pa);
+	p2p_unpin_io_mem(&pinned_mem);
 	kvfree(pa_iov);
 put_topo:
 	if (topo)
@@ -915,8 +1385,7 @@ static int p2p_drain_io(struct p2p_batch *batch)
 		if (!err) {
 			dump_io_ctx_crc32(io_ctx);
 			dump_pa_content(io_ctx->pa_iov[0].addr,
-					min_t(u64, io_ctx->data_size,
-					      io_ctx->pa_iov[0].len));
+					min_t(u64, io_ctx->data_size, io_ctx->pa_iov[0].len));
 		} else if (!first_err) {
 			first_err = err;
 		}
@@ -971,6 +1440,12 @@ static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 	case IOCTL_ADD_TOPO:
 		err = p2p_add_topo(batch, (void __user *)arg);
+		break;
+	case IOCTL_REGISTER_MEM:
+		err = p2p_register_mem(batch, (void __user *)arg);
+		break;
+	case IOCTL_UNREGISTER_MEM:
+		err = p2p_unregister_mem(batch, (void __user *)arg);
 		break;
 	default:
 		pr_info("invalid ioctl command 0x%x\n", cmd);
@@ -1053,6 +1528,13 @@ static void __exit p2p_drv_exit(void)
 	cdev_del(&p2p_cdev);
 	unregister_chrdev_region(dev, 1);
 	p2p_tp_hook_exit();
+	WARN_ON_ONCE(!xa_empty(&registered_mems));
+	xa_destroy(&registered_mems);
+	/*
+	 * Drain registered-memory RCU frees and queue all topology release work
+	 * before topo_exit() flushes and destroys the topology workqueue.
+	 */
+	rcu_barrier();
 	topo_exit();
 	pr_info("driver removed done\n");
 }

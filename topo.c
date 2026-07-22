@@ -550,6 +550,5 @@ int topo_init(void)
 void topo_exit(void)
 {
 	WARN_ON_ONCE(!radix_tree_empty(&topo_tree));
-	rcu_barrier();
 	destroy_workqueue(topo_release_wq);
 }
