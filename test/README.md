@@ -122,3 +122,27 @@ default 16 iterations and `XDS_STRESS_SEED` to replay another workload; the
 default seed is `0x584453`. The common `XDS_TEST_WORKDIR`,
 `XDS_TEST_KEEP_WORKDIR`, `XDS_TEST_BUILD_JOBS`, and `KSRC` controls apply to
 both entry points. Shared prepared-VM and storage helpers live in `common.sh`.
+
+## Remote test runner
+
+The remote VM helper scripts read machine-specific settings from an ignored
+local file. Create it from the checked-in example before using either helper:
+
+```sh
+cp test/remote_test.env.example test/remote_test.env
+chmod 600 test/remote_test.env
+${EDITOR:-vi} test/remote_test.env
+```
+
+Then start the prepared VM and run the basic suite from the local checkout:
+
+```sh
+./test/launch_remote_vm.sh
+./test/run_remote_test.sh
+```
+
+Set `XDS_REMOTE_TEST_ENV` to use a configuration file at another path. The
+configuration is sourced as shell syntax, so it must be trusted. SSH
+authentication uses the local SSH agent or SSH configuration for the remote
+host and the configured key file for the guest; passwords should not be stored
+in the configuration file.
