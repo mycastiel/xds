@@ -26,10 +26,12 @@ GUEST_USER=${XDS_GUEST_USER:?set XDS_GUEST_USER in "$CONFIG_FILE"}
 GUEST_PORT=${XDS_GUEST_PORT:?set XDS_GUEST_PORT in "$CONFIG_FILE"}
 GUEST_KEY=${XDS_GUEST_KEY:?set XDS_GUEST_KEY in "$CONFIG_FILE"}
 WAIT_TIMEOUT=${XDS_VM_WAIT_TIMEOUT:?set XDS_VM_WAIT_TIMEOUT in "$CONFIG_FILE"}
+SSH_CONFIG=${XDS_SSH_CONFIG:-/dev/null}
 
 readonly REMOTE_TARGET=$REMOTE_USER@$REMOTE_HOST
 readonly -a REMOTE_SSH=(
 	ssh
+	-F "$SSH_CONFIG"
 	-p "$REMOTE_PORT"
 	-o BatchMode=yes
 	-o ConnectTimeout=10
@@ -44,7 +46,7 @@ guest_exec()
 
 	printf -v guest_command '%q ' "$@"
 	printf -v host_command '%q ' \
-		ssh -i "$GUEST_KEY" -p "$GUEST_PORT" \
+		ssh -F /dev/null -i "$GUEST_KEY" -p "$GUEST_PORT" \
 		-o BatchMode=yes -o ConnectTimeout=5 \
 		-o StrictHostKeyChecking=no \
 		-o UserKnownHostsFile=/dev/null \

@@ -98,8 +98,9 @@ def load_stress_manifest(path: Path) -> List[StressCase]:
 
 
 def submit(dev_fd: int, test: TestCase, flags: int, mem_handle: int) -> None:
-    test.result = file_p2p.read_file(
+    test.result = file_p2p.rw_file(
         dev_fd,
+        file_p2p.P2P_IO_READ,
         test.path,
         test.file_offset,
         [(test.cmb_va, test.length)],
@@ -365,8 +366,9 @@ def run_stress(
 
                 if not failed() and dev_fd is not None and va is not None:
                     try:
-                        test.result = file_p2p.read_file(
+                        test.result = file_p2p.rw_file(
                             dev_fd,
+                            file_p2p.P2P_IO_READ,
                             test.path,
                             test.file_offset,
                             [(va, test.length)],
@@ -380,7 +382,7 @@ def run_stress(
                         )
                         if test.result:
                             raise RuntimeError(
-                                f"{test.case_id}: read_file returned {test.result}"
+                                f"{test.case_id}: rw_file returned {test.result}"
                             )
                         drain(dev_fd)
                     except BaseException as error:

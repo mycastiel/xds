@@ -1,9 +1,10 @@
 # XDS prepared-VM tests
 
-`basic_test.sh` is a destructive end-to-end test for the XDS direct-read path.
-It builds the kernel modules and both userspace APIs, uses a QEMU NVMe
-Controller Memory Buffer as the destination, and verifies every successful
-read by comparing kernel and userspace CRC32 values.
+`basic_test.sh` is a destructive end-to-end test for the XDS direct read/write
+path. It builds the kernel modules and both userspace APIs, uses a QEMU NVMe
+Controller Memory Buffer as the read destination and write source, verifies
+reads by comparing kernel and userspace CRC32 values, and verifies writes
+through independent direct-I/O block-device read-back.
 
 ## Prepared VM contract
 
@@ -63,18 +64,20 @@ successful run. Failure artifacts are always retained.
 
 The sequence is:
 
-1. Direct block-device reads on both namespaces, followed by ext4 with 1K,
-   2K, and 4K blocks on the first namespace.
-2. A partition on the first NVMe namespace, tested as a block device and with
-   all three ext4 block sizes, then removed before stacked-device testing.
+1. Direct block-device reads and writes on both namespaces, followed by ext4
+   read coverage with 1K, 2K, and 4K blocks on the first namespace.
+2. A partition on the first NVMe namespace, tested for raw reads and writes
+   and with all three ext4 block sizes for reads, then removed before
+   stacked-device testing.
 3. A 126 MiB dm-linear device made from the 63 MiB usable region of each
    namespace. Each segment starts at a 1 MiB underlying-device offset to match
-   the real LVM data layout. It is tested as a block device and with all three
-   ext4 block sizes, and is created and removed directly with `dmsetup`.
+   the real LVM data layout. It is tested for raw reads and writes and with all
+   three ext4 block sizes for reads, and is created and removed directly with
+   `dmsetup`.
 4. The same dm-linear coverage with equal-sized partitions starting at
    different namespace sectors as its components.
-5. A two-member, 64 KiB-chunk MD RAID0, tested as a block device and with all
-   three ext4 block sizes.
+5. A two-member, 64 KiB-chunk MD RAID0, tested for raw reads and writes and
+   with all three ext4 block sizes for reads.
 6. A two-member RAID0 created with the namespace arguments reversed, verifying
    topology discovery orders components by MD slot rather than sysfs directory
    enumeration order.
@@ -85,6 +88,20 @@ The sequence is:
 Every filesystem phase runs individual boundary cases, four queued reads of
 different files, and four simultaneous same-fd submissions. The C and Python
 APIs use separate CMB ranges.
+
+For each raw topology, both APIs run a write pipeline that first places a
+deterministic pattern into a seed range with `O_DIRECT`, reads it into three
+HBM IOVs through XDS, drains and validates the read-side HBM CRC, then writes
+the unchanged IOVs to a distinct raw range. An `O_DIRECT` host read verifies
+the entire payload plus known guards immediately before and after it. The
+transfer crosses CMB-page, queue-limit, and topology boundaries. Write-only
+kernel logs are checked to ensure that read-only CRC and PA-content diagnostics
+were not emitted.
+
+The first namespace also runs the write pipeline with registered memory for
+both APIs. Separate rejection tests cover invalid operations, registration
+reserved fields, unknown flags, regular-file writes, read-only block-device
+descriptors, insufficient extent coverage, and ranges beyond device capacity.
 
 The direct first-namespace phase also runs the C and Python registered-memory
 tests. They register one sector-aligned but device-page-unaligned CMB range,

@@ -28,10 +28,12 @@ GUEST_DEV_1=${XDS_GUEST_DEV_1:?set XDS_GUEST_DEV_1 in "$CONFIG_FILE"}
 GUEST_DEV_2=${XDS_GUEST_DEV_2:?set XDS_GUEST_DEV_2 in "$CONFIG_FILE"}
 KEEP_WORKDIR=${XDS_TEST_KEEP_WORKDIR:?set XDS_TEST_KEEP_WORKDIR in "$CONFIG_FILE"}
 RESULT_DIR=${XDS_RESULT_DIR:-/tmp/xds-remote-test.$(date -u +%Y%m%dT%H%M%SZ)}
+SSH_CONFIG=${XDS_SSH_CONFIG:-/dev/null}
 
 readonly REMOTE_TARGET=$REMOTE_USER@$REMOTE_HOST
 readonly -a REMOTE_SSH=(
 	ssh
+	-F "$SSH_CONFIG"
 	-p "$REMOTE_PORT"
 	-o BatchMode=yes
 	-o ConnectTimeout=10
@@ -46,7 +48,7 @@ guest_exec()
 
 	printf -v guest_command '%q ' "$@"
 	printf -v host_command '%q ' \
-		ssh -i "$GUEST_KEY" -p "$GUEST_PORT" \
+		ssh -F /dev/null -i "$GUEST_KEY" -p "$GUEST_PORT" \
 		-o BatchMode=yes -o ConnectTimeout=10 \
 		-o StrictHostKeyChecking=no \
 		-o UserKnownHostsFile=/dev/null \

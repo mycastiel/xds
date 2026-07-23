@@ -52,9 +52,10 @@ static int expect(const char *operation, int actual, int expected)
 
 static int submit_read(int dev_fd, const char *source,
 		       struct p2p_iov *iov, unsigned int iov_nr,
-		       unsigned long flags, uint64_t mem_handle)
+		       unsigned int flags, uint64_t mem_handle)
 {
-	struct read_parameter param = {
+	struct io_parameter param = {
+		.op = P2P_IO_READ,
 		.file_name = source,
 		.file_offset = 0,
 		.iov = iov,
@@ -63,7 +64,7 @@ static int submit_read(int dev_fd, const char *source,
 		.mem_handle = mem_handle,
 	};
 
-	return read_file(dev_fd, &param);
+	return rw_file(dev_fd, &param);
 }
 
 static void *race_submit(void *argument)

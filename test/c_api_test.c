@@ -44,7 +44,7 @@ struct worker {
 	struct start_gate *gate;
 	struct test_case *test;
 	uint64_t mem_handle;
-	unsigned long flags;
+	unsigned int flags;
 	int dev_fd;
 };
 
@@ -89,7 +89,7 @@ struct stress_context {
 	unsigned long granularity;
 	unsigned long backing_page_size;
 	uint64_t mem_handle;
-	unsigned long flags;
+	unsigned int flags;
 	int registration_fd;
 	int error;
 };
@@ -410,13 +410,14 @@ static int load_stress_manifest(const char *path,
 }
 
 static int submit_case(int dev_fd, struct test_case *test,
-		       unsigned long flags, uint64_t mem_handle)
+		       unsigned int flags, uint64_t mem_handle)
 {
 	struct p2p_iov iov = {
 		.addr = test->cmb_va,
 		.size = test->length,
 	};
-	struct read_parameter param = {
+	struct io_parameter param = {
+		.op = P2P_IO_READ,
 		.file_name = test->path,
 		.file_offset = test->file_offset,
 		.iov = &iov,
@@ -425,7 +426,7 @@ static int submit_case(int dev_fd, struct test_case *test,
 		.flags = flags,
 	};
 
-	test->result = read_file(dev_fd, &param);
+	test->result = rw_file(dev_fd, &param);
 	printf("api=c case=%s ret=%d expected=%d\n", test->id, test->result,
 	       test->expected);
 	return test->result == test->expected ? 0 : -EINVAL;
@@ -446,7 +447,7 @@ static void *thread_worker(void *argument)
 }
 
 static int run_single(int dev_fd, struct test_case *tests, size_t count,
-		      unsigned long flags, uint64_t mem_handle)
+		      unsigned int flags, uint64_t mem_handle)
 {
 	size_t i;
 	int err;
@@ -468,7 +469,7 @@ static int run_single(int dev_fd, struct test_case *tests, size_t count,
 }
 
 static int run_queued(int dev_fd, struct test_case *tests, size_t count,
-		      unsigned long flags, uint64_t mem_handle)
+		      unsigned int flags, uint64_t mem_handle)
 {
 	size_t i;
 	int err;
@@ -487,7 +488,7 @@ static int run_queued(int dev_fd, struct test_case *tests, size_t count,
 }
 
 static int run_threaded(int dev_fd, struct test_case *tests, size_t count,
-			unsigned long flags, uint64_t mem_handle)
+			unsigned int flags, uint64_t mem_handle)
 {
 	struct start_gate gate = {
 		.lock = PTHREAD_MUTEX_INITIALIZER,
@@ -724,13 +725,14 @@ static int validate_stress_round(struct stress_context *context,
 }
 
 static int submit_stress_case(int dev_fd, struct stress_case *test,
-			      unsigned long flags, uint64_t mem_handle)
+			      unsigned int flags, uint64_t mem_handle)
 {
 	struct p2p_iov iov = {
 		.addr = test->cmb_va,
 		.size = test->length,
 	};
-	struct read_parameter param = {
+	struct io_parameter param = {
+		.op = P2P_IO_READ,
 		.file_name = test->path,
 		.file_offset = test->file_offset,
 		.iov = &iov,
@@ -740,7 +742,7 @@ static int submit_stress_case(int dev_fd, struct stress_case *test,
 	};
 	int err;
 
-	test->result = read_file(dev_fd, &param);
+	test->result = rw_file(dev_fd, &param);
 	printf("api=c case=%s va=0x%lx ret=%d expected=0\n", test->id,
 	       test->cmb_va, test->result);
 	if (test->result)

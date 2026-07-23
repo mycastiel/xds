@@ -181,6 +181,126 @@ run_mem_registration_case()
 		die "$label used $((put_after - put_before)) PA-list puts, expected $expected_calls"
 }
 
+run_write_pipeline()
+{
+	local target=$1 label=$2 phase_seed=$3 topology_boundary=$4 api=$5
+	local registered_mem=${6:-}
+	local source_offset=$((8 * 1024 * 1024))
+	local length=$((2 * 1024 * 1024 + 4096))
+	local target_offset=$((16 * 1024 * 1024))
+	local cmb_va expected_crc direct_output suffix
+	local mixed_output mixed_log read_output read_log write_output write_log
+	local -a actual_crc base_command command
+
+	if (( topology_boundary )); then
+		target_offset=$((topology_boundary - 4096))
+	fi
+	if [[ $api == c ]]; then
+		cmb_va=$((96 * 1024 * 1024 - 512))
+	else
+		cmb_va=$((112 * 1024 * 1024 - 512))
+	fi
+	suffix=$api
+	if [[ -n $registered_mem ]]; then
+		suffix=$suffix-registered
+	fi
+
+	log "$label: $api XDS read to HBM, then XDS write and O_DIRECT read-back"
+	direct_output=$(
+		"$SCRIPT_DIR/direct_io_test" --mode prepare --device "$target" \
+			--source-offset "$source_offset" \
+			--target-offset "$target_offset" --length "$length" \
+			--seed "$phase_seed"
+	)
+	expected_crc=${direct_output#expected_crc32=}
+	[[ $expected_crc =~ ^0x[0-9a-f]{8}$ ]] ||
+		die "$label $api could not obtain the expected CRC32"
+
+	if [[ $api == c ]]; then
+		base_command=("$SCRIPT_DIR/rw_api_test")
+	else
+		base_command=(env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
+			"$SCRIPT_DIR/python_rw_api_test.py")
+	fi
+	base_command+=(--topology "$target" --target "$target" \
+		--cmb-va "$cmb_va" --length "$length")
+	if [[ -n $registered_mem ]]; then
+		base_command+=(--registered-mem)
+	fi
+
+	read_output="$WORK_DIR/$label.$suffix.rw-read.out"
+	read_log="$WORK_DIR/$label.$suffix.rw-read.dmesg"
+	command=("${base_command[@]}" --offset "$source_offset" --op read)
+	: >/sys/kernel/debug/p2p_device/summary
+	dmesg -C
+	"${command[@]}" >"$read_output" 2>&1 || {
+		dmesg -c >"$read_log"
+		cat "$read_output" >&2
+		cat "$read_log" >&2
+		die "$label $api HBM population failed"
+	}
+	dmesg -c >"$read_log"
+	cat "$read_output"
+	mapfile -t actual_crc < <(
+		sed -n 's/.*p2p: crc32 .*crc32=\(0x[0-9a-fA-F]\{8\}\).*/\1/p' \
+			"$read_log"
+	)
+	[[ ${#actual_crc[@]} -eq 1 && ${actual_crc[0],,} == "$expected_crc" ]] ||
+		die "$label $api HBM CRC32 mismatch: expected $expected_crc, got ${actual_crc[*]:-none}"
+	check_stats
+
+	write_output="$WORK_DIR/$label.$suffix.rw-write.out"
+	write_log="$WORK_DIR/$label.$suffix.rw-write.dmesg"
+	command=("${base_command[@]}" --offset "$target_offset" --op write)
+	: >/sys/kernel/debug/p2p_device/summary
+	dmesg -C
+	"${command[@]}" >"$write_output" 2>&1 || {
+		dmesg -c >"$write_log"
+		cat "$write_output" >&2
+		cat "$write_log" >&2
+		die "$label $api XDS write failed"
+	}
+	dmesg -c >"$write_log"
+	cat "$write_output"
+	if grep -Eq 'p2p: crc32 |PA 0x[0-9a-fA-F]+ content:' "$write_log"; then
+		cat "$write_log" >&2
+		die "$label $api write emitted read-only diagnostics"
+	fi
+	check_stats
+
+	"$SCRIPT_DIR/direct_io_test" --mode verify --device "$target" \
+		--source-offset "$source_offset" --target-offset "$target_offset" \
+		--length "$length" --seed "$phase_seed"
+
+	"$SCRIPT_DIR/direct_io_test" --mode prepare --device "$target" \
+		--source-offset "$source_offset" --target-offset "$target_offset" \
+		--length "$length" --seed "$phase_seed" >/dev/null
+	mixed_output="$WORK_DIR/$label.$suffix.rw-mixed.out"
+	mixed_log="$WORK_DIR/$label.$suffix.rw-mixed.dmesg"
+	command=("${base_command[@]}" --offset "$target_offset" \
+		--source-offset "$source_offset" --op mixed)
+	: >/sys/kernel/debug/p2p_device/summary
+	dmesg -C
+	"${command[@]}" >"$mixed_output" 2>&1 || {
+		dmesg -c >"$mixed_log"
+		cat "$mixed_output" >&2
+		cat "$mixed_log" >&2
+		die "$label $api mixed drain failed"
+	}
+	dmesg -c >"$mixed_log"
+	cat "$mixed_output"
+	mapfile -t actual_crc < <(
+		sed -n 's/.*p2p: crc32 .*crc32=\(0x[0-9a-fA-F]\{8\}\).*/\1/p' \
+			"$mixed_log"
+	)
+	[[ ${#actual_crc[@]} -eq 1 && ${actual_crc[0],,} == "$expected_crc" ]] ||
+		die "$label $api mixed read CRC32 mismatch: expected $expected_crc, got ${actual_crc[*]:-none}"
+	check_stats
+	"$SCRIPT_DIR/direct_io_test" --mode verify --device "$target" \
+		--source-offset "$source_offset" --target-offset "$target_offset" \
+		--length "$length" --seed "$phase_seed"
+}
+
 run_block_matrix()
 {
 	local target=$1 label=$2 phase_seed=$3 topology_boundary=${4:-0}
@@ -194,6 +314,8 @@ run_block_matrix()
 		manifest=$(make_block_manifest "$api" "$target" "$size" "$label" \
 			"$topology_boundary")
 		run_manifest "$api" "$target" single "$manifest" "$label"
+		run_write_pipeline "$target" "$label" "$((phase_seed + 100))" \
+			"$topology_boundary" "$api"
 	done
 }
 
@@ -245,6 +367,15 @@ test_direct_nvme()
 	wipe_test_devices
 	next_seed
 	run_block_matrix "$DEV1" direct-nsid-1 "$SEED"
+	log "Unified read/write API rejection coverage"
+	"$SCRIPT_DIR/uapi_rw_test" --target "$DEV1"
+	env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
+		"$SCRIPT_DIR/python_rw_rejection_test.py" \
+		--regular-file "$WORK_DIR/python-regular-write.dat"
+	for api in c python; do
+		run_write_pipeline "$DEV1" direct-nsid-1-registered \
+			"$((SEED + 200))" 0 "$api" registered
+	done
 	log "Registered-memory API and lifetime"
 	run_mem_registration_case c 5 \
 		"$SCRIPT_DIR/mem_registration_test" --topology "$DEV1"

@@ -21,7 +21,9 @@ def require(operation: str, actual: int, expected: int = 0) -> None:
 
 
 def registered_read(dev_fd: int, source: str, handle: int, iovs: object) -> int:
-    return file_p2p.read_file(dev_fd, source, 0, iovs, handle, REGISTERED)
+    return file_p2p.rw_file(
+        dev_fd, file_p2p.P2P_IO_READ, source, 0, iovs, handle, REGISTERED
+    )
 
 
 def main() -> int:
@@ -53,8 +55,14 @@ def main() -> int:
         )
         require(
             "unknown flags",
-            file_p2p.read_file(
-                dev_fd, args.topology, 0, [(REG_ADDR, 512)], handle, 1 << 1
+            file_p2p.rw_file(
+                dev_fd,
+                file_p2p.P2P_IO_READ,
+                args.topology,
+                0,
+                [(REG_ADDR, 512)],
+                handle,
+                1 << 1,
             ),
             -errno.EOPNOTSUPP,
         )
