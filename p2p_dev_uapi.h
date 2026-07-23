@@ -9,13 +9,17 @@ struct p2p_iov {
 	unsigned long size;
 };
 
-#define P2P_IO_F_REGISTERED_MEM (1UL << 0)
+#define P2P_IO_F_REGISTERED_MEM (1U << 0)
 #define P2P_IO_F_MASK P2P_IO_F_REGISTERED_MEM
 
-struct p2p_read_param {
+#define P2P_IO_READ 0U
+#define P2P_IO_WRITE 1U
+
+struct p2p_io_param {
+	unsigned int op;
+	unsigned int flags;
 	int file_fd;
 	int host_pid;
-	unsigned long flags;
 	__u64 mem_handle;
 	struct p2p_iov *iov;
 	unsigned int iov_nr;
@@ -61,10 +65,10 @@ struct topo_user_cfg {
 };
 
 #define IOCTL_ADD_TOPO _IOW('k', 1, struct topo_user_cfg)
-#define IOCTL_READ_FILE _IOWR('k', 2, struct p2p_read_param)
+#define IOCTL_RW_FILE _IOWR('k', 2, struct p2p_io_param)
 /*
- * Drain snapshots I/O contexts already published by read ioctls. A read or
- * another drain that overlaps this ioctl need not be covered by its wait.
+ * Drain snapshots I/O contexts already published by read/write ioctls. An I/O
+ * or another drain that overlaps this ioctl need not be covered by its wait.
  */
 #define IOCTL_DRAIN_IO _IOC(_IOC_READ, 'k', 3, 0)
 #define IOCTL_REGISTER_MEM _IOWR('k', 4, struct p2p_mem_register_param)

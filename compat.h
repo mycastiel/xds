@@ -21,8 +21,8 @@ typedef struct block_device p2p_bdev_handle;
 
 #define P2P_BDEV_READ_MODE FMODE_READ
 
-static inline struct request *
-p2p_alloc_nvme_read_request(struct request_queue *queue, struct nvme_command *cmd)
+static inline struct request *p2p_alloc_nvme_request(struct request_queue *queue,
+						     struct nvme_command *cmd)
 {
 	struct nvme_command *owned_cmd;
 	struct request *req;
@@ -37,11 +37,11 @@ p2p_alloc_nvme_read_request(struct request_queue *queue, struct nvme_command *cm
 	return req;
 }
 
-static inline void p2p_end_read_io(struct request *req, blk_status_t status)
+static inline void p2p_end_io(struct request *req, blk_status_t status)
 {
 	struct nvme_command *cmd = nvme_req(req)->cmd;
 
-	p2p_complete_read_io(req, status);
+	p2p_complete_io(req, status);
 	kfree(cmd);
 	blk_mq_free_request(req);
 }
@@ -87,21 +87,20 @@ typedef struct bdev_handle p2p_bdev_handle;
 
 #define P2P_BDEV_READ_MODE BLK_OPEN_READ
 
-static inline struct request *
-p2p_alloc_nvme_read_request(struct request_queue *queue, struct nvme_command *cmd)
+static inline struct request *p2p_alloc_nvme_request(struct request_queue *queue,
+						     struct nvme_command *cmd)
 {
 	struct request *req;
 
-	req = blk_mq_alloc_request(queue, REQ_OP_DRV_IN, 0);
+	req = blk_mq_alloc_request(queue, nvme_req_op(cmd), 0);
 	if (!IS_ERR(req))
 		nvme_init_request(req, cmd);
 	return req;
 }
 
-static inline enum rq_end_io_ret
-p2p_end_read_io(struct request *req, blk_status_t status)
+static inline enum rq_end_io_ret p2p_end_io(struct request *req, blk_status_t status)
 {
-	p2p_complete_read_io(req, status);
+	p2p_complete_io(req, status);
 
 	return RQ_END_IO_FREE;
 }

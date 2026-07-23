@@ -6,6 +6,6 @@
 
 struct request;
 
-void p2p_complete_read_io(struct request *req, blk_status_t status);
+void p2p_complete_io(struct request *req, blk_status_t status);
 
 #endif
