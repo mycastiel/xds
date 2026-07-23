@@ -275,6 +275,56 @@ crc_self_test()
 	[[ $vector_crc == 0xcbf43926 ]] || die "123456789 CRC32 vector failed"
 }
 
+save_kernel_identity()
+{
+	local info="$WORK_DIR/kernel.info"
+	local kernel_variant=${XDS_KERNEL_VARIANT:-}
+	local kernel_version kasan_config kasan_dmesg
+
+	kernel_version=$(uname -r)
+	if [[ -n $kernel_variant ]]; then
+		case $kernel_variant in
+			kasan | nokasan) ;;
+			*) die "XDS_KERNEL_VARIANT must be kasan or nokasan" ;;
+		esac
+	elif [[ $kernel_version == *xds-kasan ]]; then
+		kernel_variant=kasan
+	elif [[ $kernel_version == *xds-nokasan ]]; then
+		kernel_variant=nokasan
+	fi
+	kasan_dmesg=$(
+		dmesg 2>/dev/null |
+			grep -i 'KernelAddressSanitizer initialized' || true
+	)
+
+	{
+		printf 'UNAME=%s\n' "$(uname -a)"
+		printf 'VERSION=%s\n' "$kernel_version"
+		if [[ -n $kernel_variant ]]; then
+			printf 'VARIANT=%s\n' "$kernel_variant"
+		fi
+		printf 'CMDLINE=%s\n' "$(tr '\n' ' ' </proc/cmdline)"
+		if [[ -n $kasan_dmesg ]]; then
+			printf 'KASAN_ENABLED=true\n'
+			printf 'KASAN_MODE=generic\n'
+		else
+			printf 'KASAN_ENABLED=false\n'
+			printf 'KASAN_MODE=none\n'
+		fi
+		if [[ -n ${KSRC:-} && -f $KSRC/.config ]]; then
+			kasan_config=$(
+				grep -E '^#?[[:space:]]*CONFIG_KASAN=' \
+					"$KSRC/.config" || true
+			)
+			if [[ -n $kasan_config ]]; then
+				printf 'KASAN_CONFIG=%s\n' "$kasan_config"
+			else
+				printf 'KASAN_CONFIG=# CONFIG_KASAN is not set\n'
+			fi
+		fi
+	} >"$info"
+}
+
 load_modules()
 {
 	log "Loading CMB stub at PA 0x$(printf '%x' "$BAR2_START")"
@@ -363,7 +413,8 @@ run_manifest()
 		die "$label $api $mode runner failed"
 	fi
 	python3 "$SCRIPT_DIR/check_crc.py" --manifest "$manifest" \
-		--log "$kernel_log" --crc-tool "$SCRIPT_DIR/crc32_verify"
+		--log "$kernel_log" --crc-tool "$SCRIPT_DIR/crc32_verify" \
+		>>"$output"
 	check_stats
 }
 

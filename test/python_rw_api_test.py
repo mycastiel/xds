@@ -101,7 +101,7 @@ def main() -> int:
             file_p2p.unregister_mem(dev_fd, handle)
         file_p2p.close_p2p_fd(dev_fd)
 
-    print(f"api=python op={args.op} length=0x{args.length:x} pass")
+    print(f"api=python case={args.op} ret=0 expected=0")
     return 0
 
 

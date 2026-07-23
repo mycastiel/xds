@@ -215,9 +215,9 @@ out:
 			op == P2P_IO_WRITE ? "write" : "read",
 			strerror(-err), err);
 	else
-		printf("api=c op=%s length=0x%lx pass\n",
+		printf("api=c case=%s ret=0 expected=0\n",
 		       op == TEST_OP_MIXED ? "mixed" :
-		       op == P2P_IO_WRITE ? "write" : "read", length);
+		       op == P2P_IO_WRITE ? "write" : "read");
 	return err ? EXIT_FAILURE : EXIT_SUCCESS;
 
 invalid:

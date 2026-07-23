@@ -11,7 +11,10 @@ import file_p2p
 def require(name: str, actual: int, expected: int) -> None:
     if actual != expected:
         raise RuntimeError(f"{name} returned {actual}, expected {expected}")
-    print(f"python-reject-pass case={name} errno={-expected}")
+    print(
+        f"api=python case={name} ret={actual} expected={expected}",
+        flush=True,
+    )
 
 
 def main() -> int:

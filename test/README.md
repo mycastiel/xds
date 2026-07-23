@@ -165,6 +165,49 @@ The common `XDS_TEST_WORKDIR`,
 `XDS_TEST_KEEP_WORKDIR`, `XDS_TEST_BUILD_JOBS`, and `KSRC` controls apply to
 both entry points. Shared prepared-VM and storage helpers live in `common.sh`.
 
+## Running the complete matrix inside the VM
+
+`run_all_tests_in_vm.sh` runs the basic suite and the RAID0, dm-linear, and
+direct-NVMe stress suites without SSH or rebooting the VM. Run it once after
+logging into each kernel. Select the report variant explicitly; it is not
+inferred from `uname -r`. Use a persistent result root so it remains available
+after switching kernels:
+
+```sh
+XDS_KERNEL_VARIANT=kasan \
+XDS_RESULT_ROOT=$HOME/xds-mem-reg-results \
+KSRC=/home/xds/oe_knl \
+./test/run_all_tests_in_vm.sh
+```
+
+After booting and logging into the non-KASAN VM or kernel, use the same result
+root:
+
+```sh
+XDS_KERNEL_VARIANT=nokasan \
+XDS_RESULT_ROOT=$HOME/xds-mem-reg-results \
+KSRC=/home/xds/oe_knl \
+./test/run_all_tests_in_vm.sh
+```
+
+The runner defaults to `/dev/nvme0n1` and `/dev/nvme0n2`; override them with
+`XDS_DEV_1` and `XDS_DEV_2`. Each variant directory must be empty before its
+run, which prevents results from different runs being mixed. Raw work
+directories and suite logs are kept with the copied report inputs.
+
+When both `kasan/` and `nokasan/` are present, generate the detailed Markdown
+report directly in either VM:
+
+```sh
+XDS_RESULT_ROOT=$HOME/xds-mem-reg-results \
+./test/gen_report_in_vm.sh
+```
+
+The default output is `report.md` under `XDS_RESULT_ROOT`. Set
+`XDS_REPORT_PATH` to choose another Markdown output path. If the two variants
+were run in separate VMs without shared storage, copy the complete `kasan/`
+and `nokasan/` directories under one result root before generating the report.
+
 ## Remote test runner
 
 The remote VM helper scripts read machine-specific settings from an ignored
@@ -188,3 +231,45 @@ configuration is sourced as shell syntax, so it must be trusted. SSH
 authentication uses the local SSH agent or SSH configuration for the remote
 host and the configured key file for the guest; passwords should not be stored
 in the configuration file.
+
+## Dual-kernel matrix and detailed report
+
+`run_dual_kernel_matrix.sh` runs `basic_test.sh` plus all three stress
+topologies under exact non-KASAN and KASAN kernel versions. The stress runs
+always use 16 iterations. Before building the XDS modules, the runner restores
+the running kernel config from `/proc/config.gz`, with
+`/boot/config-$(uname -r)` as a fallback, and verifies the resulting module
+vermagic. It also reloads NVMe with `use_cmb_sqes=0`.
+
+Build and install both guest kernels when needed:
+
+```sh
+./test/build_guest_kernels.sh
+```
+
+Then run the complete matrix:
+
+```sh
+./test/run_dual_kernel_matrix.sh
+```
+
+Set `XDS_MATRIX_BUILD_KERNELS=1` to build the kernels at the beginning of the
+matrix command. `XDS_KERNEL_BASE_VERSION` defaults to `6.6.0`. Set
+`XDS_RESULT_DIR` to choose the local artifact directory.
+
+Artifacts remain separated under `nokasan/` and `kasan/`. The runner produces
+three combined reports:
+
+- `report.json` contains the kernel and suite hierarchy plus every case.
+- `report.md` contains a human-readable table for every case.
+- `cases.tsv` contains one row per case with kernel, API, memory mode, I/O
+  mode, return result, and CRC result.
+
+Report generation rejects a missing kernel, empty or failed suites, kernel-log
+issues, mismatched case sets between kernels, incomplete stress iterations,
+and stress cases without CRC verification. Its focused local checks are:
+
+```sh
+python3 ./test/report_test.py
+bash ./test/run_dual_kernel_matrix_test.sh
+```

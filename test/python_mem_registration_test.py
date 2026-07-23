@@ -16,6 +16,10 @@ REGISTERED = file_p2p.P2P_IO_F_REGISTERED_MEM
 
 
 def require(operation: str, actual: int, expected: int = 0) -> None:
+    print(
+        f"api=python case={operation} ret={actual} expected={expected}",
+        flush=True,
+    )
     if actual != expected:
         raise RuntimeError(f"{operation} returned {actual}, expected {expected}")
 
@@ -47,7 +51,15 @@ def main() -> int:
             raise RuntimeError(f"register_mem returned {handle}")
 
         if file_p2p.register_mem(dev_fd, REG_ADDR, 0) is not None:
+            print(
+                "api=python case=register zero size ret=0 expected=-22",
+                flush=True,
+            )
             raise RuntimeError("zero-size registration succeeded")
+        print(
+            "api=python case=register zero size ret=-22 expected=-22",
+            flush=True,
+        )
         require(
             "zero handle",
             registered_read(dev_fd, args.topology, 0, [(REG_ADDR, 512)]),

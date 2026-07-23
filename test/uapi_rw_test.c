@@ -16,7 +16,8 @@
 static int expect(const char *name, int actual, int expected)
 {
 	if (actual == expected) {
-		printf("uapi-reject-pass case=%s errno=%d\n", name, -expected);
+		printf("api=c case=%s ret=%d expected=%d\n",
+		       name, actual, expected);
 		return 0;
 	}
 	fprintf(stderr, "%s returned %d, expected %d\n", name, actual,

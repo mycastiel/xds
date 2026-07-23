@@ -104,18 +104,24 @@ run_stress_api()
 		get_after=$(<"$get_param")
 		put_after=$(<"$put_param")
 		(( get_after - get_before == 1 )) ||
-			die "$api registered stress used $((get_after - get_before)) PA-list gets"
+			die "$api registered stress used \
+$((get_after - get_before)) PA-list gets"
 		(( put_after - put_before == 1 )) ||
-			die "$api registered stress used $((put_after - put_before)) PA-list puts"
+			die "$api registered stress used \
+$((put_after - put_before)) PA-list puts"
 	fi
 
 	python3 "$SCRIPT_DIR/check_stress.py" --workload "$workload" \
 		--result "$result" --workers "$STRESS_WORKERS" \
-		--iterations "$STRESS_ITERATIONS" --cmb-size "$CMB_SIZE" \
+		--iterations "$STRESS_ITERATIONS" \
+		--cmb-size "$CMB_SIZE" \
 		--granularity "$VA_GRANULARITY" \
-		--backing-page-size "$BACKING_PAGE_SIZE"
+		--backing-page-size "$BACKING_PAGE_SIZE" |
+		tee -a "$output"
 	python3 "$SCRIPT_DIR/check_crc.py" --manifest "$result" \
-		--log "$kernel_log" --crc-tool "$SCRIPT_DIR/crc32_verify"
+		--log "$kernel_log" \
+		--crc-tool "$SCRIPT_DIR/crc32_verify" |
+		tee -a "$output"
 	check_stats
 }
 
@@ -135,6 +141,7 @@ main()
 	preflight
 	build_all
 	crc_self_test
+	save_kernel_identity
 	load_modules
 	prepare_topology
 

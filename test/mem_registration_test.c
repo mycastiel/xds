@@ -43,6 +43,7 @@ struct unregister_worker {
 
 static int expect(const char *operation, int actual, int expected)
 {
+	printf("api=c case=%s ret=%d expected=%d\n", operation, actual, expected);
 	if (actual == expected)
 		return 0;
 	fprintf(stderr, "%s returned %d, expected %d\n", operation, actual,
@@ -487,31 +488,37 @@ int main(int argc, char **argv)
 		err = dev_fd < 0 ? dev_fd : other_fd;
 		goto out;
 	}
-	err = add_topo(dev_fd, topology);
+	err = expect("add topology owner", add_topo(dev_fd, topology), 0);
 	if (err)
 		goto out;
-	err = add_topo(other_fd, topology);
+	err = expect("add topology io", add_topo(other_fd, topology), 0);
 	if (err)
 		goto out;
-	err = register_range(dev_fd, &handle);
+	err = expect("register primary", register_range(dev_fd, &handle), 0);
 	if (err)
 		goto out;
 	err = test_validation(dev_fd, other_fd, topology, handle);
 	if (err)
 		goto unregister;
-	err = test_multiple_registered_mem(dev_fd, other_fd, topology, handle);
+	err = expect("multiple registered memories",
+		     test_multiple_registered_mem(dev_fd, other_fd, topology,
+						  handle), 0);
 	if (err)
 		goto unregister;
-	err = test_process_scope(dev_fd, topology, handle);
+	err = expect("process scope", test_process_scope(dev_fd, topology, handle),
+		     0);
 	if (err)
 		goto unregister;
-	err = test_normal_handle_ignored(dev_fd, topology);
+	err = expect("normal handle ignored",
+		     test_normal_handle_ignored(dev_fd, topology), 0);
 	if (err)
 		goto unregister;
-	err = test_registered_io(dev_fd, topology, handle);
+	err = expect("registered io and unregister",
+		     test_registered_io(dev_fd, topology, handle), 0);
 	if (err)
 		goto out;
-	err = test_handle_sequence(dev_fd, topology, handle);
+	err = expect("handle sequence",
+		     test_handle_sequence(dev_fd, topology, handle), 0);
 	if (err)
 		goto out;
 
@@ -520,7 +527,8 @@ int main(int argc, char **argv)
 		err = close_fd;
 		goto out;
 	}
-	err = register_range(close_fd, &close_handle);
+	err = expect("register close cleanup",
+		     register_range(close_fd, &close_handle), 0);
 	if (err)
 		goto out;
 	close_p2p_fd(close_fd);

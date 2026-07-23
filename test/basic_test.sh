@@ -175,10 +175,61 @@ run_mem_registration_case()
 	"$@"
 	get_after=$(<"$get_param")
 	put_after=$(<"$put_param")
-	(( get_after - get_before == expected_calls )) ||
-		die "$label used $((get_after - get_before)) PA-list gets, expected $expected_calls"
-	(( put_after - put_before == expected_calls )) ||
-		die "$label used $((put_after - put_before)) PA-list puts, expected $expected_calls"
+	if (( get_after - get_before != expected_calls )); then
+		printf '%s used %d PA-list gets, expected %d\n' \
+			"$label" "$((get_after - get_before))" "$expected_calls" >&2
+		return 1
+	fi
+	if (( put_after - put_before != expected_calls )); then
+		printf '%s used %d PA-list puts, expected %d\n' \
+			"$label" "$((put_after - put_before))" "$expected_calls" >&2
+		return 1
+	fi
+}
+
+run_logged_mem_registration_case()
+{
+	local api=$1 expected_calls=$2
+	local label="mem-registration.$api.registered"
+	local output="$WORK_DIR/$label.out"
+	local kernel_log="$WORK_DIR/$label.dmesg"
+	local status
+
+	shift 2
+	dmesg -C
+	set +e
+	run_mem_registration_case "$api registration" "$expected_calls" \
+		"$@" >"$output" 2>&1
+	status=$?
+	set -e
+	dmesg -c >"$kernel_log"
+	cat "$output"
+	if (( status != 0 )); then
+		cat "$kernel_log" >&2
+		die "$api memory registration tests failed"
+	fi
+}
+
+run_logged_write_rejection_case()
+{
+	local api=$1
+	local label="rw-rejection.$api.rejection"
+	local output="$WORK_DIR/$label.out"
+	local kernel_log="$WORK_DIR/$label.dmesg"
+	local status
+
+	shift
+	dmesg -C
+	set +e
+	"$@" >"$output" 2>&1
+	status=$?
+	set -e
+	dmesg -c >"$kernel_log"
+	cat "$output"
+	if (( status != 0 )); then
+		cat "$kernel_log" >&2
+		die "$api unified read/write rejection tests failed"
+	fi
 }
 
 run_write_pipeline()
@@ -247,6 +298,8 @@ run_write_pipeline()
 	)
 	[[ ${#actual_crc[@]} -eq 1 && ${actual_crc[0],,} == "$expected_crc" ]] ||
 		die "$label $api HBM CRC32 mismatch: expected $expected_crc, got ${actual_crc[*]:-none}"
+	printf 'crc-pass case=read crc32=%s\n' "${actual_crc[0],,}" \
+		>>"$read_output"
 	check_stats
 
 	write_output="$WORK_DIR/$label.$suffix.rw-write.out"
@@ -295,6 +348,8 @@ run_write_pipeline()
 	)
 	[[ ${#actual_crc[@]} -eq 1 && ${actual_crc[0],,} == "$expected_crc" ]] ||
 		die "$label $api mixed read CRC32 mismatch: expected $expected_crc, got ${actual_crc[*]:-none}"
+	printf 'crc-pass case=mixed crc32=%s\n' "${actual_crc[0],,}" \
+		>>"$mixed_output"
 	check_stats
 	"$SCRIPT_DIR/direct_io_test" --mode verify --device "$target" \
 		--source-offset "$source_offset" --target-offset "$target_offset" \
@@ -368,8 +423,10 @@ test_direct_nvme()
 	next_seed
 	run_block_matrix "$DEV1" direct-nsid-1 "$SEED"
 	log "Unified read/write API rejection coverage"
-	"$SCRIPT_DIR/uapi_rw_test" --target "$DEV1"
-	env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
+	run_logged_write_rejection_case c \
+		"$SCRIPT_DIR/uapi_rw_test" --target "$DEV1"
+	run_logged_write_rejection_case python env \
+		"PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
 		"$SCRIPT_DIR/python_rw_rejection_test.py" \
 		--regular-file "$WORK_DIR/python-regular-write.dat"
 	for api in c python; do
@@ -377,9 +434,9 @@ test_direct_nvme()
 			"$((SEED + 200))" 0 "$api" registered
 	done
 	log "Registered-memory API and lifetime"
-	run_mem_registration_case c 5 \
+	run_logged_mem_registration_case c 5 \
 		"$SCRIPT_DIR/mem_registration_test" --topology "$DEV1"
-	run_mem_registration_case python 3 env \
+	run_logged_mem_registration_case python 3 env \
 		"PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
 		"$SCRIPT_DIR/python_mem_registration_test.py" --topology "$DEV1"
 	log "Registered-memory CRC32"
@@ -485,6 +542,7 @@ main()
 	preflight
 	build_all
 	crc_self_test
+	save_kernel_identity
 	load_modules
 	test_direct_nvme
 	test_nvme_partition
