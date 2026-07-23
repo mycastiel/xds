@@ -785,11 +785,9 @@ static int trim_fiemap_extents(struct fiemap_extent *extents,
 	return 0;
 }
 
-static int prepare_read_extents(int file_fd, const struct stat *file_stat,
-				unsigned long offset, unsigned long size,
-				struct fiemap **exts_out,
-				unsigned int *ext_num_out,
-				unsigned long long *total_size_out)
+static int prepare_io_extents(int file_fd, const struct stat *file_stat, unsigned long offset,
+			      unsigned long size, struct fiemap **exts_out,
+			      unsigned int *ext_num_out, unsigned long long *total_size_out)
 {
 	struct fiemap *exts;
 	unsigned int block_size;
@@ -878,12 +876,12 @@ static int get_iov_size(const struct p2p_iov *iov, unsigned int iov_nr,
 	return 0;
 }
 
-int read_file(int dev_fd, const struct read_parameter *param)
+int rw_file(int dev_fd, const struct io_parameter *param)
 {
-	struct p2p_read_param *read;
+	struct p2p_io_param *io;
 	struct fiemap *exts = NULL;
 	struct stat file_stat;
-	unsigned long read_size;
+	unsigned long io_size;
 	unsigned long long total_size = 0;
 	size_t request_size;
 	unsigned int ext_num = 0;
@@ -893,19 +891,21 @@ int read_file(int dev_fd, const struct read_parameter *param)
 
 	if (!param)
 		return -EINVAL;
+	if (param->op != P2P_IO_READ && param->op != P2P_IO_WRITE)
+		return -EINVAL;
 	if (param->flags & ~P2P_IO_F_MASK)
 		return -EOPNOTSUPP;
 	if ((param->flags & P2P_IO_F_REGISTERED_MEM) && !param->mem_handle)
 		return -EINVAL;
 
-	err = get_iov_size(param->iov, param->iov_nr, &read_size);
+	err = get_iov_size(param->iov, param->iov_nr, &io_size);
 	if (err)
 		return err;
-	if (ULONG_MAX - param->file_offset < read_size)
+	if (ULONG_MAX - param->file_offset < io_size)
 		return -EOVERFLOW;
 
 	name = param->file_name;
-	file_fd = open(name, O_RDONLY | O_CLOEXEC);
+	file_fd = open(name, (param->op == P2P_IO_WRITE ? O_WRONLY : O_RDONLY) | O_CLOEXEC);
 	if (file_fd < 0) {
 		err = -errno;
 		fprintf(stderr, "open %s failed, errno: %d\n", name, err);
@@ -919,52 +919,56 @@ int read_file(int dev_fd, const struct read_parameter *param)
 		goto close_fds_out;
 	}
 
-	err = prepare_read_extents(file_fd, &file_stat, param->file_offset,
-				   read_size, &exts, &ext_num, &total_size);
+	if (param->op == P2P_IO_WRITE && !S_ISBLK(file_stat.st_mode)) {
+		err = S_ISREG(file_stat.st_mode) ? -EOPNOTSUPP : -EINVAL;
+		goto close_fds_out;
+	}
+
+	err = prepare_io_extents(file_fd, &file_stat, param->file_offset, io_size, &exts, &ext_num,
+				 &total_size);
 	if (err) {
 		fprintf(stderr, "prepare extents failed, errno: %d\n", err);
 		goto close_fds_out;
 	}
 
-	if (!ext_num || total_size < read_size) {
+	if (!ext_num || total_size < io_size) {
 		err = -ENODATA;
-		fprintf(stderr, "extent size %llu < IOV size %lu\n", total_size,
-			read_size);
+		fprintf(stderr, "extent size %llu < IOV size %lu\n", total_size, io_size);
 		goto free_ext_out;
 	}
 
-	if (__builtin_mul_overflow((size_t)ext_num,
-				   sizeof(read->extents[0]), &request_size) ||
-	    __builtin_add_overflow(request_size, sizeof(*read),
-				   &request_size)) {
+	if (__builtin_mul_overflow((size_t)ext_num, sizeof(io->extents[0]), &request_size) ||
+	    __builtin_add_overflow(request_size, sizeof(*io), &request_size)) {
 		err = -E2BIG;
 		goto free_ext_out;
 	}
-	read = malloc(request_size);
-	if (read == NULL) {
+	io = calloc(1, request_size);
+	if (io == NULL) {
 		err = -ENOMEM;
-		fprintf(stderr, "malloc p2p_read_param failed, errno: %d\n", err);
+		fprintf(stderr, "calloc p2p_io_param failed, errno: %d\n", err);
 		goto free_ext_out;
 	}
 
-	read->file_fd = file_fd;
-	read->host_pid = param->flags & P2P_IO_F_REGISTERED_MEM ? 0 : getpid();
-	read->flags = param->flags;
-	read->mem_handle = param->flags & P2P_IO_F_REGISTERED_MEM ? param->mem_handle : 0;
-	read->iov = param->iov;
-	read->iov_nr = param->iov_nr;
-	read->ext_nr = ext_num;
-	memcpy(read->extents, exts->fm_extents, ext_num * sizeof(read->extents[0]));
+	io->op = param->op;
+	io->file_fd = file_fd;
+	io->host_pid = param->flags & P2P_IO_F_REGISTERED_MEM ? 0 : getpid();
+	io->flags = param->flags;
+	io->mem_handle = param->flags & P2P_IO_F_REGISTERED_MEM ? param->mem_handle : 0;
+	io->iov = param->iov;
+	io->iov_nr = param->iov_nr;
+	io->ext_nr = ext_num;
+	memcpy(io->extents, exts->fm_extents, ext_num * sizeof(io->extents[0]));
 
-	err = ioctl(dev_fd, IOCTL_READ_FILE, read);
+	err = ioctl(dev_fd, IOCTL_RW_FILE, io);
 	if (err < 0) {
 		err = -errno;
-		fprintf(stderr, "read file ioctl failed, errno: %d\n", -err);
-		goto free_read_out;
+		fprintf(stderr, "%s file ioctl failed, errno: %d\n",
+			param->op == P2P_IO_WRITE ? "write" : "read", -err);
+		goto free_io_out;
 	}
 
-free_read_out:
-	free(read);
+free_io_out:
+	free(io);
 free_ext_out:
 	free(exts);
 close_fds_out:

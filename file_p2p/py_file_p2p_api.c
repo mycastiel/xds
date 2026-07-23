@@ -69,25 +69,27 @@ error:
 	return -1;
 }
 
-static PyObject *py_read_file(PyObject *Py_UNUSED(self), PyObject *args)
+static PyObject *py_rw_file(PyObject *Py_UNUSED(self), PyObject *args)
 {
 	int dev_fd = 0;
+	unsigned int op = 0;
 	const char *file_name = NULL;
 	unsigned long file_offset = 0;
 	struct p2p_iov *iov = NULL;
 	unsigned int iov_nr = 0;
 	PyObject *py_iovs = NULL;
 	long long mem_handle = 0;
-	unsigned long flags = 0;
+	unsigned int flags = 0;
 	int ret = 0;
 
-	if (!PyArg_ParseTuple(args, "iskOLk", &dev_fd, &file_name,
-			      &file_offset, &py_iovs, &mem_handle, &flags))
+	if (!PyArg_ParseTuple(args, "iIskOLI", &dev_fd, &op, &file_name, &file_offset, &py_iovs,
+			      &mem_handle, &flags))
 		return NULL;
 	if (parse_iovs(py_iovs, &iov, &iov_nr))
 		return NULL;
 
-	struct read_parameter param = {
+	struct io_parameter param = {
+		.op = op,
 		.file_name = file_name,
 		.file_offset = file_offset,
 		.iov = iov,
@@ -97,7 +99,7 @@ static PyObject *py_read_file(PyObject *Py_UNUSED(self), PyObject *args)
 	};
 
 	Py_BEGIN_ALLOW_THREADS
-	ret = read_file(dev_fd, &param);
+	ret = rw_file(dev_fd, &param);
 	Py_END_ALLOW_THREADS
 
 	free(iov);
@@ -193,15 +195,16 @@ static PyObject *py_close_p2p_fd(PyObject *Py_UNUSED(self), PyObject *args)
 }
 
 static PyMethodDef FileP2PMethods[] = {
-	{ "read_file", py_read_file, METH_VARARGS,
-	  "read_file(dev_fd, file_name, file_offset, iovs, mem_handle, flags) -> int\n\n"
-	  "Read file from p2p device.\n"
+	{ "rw_file", py_rw_file, METH_VARARGS,
+	  "rw_file(dev_fd, op, file_name, file_offset, iovs, mem_handle, flags) -> int\n\n"
+	  "Read from or write to a p2p I/O target.\n"
 	  "\n"
 	  "Parameters:\n"
 	  "    dev_fd (int): File descriptor of p2p device.\n"
-	  "    file_name (str): Name of file to read.\n"
+	  "    op (int): P2P_IO_READ or P2P_IO_WRITE.\n"
+	  "    file_name (str): Name of the I/O target.\n"
 	  "    file_offset (int): Starting file offset.\n"
-	  "    iovs (sequence): Destination (address, size) pairs.\n"
+	  "    iovs (sequence): Device-memory (address, size) pairs.\n"
 	  "    mem_handle (int): Registered-memory handle, or zero.\n"
 	  "    flags (int): P2P I/O flags.\n"
 	  "\n"
@@ -262,6 +265,11 @@ PyMODINIT_FUNC PyInit_file_p2p(void)
 		return NULL;
 	if (PyModule_AddIntConstant(module, "P2P_IO_F_REGISTERED_MEM",
 				    P2P_IO_F_REGISTERED_MEM)) {
+		Py_DECREF(module);
+		return NULL;
+	}
+	if (PyModule_AddIntConstant(module, "P2P_IO_READ", P2P_IO_READ) ||
+	    PyModule_AddIntConstant(module, "P2P_IO_WRITE", P2P_IO_WRITE)) {
 		Py_DECREF(module);
 		return NULL;
 	}
