@@ -15,6 +15,7 @@ struct io_parameter {
 	struct p2p_iov *iov;
 	unsigned int iov_nr;
 	unsigned int flags;
+	int host_pid;
 	uint64_t mem_handle;
 };
 
@@ -25,6 +26,12 @@ int rw_file(int dev_fd, const struct io_parameter *param);
 `P2P_IO_WRITE`.  Direction is a fundamental property of the operation and is
 not encoded in `flags`.  The flags remain independent modifiers such as
 registered-memory selection.
+
+`host_pid` follows `flags`.  For unregistered memory, it identifies the process
+whose virtual addresses appear in `iov`.  Zero selects the calling process; a
+positive value selects that PID.  Negative values are invalid.
+Registered-memory requests must set `host_pid` to zero because the registration
+already identifies the address-space owner.
 
 For a read, the IOVs are destinations.  For a write, the IOVs are sources.
 `file_offset` is a logical file offset for a regular-file read and a raw
@@ -87,6 +94,11 @@ issuing I/O.  A write requires a write-capable block-device file reference.
 The existing one-shot and registered-memory modes apply equally to reads and
 writes.  One request uses one memory mode and, in registered mode, one memory
 handle for every IOV.
+
+The userspace library resolves a zero `io_parameter.host_pid` to `getpid()` for
+one-shot I/O before issuing the ioctl.  A nonzero PID is passed through.
+Registered-memory I/O rejects a nonzero `host_pid` and sends zero to the
+kernel.
 
 The direction changes ownership semantics but not address translation:
 
