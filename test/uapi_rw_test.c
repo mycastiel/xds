@@ -154,6 +154,21 @@ int main(int argc, char **argv)
 	if (err)
 		goto out;
 	userspace.op = P2P_IO_WRITE;
+	userspace.host_pid = -1;
+	err = expect("userspace negative host pid",
+		     rw_file(-1, &userspace), -EINVAL);
+	if (err)
+		goto out;
+	userspace.host_pid = getpid();
+	userspace.flags = P2P_IO_F_REGISTERED_MEM;
+	userspace.mem_handle = 1;
+	err = expect("userspace registered host pid",
+		     rw_file(-1, &userspace), -EINVAL);
+	if (err)
+		goto out;
+	userspace.host_pid = 0;
+	userspace.flags = 0;
+	userspace.mem_handle = 0;
 	err = expect("userspace regular file write", rw_file(-1, &userspace),
 		     -EOPNOTSUPP);
 

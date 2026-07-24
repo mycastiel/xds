@@ -36,6 +36,19 @@ def main() -> int:
                          str(args.regular_file), 0, iovs, 0, 0),
         -errno.EOPNOTSUPP,
     )
+    require(
+        "negative host pid",
+        file_p2p.rw_file(-1, file_p2p.P2P_IO_READ,
+                         str(args.regular_file), 0, iovs, 0, 0, -1),
+        -errno.EINVAL,
+    )
+    require(
+        "registered host pid",
+        file_p2p.rw_file(-1, file_p2p.P2P_IO_READ,
+                         str(args.regular_file), 0, iovs, 1,
+                         file_p2p.P2P_IO_F_REGISTERED_MEM, 1),
+        -errno.EINVAL,
+    )
     return 0
 
 
