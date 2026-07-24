@@ -80,16 +80,18 @@ static PyObject *py_rw_file(PyObject *Py_UNUSED(self), PyObject *args)
 	PyObject *py_iovs = NULL;
 	long long mem_handle = 0;
 	unsigned int flags = 0;
+	int host_pid = 0;
 	int ret = 0;
 
-	if (!PyArg_ParseTuple(args, "iIskOLI", &dev_fd, &op, &file_name, &file_offset, &py_iovs,
-			      &mem_handle, &flags))
+	if (!PyArg_ParseTuple(args, "iIskOLI|i", &dev_fd, &op, &file_name, &file_offset,
+			      &py_iovs, &mem_handle, &flags, &host_pid))
 		return NULL;
 	if (parse_iovs(py_iovs, &iov, &iov_nr))
 		return NULL;
 
 	struct io_parameter param = {
 		.op = op,
+		.host_pid = host_pid,
 		.file_name = file_name,
 		.file_offset = file_offset,
 		.iov = iov,
@@ -196,7 +198,8 @@ static PyObject *py_close_p2p_fd(PyObject *Py_UNUSED(self), PyObject *args)
 
 static PyMethodDef FileP2PMethods[] = {
 	{ "rw_file", py_rw_file, METH_VARARGS,
-	  "rw_file(dev_fd, op, file_name, file_offset, iovs, mem_handle, flags) -> int\n\n"
+	  "rw_file(dev_fd, op, file_name, file_offset, iovs, mem_handle, flags"
+	  "[, host_pid]) -> int\n\n"
 	  "Read from or write to a p2p I/O target.\n"
 	  "\n"
 	  "Parameters:\n"
@@ -207,6 +210,9 @@ static PyMethodDef FileP2PMethods[] = {
 	  "    iovs (sequence): Device-memory (address, size) pairs.\n"
 	  "    mem_handle (int): Registered-memory handle, or zero.\n"
 	  "    flags (int): P2P I/O flags.\n"
+	  "    host_pid (int, optional): PID owning unregistered IOV addresses;\n"
+	  "        zero or omitted selects the current process. Must be zero for\n"
+	  "        registered memory.\n"
 	  "\n"
 	  "Returns:\n"
 	  "    int: 0 on success, non-zero on error.\n" },

@@ -895,8 +895,12 @@ int rw_file(int dev_fd, const struct io_parameter *param)
 		return -EINVAL;
 	if (param->flags & ~P2P_IO_F_MASK)
 		return -EOPNOTSUPP;
-	if ((param->flags & P2P_IO_F_REGISTERED_MEM) && !param->mem_handle)
+	if (param->flags & P2P_IO_F_REGISTERED_MEM) {
+		if (!param->mem_handle || param->host_pid)
+			return -EINVAL;
+	} else if (param->host_pid < 0) {
 		return -EINVAL;
+	}
 
 	err = get_iov_size(param->iov, param->iov_nr, &io_size);
 	if (err)
@@ -951,9 +955,14 @@ int rw_file(int dev_fd, const struct io_parameter *param)
 
 	io->op = param->op;
 	io->file_fd = file_fd;
-	io->host_pid = param->flags & P2P_IO_F_REGISTERED_MEM ? 0 : getpid();
 	io->flags = param->flags;
-	io->mem_handle = param->flags & P2P_IO_F_REGISTERED_MEM ? param->mem_handle : 0;
+	if (param->flags & P2P_IO_F_REGISTERED_MEM) {
+		io->host_pid = 0;
+		io->mem_handle = param->mem_handle;
+	} else {
+		io->host_pid = param->host_pid ? param->host_pid : getpid();
+		io->mem_handle = 0;
+	}
 	io->iov = param->iov;
 	io->iov_nr = param->iov_nr;
 	io->ext_nr = ext_num;

@@ -12,6 +12,7 @@ struct io_parameter {
 	struct p2p_iov *iov;
 	unsigned int iov_nr;
 	unsigned int flags;
+	int host_pid;
 	uint64_t mem_handle;
 };
 
