@@ -33,6 +33,7 @@ struct p2p_io_event {
 	__s64 res;                /* bytes or -errno */
 	__u32 op;                 /* echoed P2P_IO_READ/WRITE */
 	__u32 flags;              /* v1: 0 */
+	__u64 reserved[2];        /* pad to 32B; matches NDS nds_io_event */
 };
 
 struct p2p_getevents_param {

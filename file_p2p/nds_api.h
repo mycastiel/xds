@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <sys/types.h>
+#include <stdatomic.h>
 #include <time.h>	/* struct timespec for nds_io_getevents */
 
 /*
@@ -52,7 +53,11 @@
 
 #define NDS_API_VERSION 1u
 
-struct nds_io_ctx;
+struct nds_io_ctx {
+	int p2p_fd;
+	unsigned int max_io_nr;
+	_Atomic unsigned int inflight;
+};
 
 /*
  * Topology descriptor for nds_init.
@@ -75,7 +80,10 @@ struct nds_init_param {
 	uint32_t version;		/* must be NDS_API_VERSION */
 };
 
-/* max_io_nr: upper bound on outstanding I/Os in this context. flags = 0. */
+/* max_io_nr: upper bound on outstanding I/Os in this context. flags = 0.
+ * A ctx may be shared across threads: inflight is an atomic counter so
+ * concurrent submit/getevents cannot race the outstanding-I/O budget.
+ * The kernel serializes the actual I/O on the ctx's p2p_fd. */
 struct nds_io_ctx_param {
 	uint32_t max_io_nr;
 	uint32_t flags;
@@ -128,12 +136,13 @@ struct nds_io_cb {
 	uint64_t reserved;
 };
 
-/* One completion. res is bytes transferred (>= 0) or -errno. */
+/* One completion. Layout matches kernel struct p2p_io_event (32B).
+ * res is success(==0) or -errno. */
 struct nds_io_event {
 	uint64_t user_data;
 	int64_t res;
 	uint32_t opcode;
-	uint32_t reserved1;
+	uint32_t flags;			/* v1: 0 */
 	uint64_t reserved2[2];
 };
 

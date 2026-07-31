@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stddef.h>
+#include <stdatomic.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -25,6 +27,18 @@
 #include "p2p_dev_uapi.h"
 #include "p2p_common.h"
 
+_Static_assert(sizeof(struct nds_io_event) == sizeof(struct p2p_io_event),
+	       "nds_io_event must match p2p_io_event for zero-copy getevents");
+_Static_assert(offsetof(struct nds_io_event, user_data) ==
+		       offsetof(struct p2p_io_event, user_data) &&
+	       offsetof(struct nds_io_event, res) ==
+		       offsetof(struct p2p_io_event, res) &&
+	       offsetof(struct nds_io_event, opcode) ==
+		       offsetof(struct p2p_io_event, op) &&
+	       offsetof(struct nds_io_event, flags) ==
+		       offsetof(struct p2p_io_event, flags),
+	       "nds_io_event field layout must match p2p_io_event");
+
 struct nds_reg_entry {
 	struct nds_reg_entry *next;
 	void *addr;
@@ -35,12 +49,6 @@ struct nds_reg_entry {
 struct nds_state {
 	int book_fd;
 	struct nds_reg_entry *regs;
-};
-
-struct nds_io_ctx {
-	int p2p_fd;
-	unsigned int max_io_nr;
-	unsigned int inflight;
 };
 
 static struct nds_state g_state = { .book_fd = -1 };
@@ -231,6 +239,7 @@ int nds_io_new_ctx(const struct nds_io_ctx_param *param, struct nds_io_ctx **ctx
 	}
 	c->p2p_fd = fd;
 	c->max_io_nr = param->max_io_nr;
+	atomic_init(&c->inflight, 0);
 	*ctx = c;
 	return 0;
 }
@@ -242,7 +251,7 @@ int nds_io_destroy_ctx(struct nds_io_ctx *ctx)
 	if (!ctx)
 		return -EINVAL;
 
-	if (ctx->inflight) {
+	if (atomic_load_explicit(&ctx->inflight, memory_order_acquire)) {
 		ret = ioctl(ctx->p2p_fd, IOCTL_DRAIN_IO);
 		if (ret < 0)
 			fprintf(stderr, "nds: destroy_ctx drain warning %d\n",
@@ -272,7 +281,7 @@ static int nds_iocb_to_io_param(struct nds_io_cb *cb, int file_fd,
 				struct p2p_io_param **io_out,
 				struct p2p_iov *iov)
 {
-	struct nds_reg_entry *r;
+	struct nds_reg_entry *r = NULL;
 	struct p2p_io_param *io;
 	struct fiemap *exts = NULL;
 	struct stat file_stat;
@@ -297,6 +306,26 @@ static int nds_iocb_to_io_param(struct nds_io_cb *cb, int file_fd,
 		return err;
 	if (ULONG_MAX - cb->offset < io_size)
 		return -EOVERFLOW;
+
+	/*
+	 * Mem-mode precheck before fstat/FIEMAP (p2p_api.md §3.10). A
+	 * REGISTERED_MEM request with an unregistered buf_addr must not pay
+	 * the FIEMAP cost before being rejected.
+	 */
+	if (cb->rw_flags & NDS_IO_F_REGISTERED_MEM) {
+		if (cb->host_pid)
+			return -EINVAL;
+		buf_addr = cb->buf_addr;
+		for (r = g_state.regs; r; r = r->next) {
+			if (buf_addr >= (uint64_t)(uintptr_t)r->addr &&
+			    buf_addr < (uint64_t)(uintptr_t)r->addr + r->size)
+				break;
+		}
+		if (!r)
+			return -EINVAL;
+	} else if (cb->host_pid < 0) {
+		return -EINVAL;
+	}
 
 	if (fstat(file_fd, &file_stat) < 0) {
 		err = -errno;
@@ -344,28 +373,10 @@ static int nds_iocb_to_io_param(struct nds_io_cb *cb, int file_fd,
 	free(exts);
 
 	if (cb->rw_flags & NDS_IO_F_REGISTERED_MEM) {
-		if (cb->host_pid) {
-			free(io);
-			return -EINVAL;
-		}
-		buf_addr = cb->buf_addr;
-		for (r = g_state.regs; r; r = r->next) {
-			if (buf_addr >= (uint64_t)(uintptr_t)r->addr &&
-			    buf_addr < (uint64_t)(uintptr_t)r->addr + r->size)
-				break;
-		}
-		if (!r) {
-			free(io);
-			return -EINVAL;
-		}
 		io->flags = P2P_IO_F_REGISTERED_MEM;
 		io->host_pid = 0;
 		io->mem_handle = r->handle;
 	} else {
-		if (cb->host_pid < 0) {
-			free(io);
-			return -EINVAL;
-		}
 		io->flags = 0;
 		io->host_pid = cb->host_pid ? cb->host_pid : getpid();
 		io->mem_handle = 0;
@@ -389,20 +400,37 @@ int nds_io_submit(struct nds_io_ctx *ctx, unsigned int nr, struct nds_io_cb *ioc
 		struct p2p_io_param *io = NULL;
 		struct p2p_iov iov;
 		struct nds_io_cb *cb = &iocb[i];
+		unsigned int cur;
 		int file_fd;
 
-		if (ctx->inflight >= ctx->max_io_nr)
-			return i ? (int)i : -EAGAIN;
+		/*
+		 * Reserve a slot before the ioctl so concurrent submitters
+		 * cannot overshoot max_io_nr. Roll back on any failure path.
+		 */
+		cur = atomic_load_explicit(&ctx->inflight, memory_order_relaxed);
+		for (;;) {
+			if (cur >= ctx->max_io_nr)
+				return i ? (int)i : -EAGAIN;
+			if (atomic_compare_exchange_weak_explicit(
+				    &ctx->inflight, &cur, cur + 1,
+				    memory_order_acquire,
+				    memory_order_relaxed))
+				break;
+		}
 
 		ret = resolve_obj_to_fd(&cb->obj, &file_fd);
 		if (ret) {
 			fprintf(stderr, "nds: resolve_obj failed %d\n", ret);
+			atomic_fetch_sub_explicit(&ctx->inflight, 1,
+						  memory_order_release);
 			return i ? (int)i : ret;
 		}
 
 		ret = nds_iocb_to_io_param(cb, file_fd, &io, &iov);
 		if (ret) {
 			fprintf(stderr, "nds: translate iocb failed %d\n", ret);
+			atomic_fetch_sub_explicit(&ctx->inflight, 1,
+						  memory_order_release);
 			return i ? (int)i : ret;
 		}
 
@@ -411,10 +439,11 @@ int nds_io_submit(struct nds_io_ctx *ctx, unsigned int nr, struct nds_io_cb *ioc
 			ret = -errno;
 			fprintf(stderr, "nds: rw ioctl failed %d\n", ret);
 			free(io);
+			atomic_fetch_sub_explicit(&ctx->inflight, 1,
+						  memory_order_release);
 			return i ? (int)i : ret;
 		}
 		free(io);
-		ctx->inflight++;
 	}
 	return (int)i;
 }
@@ -424,9 +453,7 @@ int nds_io_getevents(struct nds_io_ctx *ctx, unsigned int min_nr,
 		     struct timespec *timeout)
 {
 	struct p2p_getevents_param param = { 0 };
-	struct p2p_io_event *raw = NULL;
 	int ret;
-	int i;
 
 	if (!ctx || !events)
 		return -EINVAL;
@@ -435,10 +462,10 @@ int nds_io_getevents(struct nds_io_ctx *ctx, unsigned int min_nr,
 	if (min_nr > nr)
 		return -EINVAL;
 
-	raw = calloc(nr, sizeof(*raw));
-	if (!raw)
-		return -ENOMEM;
-
+	/*
+	 * nds_io_event is binary-identical to p2p_io_event (32B); pass the
+	 * caller's buffer straight to the ioctl — no intermediate copy.
+	 */
 	param.min_nr = min_nr;
 	param.max_nr = nr;
 	if (timeout) {
@@ -447,23 +474,16 @@ int nds_io_getevents(struct nds_io_ctx *ctx, unsigned int min_nr,
 	} else {
 		param.timeout_ns = -1;
 	}
-	param.events = raw;
+	param.events = (struct p2p_io_event *)events;
 
 	ret = ioctl(ctx->p2p_fd, IOCTL_GET_IO_EVENTS, &param);
 	if (ret < 0) {
 		ret = -errno;
 		fprintf(stderr, "nds: getevents ioctl failed %d\n", ret);
-		free(raw);
 		return ret;
 	}
-	for (i = 0; i < ret; i++) {
-		memset(&events[i], 0, sizeof(events[i]));
-		events[i].user_data = raw[i].user_data;
-		events[i].res = raw[i].res;
-		events[i].opcode = raw[i].op;
-	}
-	free(raw);
 	if (ret > 0)
-		ctx->inflight -= (unsigned int)ret;
+		atomic_fetch_sub_explicit(&ctx->inflight, (unsigned int)ret,
+					  memory_order_release);
 	return ret;
 }

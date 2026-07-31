@@ -1548,9 +1548,11 @@ static int p2p_harvest_one_ctx(struct p2p_io_context *io_ctx, struct p2p_io_even
 	}
 
 	out->user_data = io_ctx->user_data;
-	out->res = err ? err : (s64)io_ctx->data_size;
+	out->res = err ? err : 0;
 	out->op = io_ctx->op;
 	out->flags = 0;
+	out->reserved[0] = 0;
+	out->reserved[1] = 0;
 
 	if (!err && io_ctx->op == P2P_IO_READ) {
 		dump_io_ctx_crc32(io_ctx);
