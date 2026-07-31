@@ -81,9 +81,16 @@ run_stress_api()
 	fi
 	if [[ $api == c ]]; then
 		command=("$SCRIPT_DIR/c_api_test" "${common_options[@]}")
-	else
+	elif [[ $api == python ]]; then
 		command=(env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
 			"$SCRIPT_DIR/python_api_test.py" "${common_options[@]}")
+	elif [[ $api == nds-c ]]; then
+		command=("$SCRIPT_DIR/nds_api_test" "${common_options[@]}")
+	elif [[ $api == nds-python ]]; then
+		command=(env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
+			"$SCRIPT_DIR/python_nds_api_test.py" "${common_options[@]}")
+	else
+		die "unsupported stress api '$api'"
 	fi
 
 	log "$STRESS_MODE: running $api API $memory_mode-memory dynamic-VA stress"
@@ -160,7 +167,7 @@ main()
 		--seed "$STRESS_SEED" --mode "$STRESS_MODE" --topology "$TARGET"
 	sync
 
-	for api in c python; do
+	for api in c python nds-c nds-python; do
 		for memory_mode in normal registered; do
 			run_stress_api "$api" "$workload" "$memory_mode"
 		done

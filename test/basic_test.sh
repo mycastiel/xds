@@ -5,14 +5,26 @@ set -Eeuo pipefail
 TEST_NAME=basic_test
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
+# Map NDS APIs onto the same CMB VA windows as file_p2p c/python (phases are sequential).
+api_va_family()
+{
+	case $1 in
+		c | nds-c) printf 'c\n' ;;
+		python | nds-python) printf 'python\n' ;;
+		*) die "unsupported api '$1'" ;;
+	esac
+}
+
 make_single_manifest()
 {
 	local api=$1 directory=$2 label=$3 block_size=$4
 	local manifest="$WORK_DIR/$label.$api.single.tsv"
 	local tiny_va offset_va cross_va large_va tail_len tail_va boundary_off boundary_len
+	local family
 
+	family=$(api_va_family "$api")
 	: >"$manifest"
-	if [[ $api == c ]]; then
+	if [[ $family == c ]]; then
 		tiny_va=0
 		offset_va=512
 		cross_va=$((2 * 1024 * 1024 - 512))
@@ -52,9 +64,11 @@ make_block_manifest()
 	local api=$1 source=$2 source_size=$3 label=$4 topology_boundary=${5:-0}
 	local manifest="$WORK_DIR/$label.$api.single.tsv"
 	local tiny_va offset_va cross_va large_va boundary_va tail_len tail_va
+	local family
 
+	family=$(api_va_family "$api")
 	: >"$manifest"
-	if [[ $api == c ]]; then
+	if [[ $family == c ]]; then
 		tiny_va=0
 		offset_va=512
 		cross_va=$((2 * 1024 * 1024 - 512))
@@ -91,8 +105,10 @@ make_registered_manifest()
 	local api=$1 source=$2 label=$3
 	local manifest="$WORK_DIR/$label.$api.queued.tsv"
 	local base
+	local family
 
-	if [[ $api == c ]]; then
+	family=$(api_va_family "$api")
+	if [[ $family == c ]]; then
 		base=0
 	else
 		base=$((16 * 1024 * 1024))
@@ -120,12 +136,14 @@ make_concurrent_manifest()
 	local base
 	local -a lengths offsets
 	local i
+	local family
 
-	if [[ $api == c && $mode == queued ]]; then
+	family=$(api_va_family "$api")
+	if [[ $family == c && $mode == queued ]]; then
 		base=$((32 * 1024 * 1024))
-	elif [[ $api == python && $mode == queued ]]; then
+	elif [[ $family == python && $mode == queued ]]; then
 		base=$((48 * 1024 * 1024))
-	elif [[ $api == c ]]; then
+	elif [[ $family == c ]]; then
 		base=$((64 * 1024 * 1024))
 	else
 		base=$((80 * 1024 * 1024))
@@ -365,12 +383,17 @@ run_block_matrix()
 	log "$label: writing deterministic block-device pattern"
 	generate_pattern "$target" "$size" "$phase_seed"
 	blockdev --flushbufs "$target"
-	for api in c python; do
+	for api in c python nds-c nds-python; do
 		manifest=$(make_block_manifest "$api" "$target" "$size" "$label" \
 			"$topology_boundary")
 		run_manifest "$api" "$target" single "$manifest" "$label"
-		run_write_pipeline "$target" "$label" "$((phase_seed + 100))" \
-			"$topology_boundary" "$api"
+		case $api in
+			c | python)
+				run_write_pipeline "$target" "$label" \
+					"$((phase_seed + 100))" \
+					"$topology_boundary" "$api"
+				;;
+		esac
 	done
 }
 
@@ -382,7 +405,7 @@ run_filesystem_matrix()
 
 	mkdir -p "$directory"
 	prepare_fs_files "$directory" "$block_size" "$phase_seed"
-	for api in c python; do
+	for api in c python nds-c nds-python; do
 		manifest=$(make_single_manifest "$api" "$directory" "$label" \
 			"$block_size")
 		run_manifest "$api" "$topology" single "$manifest" "$label"
@@ -440,7 +463,7 @@ test_direct_nvme()
 		"PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
 		"$SCRIPT_DIR/python_mem_registration_test.py" --topology "$DEV1"
 	log "Registered-memory CRC32"
-	for api in c python; do
+	for api in c python nds-c nds-python; do
 		manifest=$(make_registered_manifest "$api" "$DEV1" registered-mem)
 		run_mem_registration_case "$api registered CRC32" 1 \
 			run_manifest "$api" "$DEV1" queued "$manifest" \
@@ -544,6 +567,10 @@ main()
 	crc_self_test
 	save_kernel_identity
 	load_modules
+	log "NDS rejection coverage"
+	"$SCRIPT_DIR/nds_api_test" --topology "$DEV1" --mode reject
+	env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
+		"$SCRIPT_DIR/python_nds_api_test.py" --topology "$DEV1" --mode reject
 	test_direct_nvme
 	test_nvme_partition
 	test_linear_dm
@@ -551,7 +578,7 @@ main()
 	test_raid0
 	test_raid0_slot_order
 	test_raid0_partitions
-	log "All XDS C API and Python API tests passed"
+	log "All XDS C, Python, and NDS API tests passed"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

@@ -261,6 +261,7 @@ build_all()
 		python3 setup.py build_ext --inplace --force
 	)
 	PYTHONPATH="$REPO_ROOT/file_p2p" python3 -c 'import file_p2p'
+	PYTHONPATH="$REPO_ROOT/file_p2p" python3 -c 'import nds'
 }
 
 crc_self_test()
@@ -390,14 +391,29 @@ run_manifest()
 
 	: >/sys/kernel/debug/p2p_device/summary
 	dmesg -C
-	if [[ $api == c ]]; then
-		command=("$SCRIPT_DIR/c_api_test" --topology "$topology" \
-			--manifest "$manifest" --mode "$mode")
-	else
-		command=(env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
-			"$SCRIPT_DIR/python_api_test.py" --topology "$topology" \
-			--manifest "$manifest" --mode "$mode")
-	fi
+	case $api in
+		c)
+			command=("$SCRIPT_DIR/c_api_test" --topology "$topology" \
+				--manifest "$manifest" --mode "$mode")
+			;;
+		python)
+			command=(env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
+				"$SCRIPT_DIR/python_api_test.py" --topology "$topology" \
+				--manifest "$manifest" --mode "$mode")
+			;;
+		nds-c)
+			command=("$SCRIPT_DIR/nds_api_test" --topology "$topology" \
+				--manifest "$manifest" --mode "$mode")
+			;;
+		nds-python)
+			command=(env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
+				"$SCRIPT_DIR/python_nds_api_test.py" --topology "$topology" \
+				--manifest "$manifest" --mode "$mode")
+			;;
+		*)
+			die "unsupported api '$api'"
+			;;
+	esac
 	if [[ -n $registered_mem ]]; then
 		command+=(--registered-mem)
 	fi

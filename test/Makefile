@@ -5,7 +5,7 @@ CPPFLAGS += -I../file_p2p -I..
 .PHONY: all clean
 
 TEST_BINS := crc32_verify c_api_test mem_registration_test direct_io_test \
-	rw_api_test uapi_rw_test
+	rw_api_test uapi_rw_test nds_api_test
 
 all: $(TEST_BINS)
 
@@ -34,6 +34,11 @@ uapi_rw_test: uapi_rw_test.c ../file_p2p/file_p2p_api.c \
 		../file_p2p/file_p2p_api.h ../p2p_dev_uapi.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ \
 		uapi_rw_test.c ../file_p2p/file_p2p_api.c
+
+nds_api_test: nds_api_test.c ../file_p2p/nds_api.c ../file_p2p/nds_api.h \
+	../p2p_dev_uapi.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread -o $@ \
+		nds_api_test.c ../file_p2p/nds_api.c
 
 clean:
 	rm -f $(TEST_BINS)
