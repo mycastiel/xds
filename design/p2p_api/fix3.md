@@ -10,19 +10,17 @@ and its tests.
 
 ## Independence from file_p2p
 
-NDS and `file_p2p` are **two independent userspace APIs** that both sit on top
-of the same kernel UAPI (`p2p_dev_uapi.h`). They evolve separately:
+NDS and `file_p2p` remain **two independent public userspace APIs** on top of
+the same kernel UAPI (`p2p_dev_uapi.h`). They share an internal `p2p_common`
+layer (`p2p_common.h` / `p2p_common.c`) for `p2p_open_dev` / `p2p_add_topo` /
+FIEMAP extent packing (`p2p_prepare_io_extents` / `p2p_get_iov_size`) only.
 
-- `nds_api.c` is self-contained. It opens `/dev/p2p_device`, does its own
-  topology discovery (nvme/linear/raid0 sysfs+DM+MD walking), its own
-  FIEMAP extent packing, and issues `IOCTL_ADD_TOPO` / `IOCTL_RW_FILE` /
-  `IOCTL_REGISTER_MEM` / `IOCTL_UNREGISTER_MEM` / `IOCTL_GET_IO_EVENTS` /
-  `IOCTL_DRAIN_IO` directly. It does **not** include `file_p2p_api.h` or link
-  `file_p2p_api.c`.
-- `file_p2p_api.c` is untouched and keeps serving the C API / UAPI tests.
-- Build wiring reflects the split: the `nds` Python extension and
-  `nds_api_test` link only `nds_api.c` (+ `py_nds_api.c`), not
-  `file_p2p_api.c`.
+- NDS still does **not** include `file_p2p_api.h` or link `file_p2p_api.c`.
+- Each public API keeps its own surface (`nds_api.h` vs `file_p2p_api.h`) and
+  issues the remaining ioctls (`IOCTL_RW_FILE`, mem register/unregister,
+  getevents, drain) itself.
+- Build wiring: both the `nds` / `file_p2p` Python extensions and the C tests
+  link their own API `.c` plus `p2p_common.c`.
 
 ## Goals
 
