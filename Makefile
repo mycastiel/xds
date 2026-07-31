@@ -8,7 +8,7 @@ all:
 obj-m := stub.o
 obj-m += p2p_dev.o
 
-p2p_dev-objs := dev.o topo.o debugfs.o
+p2p_dev-objs := dev.o topo.o debugfs.o mem.o
 
 ccflags-y += -I$(srctree)/drivers/nvme/host
 

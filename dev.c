@@ -35,7 +35,7 @@
 #include <trace/events/block.h>
 
 #include "p2p_dev_uapi.h"
-#include "p2p_mem_query.h"
+#include "mem.h"
 #include "compat.h"
 #include "debugfs.h"
 #include "dev.h"
@@ -218,8 +218,9 @@ static void p2p_put_pinned_pa(struct p2p_pinned_pa *pinned_pa)
 	for (i = 0; i < pinned_pa->pinned_map_nr; i++) {
 		struct p2p_iov_map *map = &pinned_pa->maps[i];
 
-		devmm_put_mem_pa_list(&pinned_pa->process_id, map->aligned_addr,
-				      map->aligned_size, map->pa_list, map->pa_num);
+		p2p_mem_put_pa_list(&pinned_pa->process_id, map->aligned_addr,
+				     map->aligned_size, map->pa_list,
+				     map->pa_num);
 	}
 
 	kvfree(pinned_pa->pa_list);
@@ -274,7 +275,7 @@ static int p2p_pin_registered_pa(u64 addr, u64 size,
 		return -ENOMEM;
 	init_current_process_id(&pinned_pa->process_id);
 
-	page_size = devmm_get_mem_page_size(&pinned_pa->process_id, addr, size);
+	page_size = p2p_mem_get_page_size(&pinned_pa->process_id, addr, size);
 	if (page_size < 0) {
 		err = page_size;
 		goto put_pinned_pa;
@@ -315,9 +316,8 @@ static int p2p_pin_registered_pa(u64 addr, u64 size,
 	}
 	map->pa_list = pinned_pa->pa_list;
 
-	err = devmm_get_mem_pa_list(&pinned_pa->process_id, map->aligned_addr,
-				    map->aligned_size, map->pa_list,
-				    map->pa_num);
+	err = p2p_mem_get_pa_list(&pinned_pa->process_id, map->aligned_addr,
+				  map->aligned_size, map->pa_list, map->pa_num);
 	if (err) {
 		pr_err("registered PA list addr 0x%llx size 0x%llx num %u err %d\n",
 		       map->aligned_addr, map->aligned_size, map->pa_num, err);
@@ -605,8 +605,8 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
 		u64 offset;
 		int page_size;
 
-		page_size = devmm_get_mem_page_size(&pinned_pa->process_id,
-						    iov[i].addr, iov[i].size);
+		page_size = p2p_mem_get_page_size(&pinned_pa->process_id,
+						  iov[i].addr, iov[i].size);
 		if (page_size < P2P_MIN_PAGE_SIZE ||
 		    !is_power_of_2(page_size)) {
 			pr_err("invalid page size %d for addr 0x%lx, iov %u\n",
@@ -649,9 +649,10 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
 		unsigned int j;
 
 		maps[i].pa_list = pinned_pa->pa_list + new_pa_iov_idx;
-		err = devmm_get_mem_pa_list(&pinned_pa->process_id,
-					    maps[i].aligned_addr, maps[i].aligned_size,
-					    maps[i].pa_list, maps[i].pa_num);
+		err = p2p_mem_get_pa_list(&pinned_pa->process_id,
+					  maps[i].aligned_addr,
+					  maps[i].aligned_size,
+					  maps[i].pa_list, maps[i].pa_num);
 		if (err) {
 			pr_err("PA list addr 0x%llx size 0x%llx num %u iov %u err %d\n",
 			       maps[i].aligned_addr, maps[i].aligned_size,
@@ -1503,10 +1504,14 @@ static int __init p2p_drv_init(void)
 	struct device *device;
 	int err;
 
+	err = p2p_mem_init();
+	if (err)
+		return err;
+
 	err = topo_init();
 	if (err) {
 		pr_err("initialize topology release workqueue err %d\n", err);
-		return err;
+		goto exit_mem;
 	}
 
 	err = p2p_tp_hook_init();
@@ -1560,6 +1565,8 @@ exit_debugfs:
 	p2p_tp_hook_exit();
 exit_topo:
 	topo_exit();
+exit_mem:
+	p2p_mem_exit();
 	return err;
 }
 
@@ -1579,6 +1586,7 @@ static void __exit p2p_drv_exit(void)
 	 */
 	rcu_barrier();
 	topo_exit();
+	p2p_mem_exit();
 	pr_info("driver removed done\n");
 }
 

@@ -5,7 +5,7 @@
 #include <linux/overflow.h>
 #include <linux/sizes.h>
 
-#include "p2p_mem_query.h"
+#include "mem_abi.h"
 
 #define STUB_ADDR_SHIFT 12
 #define STUB_PAGE_SIZE SZ_2M
@@ -86,7 +86,7 @@ int devmm_get_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
 
 	return 0;
 }
-EXPORT_SYMBOL(devmm_get_mem_pa_list);
+EXPORT_SYMBOL_GPL(devmm_get_mem_pa_list);
 
 void devmm_put_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
 			   u64 size, u64 *pa_list, u32 pa_num)
@@ -98,7 +98,7 @@ void devmm_put_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
 	(void)pa_list;
 	(void)pa_num;
 }
-EXPORT_SYMBOL(devmm_put_mem_pa_list);
+EXPORT_SYMBOL_GPL(devmm_put_mem_pa_list);
 
 int devmm_get_mem_page_size(struct devmm_svm_process_id *process_id, u64 addr,
 			    u64 size)
@@ -109,7 +109,7 @@ int devmm_get_mem_page_size(struct devmm_svm_process_id *process_id, u64 addr,
 
 	return STUB_PAGE_SIZE;
 }
-EXPORT_SYMBOL(devmm_get_mem_page_size);
+EXPORT_SYMBOL_GPL(devmm_get_mem_page_size);
 
 static int __init stub_init(void)
 {

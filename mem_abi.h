@@ -1,5 +1,7 @@
-#ifndef P2P_MEM_QUERY_H_
-#define P2P_MEM_QUERY_H_
+#ifndef P2P_MEM_ABI_H_
+#define P2P_MEM_ABI_H_
+
+#include <linux/types.h>
 
 struct devmm_svm_process_id {
 	int32_t host_pid;
