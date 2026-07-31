@@ -24,7 +24,22 @@ struct p2p_io_param {
 	struct p2p_iov *iov;
 	unsigned int iov_nr;
 	unsigned int ext_nr;
+	__u64 user_data;          /* echo'd in completion event */
 	struct fiemap_extent extents[];
+};
+
+struct p2p_io_event {
+	__u64 user_data;
+	__s64 res;                /* bytes or -errno */
+	__u32 op;                 /* echoed P2P_IO_READ/WRITE */
+	__u32 flags;              /* v1: 0 */
+};
+
+struct p2p_getevents_param {
+	__u32 min_nr;
+	__u32 max_nr;
+	__s64 timeout_ns;       /* <0 infinite, 0 nonblock, >0 relative */
+	struct p2p_io_event *events;
 };
 
 struct p2p_mem_register_param {
@@ -73,5 +88,6 @@ struct topo_user_cfg {
 #define IOCTL_DRAIN_IO _IOC(_IOC_READ, 'k', 3, 0)
 #define IOCTL_REGISTER_MEM _IOWR('k', 4, struct p2p_mem_register_param)
 #define IOCTL_UNREGISTER_MEM _IOW('k', 5, struct p2p_mem_unregister_param)
+#define IOCTL_GET_IO_EVENTS _IOWR('k', 6, struct p2p_getevents_param)
 
 #endif
