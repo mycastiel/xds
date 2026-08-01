@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "file_p2p_api.h"
@@ -19,6 +20,7 @@
 #define TEST_SECOND_REG_ADDR ((8UL << 20) + 512)
 #define TEST_SECOND_REG_SIZE ((4UL << 20) - 512)
 #define TEST_RACE_THREADS 8
+#define TEST_UNREGISTER_TIMEOUT_SEC 30
 
 struct race_context {
 	pthread_mutex_t lock;
@@ -126,6 +128,18 @@ static void *race_unregister(void *argument)
 
 	worker->result = unregister_handle(worker->dev_fd, worker->handle);
 	return NULL;
+}
+
+static int timed_join(pthread_t thread, unsigned int timeout_sec)
+{
+	struct timespec deadline;
+	int err;
+
+	if (clock_gettime(CLOCK_REALTIME, &deadline))
+		return -errno;
+	deadline.tv_sec += timeout_sec;
+	err = pthread_timedjoin_np(thread, NULL, &deadline);
+	return err ? -err : 0;
 }
 
 static int test_validation(int dev_fd, int other_fd, const char *source,
@@ -315,7 +329,8 @@ static int test_normal_handle_ignored(int dev_fd, const char *source)
 	return drain_io(dev_fd);
 }
 
-static int test_registered_io(int dev_fd, const char *source, uint64_t handle)
+static int test_unregister_before_drain(int owner_fd, int io_fd,
+					const char *source, uint64_t handle)
 {
 	struct p2p_iov multi_iov[] = {
 		{ .addr = TEST_REG_ADDR, .size = 512 },
@@ -325,12 +340,12 @@ static int test_registered_io(int dev_fd, const char *source, uint64_t handle)
 	struct race_context context = {
 		.source = source,
 		.handle = handle,
-		.dev_fd = dev_fd,
+		.dev_fd = io_fd,
 	};
 	struct race_worker workers[TEST_RACE_THREADS];
 	struct unregister_worker unregister = {
 		.handle = handle,
-		.dev_fd = dev_fd,
+		.dev_fd = owner_fd,
 		.result = -EINPROGRESS,
 	};
 	pthread_t threads[TEST_RACE_THREADS];
@@ -340,7 +355,7 @@ static int test_registered_io(int dev_fd, const char *source, uint64_t handle)
 	unsigned int i;
 	int err;
 
-	err = submit_read(dev_fd, source, multi_iov,
+	err = submit_read(io_fd, source, multi_iov,
 			  sizeof(multi_iov) / sizeof(multi_iov[0]),
 			  P2P_IO_F_REGISTERED_MEM, handle);
 	if (err)
@@ -352,7 +367,7 @@ static int test_registered_io(int dev_fd, const char *source, uint64_t handle)
 			.size = 512,
 		};
 
-		err = submit_read(dev_fd, source, &iov, 1,
+		err = submit_read(io_fd, source, &iov, 1,
 				  P2P_IO_F_REGISTERED_MEM, handle);
 		if (err)
 			return err;
@@ -400,8 +415,26 @@ release_workers:
 		if (!err)
 			err = workers[i].result;
 	}
+	if (unregister_started) {
+		int join_err;
+
+		/* Unregister must depend on hardware completion, not io_fd drain. */
+		join_err = timed_join(unregister_thread,
+				      TEST_UNREGISTER_TIMEOUT_SEC);
+		if (join_err) {
+			fprintf(stderr,
+				"unregister did not finish before drain: %s\n",
+				strerror(-join_err));
+			if (!err)
+				err = join_err;
+		} else {
+			unregister_started = false;
+			if (!err)
+				err = unregister.result;
+		}
+	}
 	{
-		int drain_err = drain_io(dev_fd);
+		int drain_err = drain_io(io_fd);
 
 		if (!err)
 			err = drain_err;
@@ -513,8 +546,9 @@ int main(int argc, char **argv)
 		     test_normal_handle_ignored(dev_fd, topology), 0);
 	if (err)
 		goto unregister;
-	err = expect("registered io and unregister",
-		     test_registered_io(dev_fd, topology, handle), 0);
+	err = expect("unregister before drain",
+		     test_unregister_before_drain(dev_fd, other_fd, topology,
+					  handle), 0);
 	if (err)
 		goto out;
 	err = expect("handle sequence",
