@@ -1065,11 +1065,13 @@ static int do_ios(struct p2p_io_context *io_ctx, struct topo *topo, struct fiema
 		  unsigned int nr)
 {
 	struct p2p_iov_iter iter;
+	struct blk_plug plug;
 	unsigned int i;
 	int err = 0;
 
 	p2p_iov_iter_init(&iter, io_ctx->pa_iov, io_ctx->pa_iov_nr,
 			  io_ctx->data_size);
+	blk_start_plug(&plug);
 
 	for (i = 0; i < nr && p2p_iov_iter_count(&iter); i++) {
 		u64 sector = extents[i].fe_physical >> SECTOR_SHIFT;
@@ -1120,6 +1122,7 @@ static int do_ios(struct p2p_io_context *io_ctx, struct topo *topo, struct fiema
 	}
 
 out:
+	blk_finish_plug(&plug);
 	return err;
 }
 
