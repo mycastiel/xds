@@ -21,6 +21,7 @@
 #include <linux/pid.h>
 #include <linux/random.h>
 #include <linux/rcupdate.h>
+#include <linux/workqueue.h>
 #include <linux/xarray.h>
 #ifdef CALC_CRC32
 #include <linux/crc32.h>
@@ -112,6 +113,9 @@ struct p2p_io_context {
 	int io_err;
 	int issue_err;
 	struct list_head io_list;
+#if defined(CALC_CRC32) || defined(DUMP_CONTENT)
+	struct work_struct finalize_work;
+#endif
 };
 
 struct p2p_batch {
@@ -142,6 +146,10 @@ static void p2p_tp_hook_exit(void);
 static void p2p_revoke_all_registered_mem(struct p2p_batch *batch,
 					  struct list_head *revoked);
 static void p2p_destroy_registered_mem_list(struct list_head *revoked);
+static void p2p_io_ctx_put(struct p2p_io_context *io_ctx);
+#if defined(CALC_CRC32) || defined(DUMP_CONTENT)
+static void p2p_finalize_io_work(struct work_struct *work);
+#endif
 
 static struct file_operations fops = {
 	.owner = THIS_MODULE,
@@ -509,6 +517,7 @@ static int p2p_unregister_mem(struct p2p_batch *batch, void __user *arg)
 static void dump_pa_content(u64 pa, u64 size)
 {
 	unsigned int data_len = min_t(u64, size, 16U << 10);
+	char prefix[64];
 	void *addr;
 
 	addr = ioremap(pa, data_len);
@@ -516,13 +525,13 @@ static void dump_pa_content(u64 pa, u64 size)
 		return;
 	}
 
-	print_hex_dump(KERN_INFO, "PA 0x%llx content: ", pa, DUMP_PREFIX_ADDRESS,
-		       16, 1, addr, data_len, false);
+	scnprintf(prefix, sizeof(prefix), "p2p: PA 0x%llx content: ", pa);
+	print_hex_dump(KERN_INFO, prefix, DUMP_PREFIX_ADDRESS, 16, 1, addr, data_len, false);
 
 	iounmap(addr);
 }
 #else
-static void dump_pa_content(u64 pa, u64 size)
+static inline void dump_pa_content(u64 pa, u64 size)
 {
 }
 #endif
@@ -858,6 +867,9 @@ static struct p2p_io_context *new_io_ctx(u32 op, struct file *file, struct p2p_p
 	atomic_set(&io_ctx->io_ref, 1);
 	INIT_LIST_HEAD(&io_ctx->io_list);
 	init_completion(&io_ctx->io_done);
+#if defined(CALC_CRC32) || defined(DUMP_CONTENT)
+	INIT_WORK(&io_ctx->finalize_work, p2p_finalize_io_work);
+#endif
 
 	return io_ctx;
 }
@@ -1012,8 +1024,7 @@ void p2p_complete_io(struct request *req, blk_status_t status)
 	if (status)
 		cmpxchg(&io_ctx->io_err, 0, status);
 
-	if (atomic_dec_and_test(&io_ctx->io_ref))
-		complete(&io_ctx->io_done);
+	p2p_io_ctx_put(io_ctx);
 }
 
 static const char *p2p_io_op_name(u32 op)
@@ -1139,8 +1150,8 @@ static void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
 	unsigned int i;
 
 	/*
-	 * wait_io_done() observed NVMe DMA completion before this helper.
-	 * Order the following CPU reads from P2P memory after that completion.
+	 * Logical-I/O finalization observed every NVMe DMA completion before
+	 * this helper. Order the following CPU reads after those completions.
 	 */
 	dma_rmb();
 
@@ -1165,10 +1176,44 @@ static void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
 		io_ctx->file, io_ctx->data_size, crc);
 }
 #else
-static void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
+static inline void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
 {
 }
 #endif
+
+#if defined(CALC_CRC32) || defined(DUMP_CONTENT)
+static void p2p_finalize_io_work(struct work_struct *work)
+{
+	struct p2p_io_context *io_ctx =
+		container_of(work, struct p2p_io_context, finalize_work);
+
+	dump_io_ctx_crc32(io_ctx);
+	dump_pa_content(io_ctx->pa_iov[0].addr,
+			min_t(u64, io_ctx->data_size, io_ctx->pa_iov[0].len));
+	if (io_ctx->pinned_mem.reg_mem)
+		p2p_unpin_io_mem(&io_ctx->pinned_mem);
+	/* Publish completion only after the worker's final io_ctx access. */
+	complete(&io_ctx->io_done);
+}
+#endif
+
+static void p2p_io_ctx_put(struct p2p_io_context *io_ctx)
+{
+	if (!atomic_dec_and_test(&io_ctx->io_ref))
+		return;
+
+#if defined(CALC_CRC32) || defined(DUMP_CONTENT)
+	if (io_ctx->op == P2P_IO_READ && !io_ctx->issue_err && !io_ctx->io_err) {
+		schedule_work(&io_ctx->finalize_work);
+		return;
+	}
+#endif
+
+	if (io_ctx->pinned_mem.reg_mem)
+		p2p_unpin_io_mem(&io_ctx->pinned_mem);
+	/* drain_io() may free io_ctx as soon as this is visible. */
+	complete(&io_ctx->io_done);
+}
 
 static int validate_io_data(const struct p2p_iov *iov, unsigned int iov_nr,
 			    const struct fiemap_extent *extents, unsigned int ext_nr,
@@ -1373,8 +1418,7 @@ static int p2p_rw_file(struct p2p_batch *batch, void __user *arg)
 	io_ctx->issue_err = do_ios(io_ctx, topo, extents, param.ext_nr);
 	if (io_ctx->issue_err)
 		p2p_stats_io_issue_failed();
-	if (atomic_dec_and_test(&io_ctx->io_ref))
-		complete(&io_ctx->io_done);
+	p2p_io_ctx_put(io_ctx);
 	topo_put(topo);
 	topo = NULL;
 
@@ -1429,13 +1473,8 @@ static int p2p_drain_io(struct p2p_batch *batch)
 			err = blk_status_to_errno(io_err);
 		}
 
-		if (!err && io_ctx->op == P2P_IO_READ) {
-			dump_io_ctx_crc32(io_ctx);
-			dump_pa_content(io_ctx->pa_iov[0].addr,
-					min_t(u64, io_ctx->data_size, io_ctx->pa_iov[0].len));
-		} else if (!first_err) {
+		if (err && !first_err)
 			first_err = err;
-		}
 
 		list_del_init(&io_ctx->io_list);
 		free_io_ctx(io_ctx);
