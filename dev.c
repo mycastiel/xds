@@ -788,7 +788,11 @@ static int get_registered_pa_iov(u64 handle, const struct p2p_iov *iov,
 		first_page = map_offset / map->page_size;
 		last_page = iov_end / map->page_size;
 		nr_pages = last_page - first_page + 1;
-		pa_iov_nr += (unsigned int)nr_pages;
+		if (nr_pages > UINT_MAX - pa_iov_nr) {
+			err = -E2BIG;
+			goto put_mem;
+		}
+		pa_iov_nr += nr_pages;
 	}
 
 	pa_iov = kvmalloc_array(pa_iov_nr, sizeof(*pa_iov), GFP_KERNEL);
@@ -1659,6 +1663,8 @@ static int p2p_get_io_events(struct p2p_batch *batch, void __user *arg)
 	if (!nonblock) {
 		wait_ret = wait_event_interruptible_hrtimeout(
 			batch->wait, p2p_events_ready(batch, param.min_nr), timeout);
+		if (wait_ret == -ERESTARTSYS)
+			wait_ret = -EINTR;
 		if (wait_ret != -ETIME && wait_ret)
 			return wait_ret;
 	}
