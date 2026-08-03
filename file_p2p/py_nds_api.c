@@ -2,6 +2,7 @@
 #include <Python.h>
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -349,6 +350,10 @@ static PyObject *py_nds_io_getevents(PyObject *Py_UNUSED(self), PyObject *args)
 		return PyLong_FromLong(-EINVAL);
 	if (!nr)
 		return PyList_New(0);
+	if (!isfinite(timeout_sec) ||
+	    (timeout_sec >= 0.0 &&
+	     timeout_sec > (double)INT64_MAX / 1000000000.0))
+		return PyLong_FromLong(-EINVAL);
 
 	events = calloc((size_t)nr, sizeof(*events));
 	if (!events)
@@ -414,9 +419,9 @@ static PyMethodDef NdsMethods[] = {
 	  "iov: sequence of (buf_addr, buf_len)\n" },
 	{ "io_getevents", py_nds_io_getevents, METH_VARARGS,
 	  "io_getevents(ctx, min_nr, nr[, timeout_sec=-1]) -> list|int\n\n"
-	  "On success returns [(user_data, res), ...].\n"
-	  "On failure returns negative errno.\n"
-	  "timeout_sec < 0 means wait forever; 0 means non-blocking.\n" },
+		  "On success returns [(user_data, res), ...].\n"
+		  "On failure returns negative errno.\n"
+		  "timeout_sec must be finite; < 0 waits forever and 0 is non-blocking.\n" },
 	{ NULL, NULL, 0, NULL }
 };
 

@@ -236,9 +236,14 @@ int nds_unregister_mem(void *addr)
 			"nds: unregister memory addr=%p size=%llu handle=%llu failed %d\n",
 			r->addr, (unsigned long long)r->size,
 			(unsigned long long)r->handle, ret);
+		pthread_mutex_lock(&g_state.reg_lock);
+		r->next = g_state.regs;
+		g_state.regs = r;
+		pthread_mutex_unlock(&g_state.reg_lock);
+		return ret;
 	}
 	free(r);
-	return ret;
+	return 0;
 }
 
 int nds_io_new_ctx(const struct nds_io_ctx_param *param, struct nds_io_ctx **ctx)
@@ -269,18 +274,21 @@ int nds_io_new_ctx(const struct nds_io_ctx_param *param, struct nds_io_ctx **ctx
 
 int nds_io_destroy_ctx(struct nds_io_ctx *ctx)
 {
-	int ret;
+	int close_err = 0;
+	int drain_err = 0;
 
 	if (!ctx)
 		return -EINVAL;
 
-	ret = ioctl(ctx->p2p_fd, IOCTL_DRAIN_IO);
-	if (ret < 0)
-		fprintf(stderr, "nds: destroy_ctx drain warning %d\n", -errno);
-	ret = close(ctx->p2p_fd);
+	if (ioctl(ctx->p2p_fd, IOCTL_DRAIN_IO) < 0) {
+		drain_err = -errno;
+		fprintf(stderr, "nds: destroy_ctx drain failed %d\n", drain_err);
+	}
+	if (close(ctx->p2p_fd) < 0)
+		close_err = -errno;
 	ctx->p2p_fd = -1;
 	free(ctx);
-	return ret;
+	return drain_err ? drain_err : close_err;
 }
 
 static int find_registered_mem(const struct nds_io_vec *iov,
@@ -340,6 +348,9 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 	err = validate_nds_iov(cb, &io_size);
 	if (err)
 		return err;
+	if (cb->offset > ULONG_MAX ||
+	    io_size > ULONG_MAX - (unsigned long)cb->offset)
+		return -EOVERFLOW;
 
 	if (cb->rw_flags & NDS_IO_F_REGISTERED_MEM) {
 		if (cb->host_pid)
@@ -387,7 +398,7 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 	io->file_fd = file_fd;
 	io->user_data = cb->user_data;
 	/* nds_io_vec is layout-identical to p2p_iov; the ioctl copies it now. */
-	io->iov = (struct p2p_iov *)(uintptr_t)cb->iov;
+	io->iov = (uint64_t)(uintptr_t)cb->iov;
 	io->iov_nr = cb->iov_cnt;
 	io->ext_nr = ext_num;
 	memcpy(io->extents, exts->fm_extents, ext_num * sizeof(io->extents[0]));
@@ -411,7 +422,8 @@ free_exts:
 	return err;
 }
 
-int nds_io_submit(struct nds_io_ctx *ctx, int nr, struct nds_io_cb *iocb)
+int nds_io_submit(struct nds_io_ctx *ctx, int nr,
+		  const struct nds_io_cb *iocb)
 {
 	int i;
 	int ret;
@@ -472,12 +484,18 @@ int nds_io_getevents(struct nds_io_ctx *ctx, int min_nr,
 	param.min_nr = min_nr;
 	param.max_nr = nr;
 	if (timeout) {
+		if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 ||
+		    timeout->tv_nsec >= 1000000000L ||
+		    (uint64_t)timeout->tv_sec >
+		    (uint64_t)(INT64_MAX - timeout->tv_nsec) /
+		    UINT64_C(1000000000))
+			return -EINVAL;
 		param.timeout_ns = (__s64)timeout->tv_sec * 1000000000LL +
 				   timeout->tv_nsec;
 	} else {
 		param.timeout_ns = -1;
 	}
-	param.events = (struct p2p_io_event *)events;
+	param.events = (uint64_t)(uintptr_t)events;
 
 	ret = ioctl(ctx->p2p_fd, IOCTL_GET_IO_EVENTS, &param);
 	if (ret < 0) {

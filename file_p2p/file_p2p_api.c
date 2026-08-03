@@ -131,7 +131,7 @@ int rw_file(int dev_fd, const struct io_parameter *param)
 		io->host_pid = param->host_pid ? param->host_pid : getpid();
 		io->mem_handle = 0;
 	}
-	io->iov = param->iov;
+	io->iov = (uint64_t)(uintptr_t)param->iov;
 	io->iov_nr = param->iov_nr;
 	io->ext_nr = ext_num;
 	memcpy(io->extents, exts->fm_extents, ext_num * sizeof(io->extents[0]));

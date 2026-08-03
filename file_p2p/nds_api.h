@@ -151,7 +151,8 @@ int nds_exit(void);
 /*
  * Pin / unpin an HBM (or CMB) VA range for P2P I/O.
  * flags must be 0. No handle is returned — use NDS_IO_F_REGISTERED_MEM and
- * vectors within that range on later submits. Unregister by the same addr.
+ * vectors within that range on later submits. Unregister by the same addr;
+ * an unregister failure keeps the registration tracked so it can be retried.
  */
 int nds_register_mem(void *addr, uint64_t size, int flags);
 int nds_unregister_mem(void *addr);
@@ -166,7 +167,7 @@ int nds_io_destroy_ctx(struct nds_io_ctx *ctx);
  * Completions are reaped with nds_io_getevents().
  */
 int nds_io_submit(struct nds_io_ctx *ctx, int nr,
-		  struct nds_io_cb *iocb);
+		  const struct nds_io_cb *iocb);
 
 /*
  * Wait for at least min_nr completions, up to nr.
