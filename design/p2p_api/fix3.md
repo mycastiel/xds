@@ -65,7 +65,9 @@ FIEMAP extent packing (`p2p_prepare_io_extents` / `p2p_get_iov_size`) only.
      `-ERANGE`.
    - A process-wide mutex protects the internal registration table during
      registration, lookup, removal, and teardown.
-   - `nds_unregister_mem` frees the kernel handle exactly as before.
+   - `nds_unregister_mem` frees the kernel handle on success. If the kernel
+     ioctl fails, the library keeps the address-to-handle entry so the caller
+     can retry the unregister operation.
 
 5. **Async-only surface: no synchronous helpers**
    - `nds_io_pread` / `nds_io_pwrite` (and their Python `io_pread`/`io_pwrite`
@@ -140,7 +142,8 @@ struct nds_io_event {
 int nds_init(struct nds_init_param *param);
 int nds_exit(void);
 int nds_register_mem(void *addr, uint64_t size, int flags);   /* no handle out */
-int nds_io_submit(struct nds_io_ctx *ctx, int nr, struct nds_io_cb *iocb);
+int nds_io_submit(struct nds_io_ctx *ctx, int nr,
+		  const struct nds_io_cb *iocb);
 int nds_io_getevents(struct nds_io_ctx *ctx, int min_nr, int nr,
 		     struct nds_io_event *events, struct timespec *timeout);
 /* no nds_io_pread / nds_io_pwrite */
@@ -149,7 +152,13 @@ int nds_io_getevents(struct nds_io_ctx *ctx, int min_nr, int nr,
 `nds_io_vec` is layout-identical to the kernel UAPI `p2p_iov`. The NDS build
 asserts their size, alignment, and field offsets, then passes the caller's IOV
 array directly to `IOCTL_RW_FILE`; no translation allocation or vector copy is
-performed in the library. The ioctl consumes the array before returning.
+performed in the library. The ioctl consumes the array before returning. In
+v2.6, the former `unsigned long p2p_iov.size` field is split into a `__u32 size`
+and must-zero `__u32 reserved`, limiting a vector's representable length to
+less than 4 GiB (the kernel currently enforces a 2 GiB maximum). UAPI pointers
+for the IOV and completion arrays are encoded as `__u64` userspace addresses so
+their containing ioctl structures have the same layout for 32-bit and 64-bit
+callers.
 
 ## Python binding
 
@@ -172,6 +181,7 @@ performed in the library. The ioctl consumes the array before returning.
 |---------------------------------------------|---------------|
 | Negative fd                                 | `-EINVAL`     |
 | Empty/oversized IOV                         | `-EINVAL`     |
+| I/O offset plus total vector length overflows | `-EOVERFLOW` |
 | REGISTERED_MEM + `iov[0]` does not fit a region | `-EINVAL` |
 | REGISTERED_MEM + later vector outside selected region | `-ERANGE` |
 | REGISTERED_MEM + `host_pid != 0`            | `-EINVAL`     |
@@ -199,5 +209,8 @@ remains the kernel's responsibility; NDS just propagates the errno.
 - Completion tests match each event to its request by `user_data` and verify
   `res` and reserved output fields, including queued
   completions that may arrive out of order.
+- C and Python completion harvest loops use a 300-second timeout so a lost
+  completion fails the suite instead of hanging indefinitely, while leaving
+  enough headroom for KASAN and stress configurations.
 - The reject names are not consumed by `report_test.py`; the report tracks only
   per-case `ret`/`expected` pairs, so no report changes were needed.

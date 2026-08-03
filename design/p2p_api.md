@@ -55,6 +55,8 @@ tests and by the NDS v1 backend.
 
 ### 1.1 Implementation style, reliability, and usability
 
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
+
 NDS v1 is a facade, not a second I/O stack.  Implementation and review must
 follow the habits already established in `file_p2p/file_p2p_api.c` and the
 kernel module:
@@ -105,6 +107,8 @@ expand these rules into concrete mapping and regression checklists.
 
 ## 2. Sub-design documents
 
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
+
 - [UAPI and userspace contract](p2p_api/uapi.md) defines the public header,
   GDS↔NDS mapping, registered vs one-shot memory flags, error codes,
   validation rules, and reserved fields.
@@ -152,6 +156,8 @@ io_uring internally without changing `nds_io_cb` or `nds_io_event`.
 
 ### 3.2 GDS alignment
 
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
+
 | Purpose | GDS API | NDS API |
 | --- | --- | --- |
 | Initialize library | `cuFileDriverOpen` | `nds_init` |
@@ -171,6 +177,8 @@ parameters, debugfs) stay inside the library or lower-level APIs and are not
 part of the primary GDS comparison table.
 
 ### 3.3 Public structures
+
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
 
 ```c
 #define NDS_API_VERSION 1u
@@ -258,6 +266,8 @@ Notes:
 
 ### 3.4 Two HBM memory modes (both required in v1)
 
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
+
 XDS already has two kernel paths.  NDS v1 exposes both; neither is optional.
 
 | Mode | Caller supplies | Kernel behavior | When to use |
@@ -301,6 +311,8 @@ One-shot:
 
 ### 3.5 Public functions
 
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
+
 ```c
 int nds_init(struct nds_init_param *param);
 int nds_shutdown(void);
@@ -337,6 +349,8 @@ errno).
 
 ### 3.6 Mapping onto existing XDS
 
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
+
 | NDS | Existing XDS |
 | --- | --- |
 | `nds_init` | Process-wide library state; open a private bookkeeping p2p fd for registrations if needed |
@@ -351,6 +365,8 @@ errno).
 | `nds_io_pread`/`pwrite` | Build one `nds_io_cb` (including flags/handle) → submit(1) → getevents(1) → return `res` |
 
 ### 3.7 Completion model (v1)
+
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
 
 The public completion API is **getevents**, not `drain_io`.  Full-fd drain
 cannot express `min_nr` or timeout; additive `IOCTL_GET_IO_EVENTS` (plus
@@ -375,6 +391,8 @@ compose submit and getevents.
 
 ### 3.8 Objects, topologies, and multi-semantic I/O
 
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
+
 v1 supported object types:
 
 | `type` | Meaning | Read | Write |
@@ -390,6 +408,8 @@ in the objects sub-design as an XDS extension; it is not part of the GDS
 comparison table.
 
 ### 3.9 Backend evolution and io_uring
+
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
 
 ```c
 struct nds_backend_ops {
@@ -412,6 +432,8 @@ underneath, or the kernel later grows uring-friendly ioctls, is an
 implementation choice that must not leak into the public header.
 
 ### 3.10 Pseudocode
+
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
 
 ```c
 int nds_init(struct nds_init_param *param)
@@ -548,6 +570,8 @@ public `nds_io_cb` layout.
 
 ## 4. Ownership summary
 
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
+
 | Resource | Owner | Released by |
 | --- | --- | --- |
 | Process library state | `nds_init` | `nds_shutdown` |
@@ -558,6 +582,8 @@ public `nds_io_cb` layout.
 | Topology cache | Library (per ctx or process) | Ctx destroy / shutdown |
 
 ## 5. Required implementation areas
+
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
 
 The implementation is expected to touch these areas while preserving existing
 `file_p2p` behavior and keeping non-completion ioctl packing compatible:
@@ -580,6 +606,8 @@ registered-memory lifetime rules beyond wiring completion cookies through
 accepted I/O contexts.
 
 ## 6. Acceptance criteria
+
+> Historical proposal; use [fix3](p2p_api/fix3.md) for the implemented v2.6 API.
 
 The feature design (and later its v1-complete implementation) is complete when
 all of the following hold:
