@@ -169,6 +169,7 @@ static struct file_operations fops = {
 	.open = p2p_open,
 	.release = p2p_release,
 	.unlocked_ioctl = p2p_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 };
 
 static int p2p_open(struct inode *inode, struct file *file)
@@ -1405,7 +1406,7 @@ static int p2p_rw_file(struct p2p_batch *batch, void __user *arg)
 	if (!iov)
 		return -ENOMEM;
 	if (copy_from_user(iov,
-			   (__force void __user *)(uintptr_t)param.iov,
+			   u64_to_user_ptr(param.iov),
 			   array_size(param.iov_nr, sizeof(*iov)))) {
 		err = -EFAULT;
 		goto free_iov;
@@ -1536,8 +1537,8 @@ static int p2p_drain_io(struct p2p_batch *batch)
 	list_for_each_entry_safe(io_ctx, next_io_ctx, &tmp, io_list) {
 		int err, io_err;
 
-		err = io_ctx->issue_err;
 		io_err = wait_io_done(io_ctx);
+		err = io_ctx->issue_err;
 
 		if (io_err && !err) {
 			pr_err("I/O error status %d errno %d\n", io_err,
@@ -1648,7 +1649,7 @@ static int p2p_get_io_events(struct p2p_batch *batch, void __user *arg)
 	    param.min_nr > param.max_nr || !param.events)
 		return -EINVAL;
 
-	user_events = (struct p2p_io_event __user *)(uintptr_t)param.events;
+	user_events = u64_to_user_ptr(param.events);
 
 	if (param.timeout_ns == 0) {
 		nonblock = true;

@@ -23,7 +23,7 @@ struct p2p_io_param {
 	int host_pid;
 	__u64 mem_handle;
 	__u64 user_data;          /* echo'd in completion event */
-	struct p2p_iov *iov;
+	__u64 iov;                /* userspace pointer to struct p2p_iov[] */
 	unsigned int iov_nr;
 	unsigned int ext_nr;
 	struct fiemap_extent extents[];
@@ -39,7 +39,7 @@ struct p2p_getevents_param {
 	__s32 min_nr;
 	__s32 max_nr;
 	__s64 timeout_ns;       /* <0 infinite, 0 nonblock, >0 relative */
-	struct p2p_io_event *events;
+	__u64 events;           /* userspace pointer to struct p2p_io_event[] */
 };
 
 struct p2p_mem_register_param {
