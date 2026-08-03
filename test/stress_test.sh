@@ -94,7 +94,7 @@ run_stress_api()
 	fi
 
 	log "$STRESS_MODE: running $api API $memory_mode-memory dynamic-VA stress"
-	: >/sys/kernel/debug/p2p_device/summary
+	reset_p2p_stats
 	dmesg -C
 	set +e
 	"${command[@]}" >"$output" 2>&1

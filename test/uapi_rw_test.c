@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <linux/fs.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,13 @@
 #include <unistd.h>
 
 #include "file_p2p_api.h"
+
+#define TEST_TOO_LARGE_IOV_SIZE ((2U << 30) + 512U)
+
+_Static_assert(sizeof(struct p2p_iov) == 16,
+	       "p2p_iov must remain a 16-byte UAPI record");
+_Static_assert(offsetof(struct p2p_iov, reserved) == 12,
+	       "p2p_iov reserved field must occupy the old padding");
 
 static int expect(const char *name, int actual, int expected)
 {
@@ -121,6 +129,16 @@ int main(int argc, char **argv)
 	if (err)
 		goto out;
 	param->flags = 0;
+	iov.reserved = 1;
+	err = expect("IOV reserved field", issue(dev_fd, param), -EINVAL);
+	if (err)
+		goto out;
+	iov.reserved = 0;
+	iov.size = TEST_TOO_LARGE_IOV_SIZE;
+	err = expect("IOV exceeds 2 GiB", issue(dev_fd, param), -EINVAL);
+	if (err)
+		goto out;
+	iov.size = 512;
 
 	param->file_fd = regular_fd;
 	err = expect("regular file write", issue(dev_fd, param),

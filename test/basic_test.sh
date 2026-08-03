@@ -300,7 +300,7 @@ run_write_pipeline()
 	read_output="$WORK_DIR/$label.$suffix.rw-read.out"
 	read_log="$WORK_DIR/$label.$suffix.rw-read.dmesg"
 	command=("${base_command[@]}" --offset "$source_offset" --op read)
-	: >/sys/kernel/debug/p2p_device/summary
+	reset_p2p_stats
 	dmesg -C
 	"${command[@]}" >"$read_output" 2>&1 || {
 		dmesg -c >"$read_log"
@@ -323,7 +323,7 @@ run_write_pipeline()
 	write_output="$WORK_DIR/$label.$suffix.rw-write.out"
 	write_log="$WORK_DIR/$label.$suffix.rw-write.dmesg"
 	command=("${base_command[@]}" --offset "$target_offset" --op write)
-	: >/sys/kernel/debug/p2p_device/summary
+	reset_p2p_stats
 	dmesg -C
 	"${command[@]}" >"$write_output" 2>&1 || {
 		dmesg -c >"$write_log"
@@ -350,7 +350,7 @@ run_write_pipeline()
 	mixed_log="$WORK_DIR/$label.$suffix.rw-mixed.dmesg"
 	command=("${base_command[@]}" --offset "$target_offset" \
 		--source-offset "$source_offset" --op mixed)
-	: >/sys/kernel/debug/p2p_device/summary
+	reset_p2p_stats
 	dmesg -C
 	"${command[@]}" >"$mixed_output" 2>&1 || {
 		dmesg -c >"$mixed_log"

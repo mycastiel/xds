@@ -13,6 +13,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+
 #include "nds_api.h"
 
 #define STRESS_KIB (1UL << 10)
@@ -49,6 +52,13 @@ struct worker {
 	struct start_gate *gate;
 	struct test_case *test;
 	unsigned int flags;
+};
+
+struct expected_io_event {
+	uint64_t user_data;
+	int64_t res;
+	bool negative;
+	bool seen;
 };
 
 struct stress_case {
@@ -429,10 +439,12 @@ static int load_stress_manifest(const char *path,
 	return 0;
 }
 
-static int harvest_io(struct nds_io_ctx *ctx, unsigned int nr)
+static int harvest_io(struct nds_io_ctx *ctx,
+		      struct expected_io_event *expected, unsigned int nr)
 {
 	struct nds_io_event *events;
 	unsigned int got = 0;
+	unsigned int i;
 	int n;
 
 	if (!nr)
@@ -451,7 +463,42 @@ static int harvest_io(struct nds_io_ctx *ctx, unsigned int nr)
 			free(events);
 			return -ETIMEDOUT;
 		}
+		for (i = 0; i < (unsigned int)n; i++) {
+			unsigned int j;
+
+			if (events[i].reserved[0] || events[i].reserved[1]) {
+				fprintf(stderr,
+					"completion cookie %llu has nonzero reserved fields\n",
+					(unsigned long long)events[i].user_data);
+				free(events);
+				return -EINVAL;
+			}
+			for (j = 0; j < nr; j++) {
+				if (!expected[j].seen &&
+				    expected[j].user_data == events[i].user_data)
+					break;
+			}
+			if (j == nr ||
+			    (expected[j].negative ? events[i].res >= 0 :
+						    events[i].res != expected[j].res)) {
+				fprintf(stderr,
+					"unexpected completion cookie=%llu res=%lld\n",
+					(unsigned long long)events[i].user_data,
+					(long long)events[i].res);
+				free(events);
+				return -EINVAL;
+			}
+			expected[j].seen = true;
+		}
 		got += (unsigned int)n;
+	}
+	for (i = 0; i < nr; i++) {
+		if (!expected[i].seen) {
+			fprintf(stderr, "missing completion cookie %llu\n",
+				(unsigned long long)expected[i].user_data);
+			free(events);
+			return -EINVAL;
+		}
 	}
 	free(events);
 	return 0;
@@ -460,17 +507,20 @@ static int harvest_io(struct nds_io_ctx *ctx, unsigned int nr)
 static int submit_case(struct nds_io_ctx *ctx, struct test_case *test,
 		       unsigned int flags, uint64_t user_data)
 {
+	struct nds_io_vec iov = {
+		.buf_addr = test->cmb_va,
+		.buf_len = (uint32_t)test->length,
+	};
 	struct nds_io_cb cb = {
 		.opcode = NDS_IO_OP_PREAD,
 		.rw_flags = flags,
 		.obj = {
-			.type = NDS_IO_OBJ_FD,
 			.fd = test->fd,
 		},
 		.offset = test->file_offset,
 		.user_data = user_data,
-		.buf_addr = test->cmb_va,
-		.buf_len = (uint32_t)test->length,
+		.iov = &iov,
+		.iov_cnt = 1,
 		.host_pid = 0,
 	};
 	int ret;
@@ -489,6 +539,10 @@ static int submit_case(struct nds_io_ctx *ctx, struct test_case *test,
 static void *thread_worker(void *argument)
 {
 	struct worker *worker = argument;
+	struct expected_io_event expected = {
+		.user_data = 0,
+		.res = 0,
+	};
 	struct nds_io_ctx *ctx = NULL;
 	int err;
 
@@ -497,7 +551,7 @@ static void *thread_worker(void *argument)
 		pthread_cond_wait(&worker->gate->cond, &worker->gate->lock);
 	pthread_mutex_unlock(&worker->gate->lock);
 
-	err = nds_io_new_ctx(&(struct nds_io_ctx_param){ .max_io_nr = 4 },
+	err = nds_io_new_ctx(&(struct nds_io_ctx_param){ .max_io_cnt = 4 },
 			     &ctx);
 	if (err) {
 		worker->test->result = err;
@@ -509,7 +563,7 @@ static void *thread_worker(void *argument)
 
 	err = submit_case(ctx, worker->test, worker->flags, 0);
 	if (!err && !worker->test->result) {
-		err = harvest_io(ctx, 1);
+		err = harvest_io(ctx, &expected, 1);
 		if (err) {
 			fprintf(stderr, "harvest after %s failed: %d\n",
 				worker->test->id, err);
@@ -527,11 +581,16 @@ static int run_single(struct nds_io_ctx *ctx, struct test_case *tests,
 	int err;
 
 	for (i = 0; i < count; i++) {
+		struct expected_io_event expected = {
+			.user_data = i,
+			.res = 0,
+		};
+
 		err = submit_case(ctx, &tests[i], flags, i);
 		if (err)
 			return err;
 		if (!tests[i].expected) {
-			err = harvest_io(ctx, 1);
+			err = harvest_io(ctx, &expected, 1);
 			if (err) {
 				fprintf(stderr, "harvest after %s failed: %d\n",
 					tests[i].id, err);
@@ -545,22 +604,33 @@ static int run_single(struct nds_io_ctx *ctx, struct test_case *tests,
 static int run_queued(struct nds_io_ctx *ctx, struct test_case *tests,
 		      size_t count, unsigned int flags)
 {
+	struct expected_io_event *expected;
 	size_t i;
 	unsigned int accepted = 0;
 	int err;
+
+	expected = calloc(count ? count : 1, sizeof(*expected));
+	if (!expected)
+		return -ENOMEM;
 
 	for (i = 0; i < count; i++) {
 		if (tests[i].expected) {
 			fprintf(stderr,
 				"queued mode only accepts successful cases\n");
-			return -EINVAL;
+			err = -EINVAL;
+			goto out;
 		}
 		err = submit_case(ctx, &tests[i], flags, i);
 		if (err)
-			return err;
+			goto out;
+		expected[accepted].user_data = i;
+		expected[accepted].res = 0;
 		accepted++;
 	}
-	return harvest_io(ctx, accepted);
+	err = harvest_io(ctx, expected, accepted);
+out:
+	free(expected);
+	return err;
 }
 
 static int run_threaded(struct test_case *tests, size_t count,
@@ -631,32 +701,117 @@ static int expect_case(const char *name, int ret, int expected)
 	return ret == expected ? 0 : -EINVAL;
 }
 
+static int init_nds(int32_t *topo_fds, uint32_t topo_fd_cnt)
+{
+	struct nds_init_param param = {
+		.desc = {
+			.fs_fd = topo_fds,
+			.fs_fd_cnt = topo_fd_cnt,
+		},
+		.version = UINT32_MAX,
+	};
+	int ret;
+
+	ret = nds_init(&param);
+	if (ret)
+		return ret;
+	if (param.version != NDS_API_VERSION) {
+		fprintf(stderr, "nds_init returned version %u, expected %u\n",
+			param.version, NDS_API_VERSION);
+		return -EPROTO;
+	}
+	return 0;
+}
+
 static int run_reject(const char *topology)
 {
+	struct expected_io_event expected = {
+		.user_data = UINT64_C(0xfeedface),
+		.negative = true,
+	};
 	struct nds_io_ctx *ctx = NULL;
+	struct nds_io_vec iov[] = {
+		{ .buf_addr = 0, .buf_len = 4096 },
+		{ .buf_addr = 4096, .buf_len = 4096 },
+	};
 	struct nds_io_cb cb;
 	struct nds_io_event ev;
 	struct timespec timeout = { 0, 0 };
+	uint64_t size_bytes;
 	int topo_fd = -1;
 	int err;
 	int ret;
+	struct nds_io_ctx *oversized_ctx = NULL;
 
 	topo_fd = open(topology, O_RDONLY | O_DIRECT);
 	if (topo_fd < 0)
 		return -errno;
 
-	err = nds_io_new_ctx(&(struct nds_io_ctx_param){ .max_io_nr = 4 },
+	ret = nds_io_new_ctx(
+		&(struct nds_io_ctx_param){
+			.max_io_cnt = NDS_IO_MAX_IO_CNT + 1,
+		},
+		&oversized_ctx);
+	err = expect_case("reject-max-io-cnt", ret, -EINVAL);
+	if (err)
+		goto out_close;
+
+	err = nds_io_new_ctx(&(struct nds_io_ctx_param){ .max_io_cnt = 4 },
 			     &ctx);
 	if (err)
 		goto out_close;
 
 	memset(&cb, 0, sizeof(cb));
 	cb.opcode = NDS_IO_OP_PREAD;
-	cb.obj.type = NDS_IO_OBJ_FD;
 	cb.obj.fd = topo_fd;
 	cb.offset = 0;
-	cb.buf_addr = 0;
-	cb.buf_len = 8192;
+	cb.iov = iov;
+	cb.iov_cnt = 2;
+
+	cb.reserved = 1;
+	ret = nds_io_submit(ctx, 1, &cb);
+	err = expect_case("reject-cb-reserved", ret, -EINVAL);
+	if (err)
+		goto out;
+	cb.reserved = 0;
+
+	cb.obj.reserved = 1;
+	ret = nds_io_submit(ctx, 1, &cb);
+	err = expect_case("reject-obj-reserved", ret, -EINVAL);
+	if (err)
+		goto out;
+	cb.obj.reserved = 0;
+
+	iov[1].reserved = 1;
+	ret = nds_io_submit(ctx, 1, &cb);
+	err = expect_case("reject-iov-reserved", ret, -EINVAL);
+	if (err)
+		goto out;
+	iov[1].reserved = 0;
+
+	ret = nds_io_submit(ctx, -1, &cb);
+	err = expect_case("reject-submit-negative-nr", ret, -EINVAL);
+	if (err)
+		goto out;
+
+	if (ioctl(topo_fd, BLKGETSIZE64, &size_bytes) < 0) {
+		err = -errno;
+		goto out;
+	}
+	cb.offset = size_bytes;
+	cb.user_data = expected.user_data;
+	ret = nds_io_submit(ctx, 1, &cb);
+	err = expect_case("completion-negative-submit", ret, 1);
+	if (err)
+		goto out;
+	err = harvest_io(ctx, &expected, 1);
+	if (err)
+		goto out;
+	err = expect_case("completion-negative-result", 0, 0);
+	if (err)
+		goto out;
+	cb.offset = 0;
+	cb.user_data = 0;
 
 	cb.rw_flags = NDS_IO_F_REGISTERED_MEM;
 	cb.host_pid = 0;
@@ -665,14 +820,6 @@ static int run_reject(const char *topology)
 	if (err)
 		goto out;
 
-	cb.obj = (struct nds_io_obj){ .type = NDS_IO_OBJ_ID };
-	cb.rw_flags = 0;
-	ret = nds_io_submit(ctx, 1, &cb);
-	err = expect_case("reject-obj-id", ret, -EOPNOTSUPP);
-	if (err)
-		goto out;
-
-	cb.obj.type = NDS_IO_OBJ_FD;
 	cb.obj.fd = topo_fd;
 	cb.host_pid = -1;
 	cb.rw_flags = 0;
@@ -697,6 +844,10 @@ static int run_reject(const char *topology)
 
 	ret = nds_io_getevents(ctx, 1, 1, &ev, &timeout);
 	err = expect_case("reject-getevents-empty", ret, 0);
+	if (err)
+		goto out;
+	ret = nds_io_getevents(ctx, -1, 1, &ev, &timeout);
+	err = expect_case("reject-getevents-negative-min", ret, -EINVAL);
 
 out:
 	nds_io_destroy_ctx(ctx);
@@ -880,17 +1031,25 @@ static int validate_stress_round(struct stress_context *context,
 static int submit_stress_case(struct nds_io_ctx *ctx, struct stress_case *test,
 			      unsigned int flags)
 {
+	uint64_t user_data = (uint64_t)test->iteration << 32 | test->worker;
+	struct expected_io_event expected = {
+		.user_data = user_data,
+		.res = 0,
+	};
+	struct nds_io_vec iov = {
+		.buf_addr = test->cmb_va,
+		.buf_len = (uint32_t)test->length,
+	};
 	struct nds_io_cb cb = {
 		.opcode = NDS_IO_OP_PREAD,
 		.rw_flags = flags,
 		.obj = {
-			.type = NDS_IO_OBJ_FD,
 			.fd = test->fd,
 		},
 		.offset = test->file_offset,
-		.user_data = 0,
-		.buf_addr = test->cmb_va,
-		.buf_len = (uint32_t)test->length,
+		.user_data = user_data,
+		.iov = &iov,
+		.iov_cnt = 1,
 		.host_pid = 0,
 	};
 	int ret;
@@ -905,7 +1064,7 @@ static int submit_stress_case(struct nds_io_ctx *ctx, struct stress_case *test,
 	       test->cmb_va, test->result);
 	if (test->result)
 		return test->result;
-	err = harvest_io(ctx, 1);
+	err = harvest_io(ctx, &expected, 1);
 	if (err)
 		fprintf(stderr, "%s: harvest_io failed: %d\n", test->id, err);
 	return err;
@@ -929,7 +1088,7 @@ static void *stress_thread_worker(void *argument)
 	}
 	pthread_mutex_unlock(&context->gate.lock);
 
-	err = nds_io_new_ctx(&(struct nds_io_ctx_param){ .max_io_nr = 4 },
+	err = nds_io_new_ctx(&(struct nds_io_ctx_param){ .max_io_cnt = 4 },
 			     &ctx);
 	if (err)
 		stress_fail(context, err, "nds_io_new_ctx", worker_id);
@@ -1348,6 +1507,11 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 	if (mode == MODE_REJECT) {
+		struct nds_init_param invalid_init = {
+			.desc = { .fs_fd = (int32_t[]){ topo_fd },
+				  .fs_fd_cnt = 1 },
+		};
+
 		if (workers || iterations || cmb_size || va_granularity ||
 		    backing_page_size || result_manifest) {
 			fprintf(stderr,
@@ -1360,10 +1524,47 @@ int main(int argc, char **argv)
 				strerror(errno));
 			return EXIT_FAILURE;
 		}
-		err = nds_init(&(struct nds_init_param){
-			.version = NDS_API_VERSION,
-			.desc = { .fs_fd = (int32_t[]){ topo_fd },
-				  .fs_fd_cnt = 1 } });
+		invalid_init.desc.fs_fd[0] = topo_fd;
+		invalid_init.flags = 1;
+		err = expect_case("reject-init-flags", nds_init(&invalid_init),
+				  -EINVAL);
+		if (err) {
+			close(topo_fd);
+			return EXIT_FAILURE;
+		}
+		invalid_init.flags = 0;
+		invalid_init.desc.fs_fd_cnt = 0;
+		err = expect_case("reject-init-empty-fds", nds_init(&invalid_init),
+				  -EINVAL);
+		if (err) {
+			close(topo_fd);
+			return EXIT_FAILURE;
+		}
+		invalid_init.desc.fs_fd_cnt = 1;
+		invalid_init.desc.reserved = 1;
+		err = expect_case("reject-init-desc-reserved",
+				  nds_init(&invalid_init), -EINVAL);
+		if (err) {
+			close(topo_fd);
+			return EXIT_FAILURE;
+		}
+		invalid_init.desc.reserved = 0;
+		invalid_init._data[2] = 1;
+		err = expect_case("reject-init-data2", nds_init(&invalid_init),
+				  -EINVAL);
+		if (err) {
+			close(topo_fd);
+			return EXIT_FAILURE;
+		}
+		invalid_init._data[2] = 0;
+		invalid_init._data[3] = 1;
+		err = expect_case("reject-init-data3", nds_init(&invalid_init),
+				  -EINVAL);
+		if (err) {
+			close(topo_fd);
+			return EXIT_FAILURE;
+		}
+		err = init_nds((int32_t[]){ topo_fd, topo_fd }, 2);
 		if (err) {
 			fprintf(stderr, "nds_init failed: %s\n",
 				strerror(-err));
@@ -1401,10 +1602,7 @@ int main(int argc, char **argv)
 			free_stress_cases(stress_tests, count);
 			return EXIT_FAILURE;
 		}
-		err = nds_init(&(struct nds_init_param){
-			.version = NDS_API_VERSION,
-			.desc = { .fs_fd = (int32_t[]){ topo_fd },
-				  .fs_fd_cnt = 1 } });
+		err = init_nds((int32_t[]){ topo_fd }, 1);
 		if (err) {
 			fprintf(stderr, "nds_init failed: %s\n",
 				strerror(-err));
@@ -1439,10 +1637,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "open topology failed: %s\n", strerror(errno));
 		goto out;
 	}
-	err = nds_init(&(struct nds_init_param){
-		.version = NDS_API_VERSION,
-		.desc = { .fs_fd = (int32_t[]){ topo_fd },
-			  .fs_fd_cnt = 1 } });
+	err = init_nds((int32_t[]){ topo_fd }, 1);
 	if (err) {
 		fprintf(stderr, "nds_init failed: %s\n", strerror(-err));
 		goto out;
@@ -1450,13 +1645,8 @@ int main(int argc, char **argv)
 	nds_ready = true;
 
 	if (mode != MODE_THREADED) {
-		unsigned int max_io_nr = count > UINT_MAX ? UINT_MAX :
-							   (unsigned int)count;
-
-		if (!max_io_nr)
-			max_io_nr = 1;
 		err = nds_io_new_ctx(
-			&(struct nds_io_ctx_param){ .max_io_nr = max_io_nr },
+			&(struct nds_io_ctx_param){ .max_io_cnt = 1 },
 			&ctx);
 		if (err) {
 			fprintf(stderr, "nds_io_new_ctx failed: %s\n",

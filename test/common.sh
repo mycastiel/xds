@@ -367,6 +367,11 @@ append_case()
 		"$id" "$path" "$offset" "$va" "$length" "$expected" >>"$manifest"
 }
 
+reset_p2p_stats()
+{
+	printf '0\n' >/sys/kernel/debug/p2p_device/summary
+}
+
 check_stats()
 {
 	local summary=/sys/kernel/debug/p2p_device/summary
@@ -389,7 +394,7 @@ run_manifest()
 	local status
 	local -a command
 
-	: >/sys/kernel/debug/p2p_device/summary
+	reset_p2p_stats
 	dmesg -C
 	case $api in
 		c)

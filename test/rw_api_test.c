@@ -46,6 +46,7 @@ static unsigned int make_iovs(struct p2p_iov iov[3], unsigned long cmb_va,
 	unsigned long first = 512;
 	unsigned long second = 128UL << 10;
 
+	memset(iov, 0, sizeof(*iov) * 3);
 	if (length < first + second + 512) {
 		iov[0].addr = cmb_va;
 		iov[0].size = length;

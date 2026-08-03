@@ -114,8 +114,8 @@ def close_case_fds(tests: Sequence) -> None:
             test.fd = None
 
 
-def new_ctx(max_io_nr: int):
-    ctx = nds.io_new_ctx(max_io_nr)
+def new_ctx(max_io_cnt: int):
+    ctx = nds.io_new_ctx(max_io_cnt)
     if isinstance(ctx, int):
         raise RuntimeError(f"nds.io_new_ctx returned {ctx}")
     return ctx
@@ -146,10 +146,9 @@ def submit(ctx, test: TestCase, flags: int, user_data: int = 0) -> None:
         [
             (
                 nds.NDS_IO_OP_PREAD,
-                (nds.NDS_IO_OBJ_FD, test.fd),
+                test.fd,
                 test.file_offset,
-                test.cmb_va,
-                test.length,
+                [(test.cmb_va, test.length)],
                 flags,
                 0,
                 user_data,
@@ -181,13 +180,50 @@ def require(name: str, actual: int, expected: int) -> None:
         raise RuntimeError(f"{name} returned {actual}, expected {expected}")
 
 
+def require_value_error(name: str, operation) -> None:
+    try:
+        operation()
+    except ValueError:
+        require(name, -errno.EINVAL, -errno.EINVAL)
+        return
+    raise RuntimeError(f"{name} did not raise ValueError")
+
+
 def run_reject(topology: str) -> None:
     topo_fd = os.open(topology, os.O_RDONLY | os.O_DIRECT)
+    require(
+        "reject-max-io-cnt",
+        nds.io_new_ctx(nds.NDS_IO_MAX_IO_CNT + 1),
+        -errno.EINVAL,
+    )
     ctx = new_ctx(4)
     try:
-        path_obj = (nds.NDS_IO_OBJ_FD, topo_fd)
         buf_addr = 0
         buf_len = 8192
+
+        def submit_fd(fd, iov=None) -> int:
+            if iov is None:
+                iov = [(buf_addr, buf_len)]
+            return nds.io_submit(
+                ctx,
+                [
+                    (
+                        nds.NDS_IO_OP_PREAD,
+                        fd,
+                        0,
+                        iov,
+                    )
+                ],
+            )
+
+        require_value_error(
+            "reject-iov-empty",
+            lambda: submit_fd(topo_fd, []),
+        )
+        require_value_error(
+            "reject-fd-overflow",
+            lambda: submit_fd(2**32 + topo_fd),
+        )
 
         require(
             "reject-reg-unregistered-buf",
@@ -196,10 +232,9 @@ def run_reject(topology: str) -> None:
                 [
                     (
                         nds.NDS_IO_OP_PREAD,
-                        path_obj,
+                        topo_fd,
                         0,
-                        buf_addr,
-                        buf_len,
+                        [(buf_addr, buf_len)],
                         nds.NDS_IO_F_REGISTERED_MEM,
                         0,
                         1,
@@ -209,34 +244,15 @@ def run_reject(topology: str) -> None:
             -errno.EINVAL,
         )
         require(
-            "reject-obj-id",
-            nds.io_submit(
-                ctx,
-                [
-                    (
-                        nds.NDS_IO_OP_PREAD,
-                        (nds.NDS_IO_OBJ_ID, 0),                        0,
-                        buf_addr,
-                        buf_len,
-                        0,
-                        0,
-                        3,
-                    )
-                ],
-            ),
-            -errno.EOPNOTSUPP,
-        )
-        require(
             "reject-host-pid-neg",
             nds.io_submit(
                 ctx,
                 [
                     (
                         nds.NDS_IO_OP_PREAD,
-                        path_obj,
+                        topo_fd,
                         0,
-                        buf_addr,
-                        buf_len,
+                        [(buf_addr, buf_len)],
                         0,
                         -1,
                         4,
@@ -252,10 +268,9 @@ def run_reject(topology: str) -> None:
                 [
                     (
                         nds.NDS_IO_OP_PREAD,
-                        path_obj,
+                        topo_fd,
                         0,
-                        buf_addr,
-                        buf_len,
+                        [(buf_addr, buf_len)],
                         nds.NDS_IO_F_REGISTERED_MEM,
                         1,
                         5,
@@ -271,10 +286,9 @@ def run_reject(topology: str) -> None:
                 [
                     (
                         nds.NDS_IO_OP_PREAD,
-                        path_obj,
+                        topo_fd,
                         0,
-                        buf_addr,
-                        buf_len,
+                        [(buf_addr, buf_len)],
                         nds.NDS_IO_F_REGISTERED_MEM << 1,
                         0,
                         6,
@@ -534,10 +548,9 @@ def run_stress(
                             [
                                 (
                                     nds.NDS_IO_OP_PREAD,
-                                    (nds.NDS_IO_OBJ_FD, test.fd),
+                                    test.fd,
                                     test.file_offset,
-                                    va,
-                                    test.length,
+                                    [(va, test.length)],
                                     flags,
                                     0,
                                     0,
@@ -634,6 +647,12 @@ def main() -> int:
             parser.error("reject mode does not take --registered-mem")
         topo_fd = os.open(args.topology, os.O_RDONLY | os.O_DIRECT)
         try:
+            require("reject-init-empty-fds", nds.init([]), -errno.EINVAL)
+            require(
+                "reject-init-flags",
+                nds.init([topo_fd], 1),
+                -errno.EINVAL,
+            )
             ret = nds.init([topo_fd])
             if ret:
                 raise RuntimeError(f"nds.init returned {ret}")
@@ -722,8 +741,7 @@ def main() -> int:
             if args.mode == "threaded":
                 run_threaded(tests, flags)
             else:
-                max_io_nr = max(len(tests), 1)
-                ctx = new_ctx(max_io_nr)
+                ctx = new_ctx(1)
                 if args.mode == "single":
                     run_single(ctx, tests, flags)
                 else:

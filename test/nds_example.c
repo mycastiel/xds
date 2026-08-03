@@ -5,12 +5,11 @@
  *   nds_init → nds_register_mem → nds_io_new_ctx →
  *   nds_io_submit → nds_io_getevents → teardown
  *
- * Build (from this directory):
- *   cc -O2 -Wall -Wextra -I. -I.. -o nds_example \
- *      nds_example.c nds_api.c p2p_common.c
+ * Build (from the repository root):
+ *   make -C test nds_example
  *
  * Run (requires /dev/p2p_device and a loaded topology-capable block stack):
- *   sudo ./nds_example /dev/nvme0n1 /path/to/file.dat 0 0 4096
+ *   sudo ./test/nds_example /dev/nvme0n1 /path/to/file.dat 0 0 4096
  *
  * Args:
  *   topology   file or block device identifying the I/O topology
@@ -50,6 +49,7 @@ int main(int argc, char **argv)
 	int32_t fs_fds[1];
 	struct nds_io_ctx *ctx = NULL;
 	struct nds_io_cb cb;
+	struct nds_io_vec iov;
 	struct nds_io_event ev;
 	int err;
 	int n;
@@ -98,19 +98,21 @@ int main(int argc, char **argv)
 
 	/* ---- 4. Create an I/O context (queue) ---- */
 	err = nds_io_new_ctx(
-		&(struct nds_io_ctx_param){ .max_io_nr = 32 }, &ctx);
+		&(struct nds_io_ctx_param){ .max_io_cnt = 32 }, &ctx);
 	if (err)
 		die("nds_io_new_ctx", err);
 
 	/* ---- 5. Build one async PREAD and submit ---- */
 	memset(&cb, 0, sizeof(cb));
+	memset(&iov, 0, sizeof(iov));
+	iov.buf_addr = hbm_va;
+	iov.buf_len = length;
 	cb.opcode = NDS_IO_OP_PREAD;
 	cb.rw_flags = NDS_IO_F_REGISTERED_MEM;
-	cb.obj.type = NDS_IO_OBJ_FD;
 	cb.obj.fd = file_fd;
 	cb.offset = offset;
-	cb.buf_addr = hbm_va;
-	cb.buf_len = length;
+	cb.iov = &iov;
+	cb.iov_cnt = 1;
 	cb.host_pid = 0;		/* must be 0 with REGISTERED_MEM */
 	cb.user_data = 0xA5A5;		/* echoed in the completion event */
 
@@ -126,8 +128,8 @@ int main(int argc, char **argv)
 	if (ev.res < 0)
 		die("I/O failed", (int)ev.res);
 
-	printf("I/O complete: user_data=0x%llx res=%lld (bytes) opcode=%u\n",
-	       (unsigned long long)ev.user_data, (long long)ev.res, ev.opcode);
+	printf("I/O complete: user_data=0x%llx res=%lld\n",
+	       (unsigned long long)ev.user_data, (long long)ev.res);
 
 	/* ---- 7. Tear down (reverse order) ---- */
 	err = nds_io_destroy_ctx(ctx);
