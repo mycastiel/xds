@@ -11,7 +11,8 @@ nds_module = Extension(
     "nds",
     sources=["nds_api.c", "py_nds_api.c", "p2p_common.c"],
     depends=["nds_api.h", "p2p_dev_uapi.h", "p2p_common.h"],
-    extra_compile_args=["-Wall", "-Wextra"],
+    extra_compile_args=["-Wall", "-Wextra", "-pthread"],
+    extra_link_args=["-pthread"],
 )
 
 setup(

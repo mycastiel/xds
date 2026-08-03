@@ -1,5 +1,6 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -35,53 +36,51 @@ static struct nds_io_ctx *nds_ctx_from_obj(PyObject *obj)
 	return ctx;
 }
 
-static int parse_nds_obj(PyObject *obj, struct nds_io_obj *out)
+static int parse_nds_iov(PyObject *obj, struct nds_io_vec **iov_out,
+			 uint32_t *iov_cnt_out)
 {
-	PyObject *type_obj;
-	PyObject *value_obj;
-	Py_ssize_t n;
-	long type;
+	struct nds_io_vec *iov;
+	PyObject *seq;
+	Py_ssize_t count;
+	Py_ssize_t i;
 
-	memset(out, 0, sizeof(*out));
-	if (!PyTuple_Check(obj)) {
-		PyErr_SetString(PyExc_TypeError,
-				"obj must be (type, fd_or_id)");
+	seq = PySequence_Fast(obj, "iov must be a sequence of (buf_addr, buf_len)");
+	if (!seq)
+		return -1;
+	count = PySequence_Fast_GET_SIZE(seq);
+	if (count <= 0 || count > NDS_IO_MAX_IOV) {
+		Py_DECREF(seq);
+		PyErr_SetString(PyExc_ValueError, "iov count out of range");
 		return -1;
 	}
-	n = PyTuple_GET_SIZE(obj);
-	if (n != 2) {
-		PyErr_SetString(PyExc_TypeError,
-				"obj must be (type, fd_or_id)");
+	iov = calloc((size_t)count, sizeof(*iov));
+	if (!iov) {
+		Py_DECREF(seq);
+		PyErr_NoMemory();
 		return -1;
 	}
-	type_obj = PyTuple_GET_ITEM(obj, 0);
-	value_obj = PyTuple_GET_ITEM(obj, 1);
-	type = PyLong_AsLong(type_obj);
-	if (PyErr_Occurred())
-		return -1;
-	out->type = (uint32_t)type;
+	for (i = 0; i < count; i++) {
+		unsigned long long addr;
+		unsigned int len;
 
-	if (out->type == NDS_IO_OBJ_FD) {
-		out->fd = (int32_t)PyLong_AsLong(value_obj);
-		if (PyErr_Occurred())
+		if (!PyArg_ParseTuple(PySequence_Fast_GET_ITEM(seq, i), "KI",
+				      &addr, &len)) {
+			free(iov);
+			Py_DECREF(seq);
 			return -1;
-		return 0;
+		}
+		iov[i].buf_addr = addr;
+		iov[i].buf_len = len;
 	}
-	if (out->type == NDS_IO_OBJ_ID) {
-		/* Pass through; C layer returns -EOPNOTSUPP. */
-		out->_data = (uint64_t)PyLong_AsUnsignedLongLong(value_obj);
-		if (PyErr_Occurred())
-			return -1;
-		return 0;
-	}
-	PyErr_SetString(PyExc_ValueError, "unsupported nds_io_obj type");
-	return -1;
+	Py_DECREF(seq);
+	*iov_out = iov;
+	*iov_cnt_out = (uint32_t)count;
+	return 0;
 }
 
 static PyObject *py_nds_init(PyObject *Py_UNUSED(self), PyObject *args)
 {
-	struct nds_init_param param = { .version = NDS_API_VERSION };
-	unsigned int version = NDS_API_VERSION;
+	struct nds_init_param param = { };
 	unsigned int flags = 0;
 	PyObject *fd_seq;
 	PyObject *seq = NULL;
@@ -90,8 +89,8 @@ static PyObject *py_nds_init(PyObject *Py_UNUSED(self), PyObject *args)
 	Py_ssize_t i;
 	int ret;
 
-	/* init(fs_fds[, version=NDS_API_VERSION[, flags=0]]) */
-	if (!PyArg_ParseTuple(args, "O|II", &fd_seq, &version, &flags))
+	/* init(fs_fds[, flags=0]) */
+	if (!PyArg_ParseTuple(args, "O|I", &fd_seq, &flags))
 		return NULL;
 
 	seq = PySequence_Fast(fd_seq, "fs_fds must be a sequence of ints");
@@ -123,7 +122,6 @@ static PyObject *py_nds_init(PyObject *Py_UNUSED(self), PyObject *args)
 	}
 	Py_DECREF(seq);
 
-	param.version = version;
 	param.flags = flags;
 	param.desc.fs_fd = fds;
 	param.desc.fs_fd_cnt = (uint32_t)count;
@@ -182,13 +180,13 @@ static PyObject *py_nds_io_new_ctx(PyObject *Py_UNUSED(self), PyObject *args)
 {
 	struct nds_io_ctx_param param = { };
 	struct nds_io_ctx *ctx = NULL;
-	unsigned int max_io_nr;
+	unsigned int max_io_cnt;
 	unsigned int flags = 0;
 	int ret;
 
-	if (!PyArg_ParseTuple(args, "I|I", &max_io_nr, &flags))
+	if (!PyArg_ParseTuple(args, "I|I", &max_io_cnt, &flags))
 		return NULL;
-	param.max_io_nr = max_io_nr;
+	param.max_io_cnt = max_io_cnt;
 	param.flags = flags;
 
 	Py_BEGIN_ALLOW_THREADS
@@ -233,6 +231,7 @@ static PyObject *py_nds_io_submit(PyObject *Py_UNUSED(self), PyObject *args)
 	PyObject *seq;
 	struct nds_io_ctx *ctx;
 	struct nds_io_cb *cbs = NULL;
+	struct nds_io_vec **iov = NULL;
 	Py_ssize_t count;
 	Py_ssize_t i;
 	int ret;
@@ -247,7 +246,7 @@ static PyObject *py_nds_io_submit(PyObject *Py_UNUSED(self), PyObject *args)
 	if (!seq)
 		return NULL;
 	count = PySequence_Fast_GET_SIZE(seq);
-	if (count < 0 || count > UINT_MAX) {
+	if (count < 0 || count > INT_MAX) {
 		Py_DECREF(seq);
 		PyErr_SetString(PyExc_ValueError, "iocb count out of range");
 		return NULL;
@@ -258,57 +257,73 @@ static PyObject *py_nds_io_submit(PyObject *Py_UNUSED(self), PyObject *args)
 	}
 
 	cbs = calloc((size_t)count, sizeof(*cbs));
-	if (!cbs) {
+	iov = calloc((size_t)count, sizeof(*iov));
+	if (!cbs || !iov) {
+		free(cbs);
+		free(iov);
 		Py_DECREF(seq);
 		return PyErr_NoMemory();
 	}
 
 	for (i = 0; i < count; i++) {
 		PyObject *item = PySequence_Fast_GET_ITEM(seq, i);
-		PyObject *obj_py;
+		PyObject *fd_py;
+		PyObject *iov_py;
 		unsigned int opcode;
 		unsigned int rw_flags = 0;
 		unsigned long long offset;
 		unsigned long long user_data = 0;
-		unsigned long long buf_addr;
-		unsigned int buf_len;
+		long long fd;
 		int host_pid = 0;
 
 		/*
 		 * iocb tuple:
-		 * (opcode, obj, offset, buf_addr, buf_len
+		 * (opcode, fd, offset, iov
 		 *  [, rw_flags=0, host_pid=0, user_data=0])
-		 * obj: (NDS_IO_OBJ_FD, fd)
+		 * iov: sequence of (buf_addr, buf_len)
 		 */
-		if (!PyArg_ParseTuple(item, "IOKKI|IiK",
-				      &opcode, &obj_py, &offset, &buf_addr,
-				      &buf_len, &rw_flags, &host_pid,
+		if (!PyArg_ParseTuple(item, "IOKO|IiK",
+				      &opcode, &fd_py, &offset, &iov_py,
+				      &rw_flags, &host_pid,
 				      &user_data)) {
-			free(cbs);
-			Py_DECREF(seq);
-			return NULL;
+			goto parse_error;
 		}
+		fd = PyLong_AsLongLong(fd_py);
+		if (PyErr_Occurred())
+			goto parse_error;
+		if (fd < 0 || fd > INT32_MAX) {
+			PyErr_SetString(PyExc_ValueError, "fd out of range");
+			goto parse_error;
+		}
+		if (parse_nds_iov(iov_py, &iov[i], &cbs[i].iov_cnt))
+			goto parse_error;
 		cbs[i].opcode = opcode;
 		cbs[i].rw_flags = rw_flags;
+		cbs[i].obj.fd = (int32_t)fd;
 		cbs[i].offset = offset;
 		cbs[i].user_data = user_data;
-		cbs[i].buf_addr = buf_addr;
-		cbs[i].buf_len = buf_len;
+		cbs[i].iov = iov[i];
 		cbs[i].host_pid = (int32_t)host_pid;
-		if (parse_nds_obj(obj_py, &cbs[i].obj)) {
-			free(cbs);
-			Py_DECREF(seq);
-			return NULL;
-		}
 	}
 	Py_DECREF(seq);
 
 	Py_BEGIN_ALLOW_THREADS
-	ret = nds_io_submit(ctx, (unsigned int)count, cbs);
+	ret = nds_io_submit(ctx, (int)count, cbs);
 	Py_END_ALLOW_THREADS
 
+	for (i = 0; i < count; i++)
+		free(iov[i]);
+	free(iov);
 	free(cbs);
 	return PyLong_FromLong(ret);
+
+parse_error:
+	for (i = 0; i < count; i++)
+		free(iov[i]);
+	free(iov);
+	free(cbs);
+	Py_DECREF(seq);
+	return NULL;
 }
 
 static PyObject *py_nds_io_getevents(PyObject *Py_UNUSED(self), PyObject *args)
@@ -318,22 +333,24 @@ static PyObject *py_nds_io_getevents(PyObject *Py_UNUSED(self), PyObject *args)
 	struct nds_io_event *events = NULL;
 	struct timespec ts_storage;
 	struct timespec *timeout = NULL;
-	unsigned int min_nr;
-	unsigned int nr;
+	int min_nr;
+	int nr;
 	double timeout_sec = -1.0;
 	PyObject *list;
 	int ret;
 	int i;
 
-	if (!PyArg_ParseTuple(args, "OII|d", &capsule, &min_nr, &nr, &timeout_sec))
+	if (!PyArg_ParseTuple(args, "Oii|d", &capsule, &min_nr, &nr, &timeout_sec))
 		return NULL;
 	ctx = nds_ctx_from_obj(capsule);
 	if (!ctx)
 		return NULL;
+	if (min_nr < 0 || nr < 0 || min_nr > nr)
+		return PyLong_FromLong(-EINVAL);
 	if (!nr)
 		return PyList_New(0);
 
-	events = calloc(nr, sizeof(*events));
+	events = calloc((size_t)nr, sizeof(*events));
 	if (!events)
 		return PyErr_NoMemory();
 
@@ -362,10 +379,9 @@ static PyObject *py_nds_io_getevents(PyObject *Py_UNUSED(self), PyObject *args)
 	for (i = 0; i < ret; i++) {
 		PyObject *tup;
 
-		tup = Py_BuildValue("(KLI)",
+		tup = Py_BuildValue("(KL)",
 				    (unsigned long long)events[i].user_data,
-				    (long long)events[i].res,
-				    (unsigned int)events[i].opcode);
+				    (long long)events[i].res);
 		if (!tup) {
 			Py_DECREF(list);
 			free(events);
@@ -379,7 +395,7 @@ static PyObject *py_nds_io_getevents(PyObject *Py_UNUSED(self), PyObject *args)
 
 static PyMethodDef NdsMethods[] = {
 	{ "init", py_nds_init, METH_VARARGS,
-	  "init(fs_fds[, version=NDS_API_VERSION[, flags=0]]) -> int\n"
+	  "init(fs_fds[, flags=0]) -> int\n"
 	  "fs_fds: sequence of file/block fds identifying the topology\n" },
 	{ "exit", py_nds_exit, METH_NOARGS,
 	  "exit() -> int\n" },
@@ -388,17 +404,17 @@ static PyMethodDef NdsMethods[] = {
 	{ "unregister_mem", py_nds_unregister_mem, METH_VARARGS,
 	  "unregister_mem(addr) -> int\n" },
 	{ "io_new_ctx", py_nds_io_new_ctx, METH_VARARGS,
-	  "io_new_ctx(max_io_nr[, flags=0]) -> ctx capsule | negative errno\n" },
+	  "io_new_ctx(max_io_cnt[, flags=0]) -> ctx capsule | negative errno\n" },
 	{ "io_destroy_ctx", py_nds_io_destroy_ctx, METH_VARARGS,
 	  "io_destroy_ctx(ctx) -> int\n" },
 	{ "io_submit", py_nds_io_submit, METH_VARARGS,
 	  "io_submit(ctx, iocbs) -> int\n\n"
-	  "iocb: (opcode, obj, offset, buf_addr, buf_len"
+	  "iocb: (opcode, fd, offset, iov"
 	  "[, rw_flags=0, host_pid=0, user_data=0])\n"
-	  "obj: (NDS_IO_OBJ_FD, fd) or (NDS_IO_OBJ_ID, id)\n" },
+	  "iov: sequence of (buf_addr, buf_len)\n" },
 	{ "io_getevents", py_nds_io_getevents, METH_VARARGS,
 	  "io_getevents(ctx, min_nr, nr[, timeout_sec=-1]) -> list|int\n\n"
-	  "On success returns [(user_data, res, opcode), ...].\n"
+	  "On success returns [(user_data, res), ...].\n"
 	  "On failure returns negative errno.\n"
 	  "timeout_sec < 0 means wait forever; 0 means non-blocking.\n" },
 	{ NULL, NULL, 0, NULL }
@@ -421,12 +437,11 @@ PyMODINIT_FUNC PyInit_nds(void)
 		return NULL;
 
 	if (PyModule_AddIntConstant(module, "NDS_API_VERSION", NDS_API_VERSION) ||
-	    PyModule_AddIntConstant(module, "NDS_IO_OBJ_FD", NDS_IO_OBJ_FD) ||
-	    PyModule_AddIntConstant(module, "NDS_IO_OBJ_ID", NDS_IO_OBJ_ID) ||
+	    PyModule_AddIntConstant(module, "NDS_IO_MAX_IO_CNT",
+				    NDS_IO_MAX_IO_CNT) ||
+	    PyModule_AddIntConstant(module, "NDS_IO_MAX_IOV", NDS_IO_MAX_IOV) ||
 	    PyModule_AddIntConstant(module, "NDS_IO_OP_PREAD", NDS_IO_OP_PREAD) ||
 	    PyModule_AddIntConstant(module, "NDS_IO_OP_PWRITE", NDS_IO_OP_PWRITE) ||
-	    PyModule_AddIntConstant(module, "NDS_IO_OP_PREADV", NDS_IO_OP_PREADV) ||
-	    PyModule_AddIntConstant(module, "NDS_IO_OP_PWRITEV", NDS_IO_OP_PWRITEV) ||
 	    PyModule_AddIntConstant(module, "NDS_IO_F_REGISTERED_MEM",
 				    NDS_IO_F_REGISTERED_MEM)) {
 		Py_DECREF(module);

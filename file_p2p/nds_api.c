@@ -10,7 +10,7 @@
 #include <string.h>
 #include <errno.h>
 #include <stddef.h>
-#include <stdatomic.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -27,16 +27,27 @@
 #include "p2p_dev_uapi.h"
 #include "p2p_common.h"
 
+_Static_assert(sizeof(struct nds_io_vec) == sizeof(struct p2p_iov),
+	       "nds_io_vec must match p2p_iov for zero-copy submission");
+_Static_assert(_Alignof(struct nds_io_vec) == _Alignof(struct p2p_iov),
+	       "nds_io_vec alignment must match p2p_iov");
+_Static_assert(offsetof(struct nds_io_vec, buf_addr) ==
+		       offsetof(struct p2p_iov, addr) &&
+	       offsetof(struct nds_io_vec, buf_len) ==
+		       offsetof(struct p2p_iov, size) &&
+	       offsetof(struct nds_io_vec, reserved) ==
+		       offsetof(struct p2p_iov, reserved),
+	       "nds_io_vec field layout must match p2p_iov");
 _Static_assert(sizeof(struct nds_io_event) == sizeof(struct p2p_io_event),
 	       "nds_io_event must match p2p_io_event for zero-copy getevents");
+_Static_assert(sizeof(struct nds_io_event) == 32,
+	       "nds_io_event must remain a 32-byte completion record");
 _Static_assert(offsetof(struct nds_io_event, user_data) ==
 		       offsetof(struct p2p_io_event, user_data) &&
 	       offsetof(struct nds_io_event, res) ==
 		       offsetof(struct p2p_io_event, res) &&
-	       offsetof(struct nds_io_event, opcode) ==
-		       offsetof(struct p2p_io_event, op) &&
-	       offsetof(struct nds_io_event, flags) ==
-		       offsetof(struct p2p_io_event, flags),
+	       offsetof(struct nds_io_event, reserved) ==
+		       offsetof(struct p2p_io_event, reserved),
 	       "nds_io_event field layout must match p2p_io_event");
 
 struct nds_reg_entry {
@@ -46,16 +57,55 @@ struct nds_reg_entry {
 	uint64_t handle;
 };
 
+struct nds_io_ctx {
+	int p2p_fd;
+};
+
 struct nds_state {
 	int book_fd;
 	struct nds_reg_entry *regs;
+	pthread_mutex_t reg_lock;
 };
 
-static struct nds_state g_state = { .book_fd = -1 };
+static struct nds_state g_state = {
+	.book_fd = -1,
+	.reg_lock = PTHREAD_MUTEX_INITIALIZER,
+};
 
 static int is_init(void)
 {
 	return g_state.book_fd >= 0;
+}
+
+static int topo_fd_to_bdev(int32_t topo_fd, char *bdev, size_t bdev_size)
+{
+	char sys[64];
+	char link[PATH_MAX];
+	const char *base;
+	struct stat st;
+	dev_t target;
+	ssize_t n;
+
+	if (fstat(topo_fd, &st) < 0)
+		return -errno;
+	if (S_ISBLK(st.st_mode))
+		target = st.st_rdev;
+	else if (S_ISREG(st.st_mode))
+		target = st.st_dev;
+	else
+		return -EINVAL;
+
+	snprintf(sys, sizeof(sys), "/sys/dev/block/%u:%u",
+		 major(target), minor(target));
+	n = readlink(sys, link, sizeof(link) - 1);
+	if (n < 0)
+		return -errno;
+	link[n] = '\0';
+	base = strrchr(link, '/');
+	base = base ? base + 1 : link;
+	if (snprintf(bdev, bdev_size, "/dev/%s", base) >= (int)bdev_size)
+		return -ENAMETOOLONG;
+	return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -64,76 +114,34 @@ static int is_init(void)
 
 int nds_init(struct nds_init_param *param)
 {
-	char path[PATH_MAX];
 	char bdev[PATH_MAX];
-	struct stat st;
-	dev_t target;
-	char sys[64];
-	char link[PATH_MAX];
-	const char *base;
-	const char *topo_path;
-	ssize_t n;
-	int32_t topo_fd;
+	uint32_t i;
 	int ret;
 
-	if (!param)
+	if (!param || param->flags || is_init() || !param->desc.fs_fd ||
+	    !param->desc.fs_fd_cnt || param->desc.reserved || param->_data[2] ||
+	    param->_data[3])
 		return -EINVAL;
-	if (param->version != NDS_API_VERSION)
-		return -EINVAL;
-	if (param->flags)
-		return -EOPNOTSUPP;
-	if (is_init())
-		return -EBUSY;
-
-	/*
-	 * Topology is described by an fs_fd array; v1 registers the topology
-	 * of the first fd only (single top device).
-	 */
-	if (!param->desc.fs_fd || param->desc.fs_fd_cnt != 1 ||
-	    param->desc.reserved)
-		return -EINVAL;
-	topo_fd = param->desc.fs_fd[0];
-
-	/* Resolve topo fd to the underlying block device path. */
-	snprintf(path, sizeof(path), "/proc/self/fd/%d", topo_fd);
-	n = readlink(path, link, sizeof(link) - 1);
-	if (n < 0)
-		return -errno;
-	link[n] = '\0';
-	if (stat(link, &st) < 0)
-		return -errno;
-	if (S_ISBLK(st.st_mode)) {
-		topo_path = link;
-	} else if (S_ISREG(st.st_mode)) {
-		target = st.st_dev;
-		snprintf(sys, sizeof(sys), "/sys/dev/block/%u:%u",
-			 major(target), minor(target));
-		n = readlink(sys, link, sizeof(link) - 1);
-		if (n < 0)
-			return -errno;
-		link[n] = '\0';
-		base = strrchr(link, '/');
-		base = base ? base + 1 : link;
-		if (snprintf(bdev, sizeof(bdev), "/dev/%s", base) >=
-		    (int)sizeof(bdev))
-			return -ENAMETOOLONG;
-		topo_path = bdev;
-	} else {
-		return -EINVAL;
-	}
 
 	g_state.book_fd = p2p_open_dev();
 	if (g_state.book_fd < 0)
 		return g_state.book_fd;
 	g_state.regs = NULL;
 
-	/* Register topology once for the lifetime of book_fd. */
-	ret = p2p_add_topo(g_state.book_fd, topo_path);
-	if (ret && ret != -EEXIST) {
-		close(g_state.book_fd);
-		g_state.book_fd = -1;
-		return ret;
+	/* Register every supplied topology for the lifetime of book_fd. */
+	for (i = 0; i < param->desc.fs_fd_cnt; i++) {
+		ret = topo_fd_to_bdev(param->desc.fs_fd[i], bdev, sizeof(bdev));
+		if (!ret)
+			ret = p2p_add_topo(g_state.book_fd, bdev);
+		if (ret) {
+			fprintf(stderr, "nds: add topology for fd %d failed %d\n",
+				param->desc.fs_fd[i], ret);
+			close(g_state.book_fd);
+			g_state.book_fd = -1;
+			return ret;
+		}
 	}
+	param->version = NDS_API_VERSION;
 	return 0;
 }
 
@@ -141,19 +149,24 @@ int nds_exit(void)
 {
 	struct nds_reg_entry *r, *next;
 
-	if (!is_init())
-		return -EINVAL;
+	pthread_mutex_lock(&g_state.reg_lock);
+	r = g_state.regs;
+	g_state.regs = NULL;
+	pthread_mutex_unlock(&g_state.reg_lock);
 
-	for (r = g_state.regs; r; r = next) {
+	for (; r; r = next) {
 		struct p2p_mem_unregister_param up = {
 			.mem_handle = r->handle,
 			.reserved = 0,
 		};
 		next = r->next;
-		ioctl(g_state.book_fd, IOCTL_UNREGISTER_MEM, &up);
+		if (ioctl(g_state.book_fd, IOCTL_UNREGISTER_MEM, &up) < 0)
+			fprintf(stderr,
+				"nds: unregister memory addr=%p size=%llu handle=%llu failed %d\n",
+				r->addr, (unsigned long long)r->size,
+				(unsigned long long)r->handle, -errno);
 		free(r);
 	}
-	g_state.regs = NULL;
 
 	close(g_state.book_fd);
 	g_state.book_fd = -1;
@@ -164,29 +177,33 @@ int nds_register_mem(void *addr, uint64_t size, int flags)
 {
 	struct p2p_mem_register_param p = { 0 };
 	struct nds_reg_entry *r;
+	int ret;
 
-	if (!is_init())
-		return -EINVAL;
 	/* addr may be 0 (stub CMB window starts at VA 0). */
 	if (!size || flags)
 		return -EINVAL;
 
+	r = calloc(1, sizeof(*r));
+	if (!r)
+		return -ENOMEM;
+
 	p.addr = (__u64)(uintptr_t)addr;
 	p.size = size;
-	if (ioctl(g_state.book_fd, IOCTL_REGISTER_MEM, &p) < 0)
-		return -errno;
-
-	r = calloc(1, sizeof(*r));
-	if (!r) {
-		struct p2p_mem_unregister_param up = { .mem_handle = p.mem_handle };
-		ioctl(g_state.book_fd, IOCTL_UNREGISTER_MEM, &up);
-		return -ENOMEM;
+	if (ioctl(g_state.book_fd, IOCTL_REGISTER_MEM, &p) < 0) {
+		ret = -errno;
+		fprintf(stderr,
+			"nds: register memory addr=%p size=%llu failed %d\n",
+			addr, (unsigned long long)size, ret);
+		free(r);
+		return ret;
 	}
 	r->addr = addr;
 	r->size = size;
 	r->handle = p.mem_handle;
+	pthread_mutex_lock(&g_state.reg_lock);
 	r->next = g_state.regs;
 	g_state.regs = r;
+	pthread_mutex_unlock(&g_state.reg_lock);
 
 	return 0;
 }
@@ -197,23 +214,29 @@ int nds_unregister_mem(void *addr)
 	struct p2p_mem_unregister_param up;
 	int ret = 0;
 
-	if (!is_init())
-		return -EINVAL;
-
+	pthread_mutex_lock(&g_state.reg_lock);
 	for (prev = &g_state.regs; *prev; prev = &(*prev)->next) {
 		if ((*prev)->addr == addr)
 			break;
 	}
-	if (!*prev)
+	if (!*prev) {
+		pthread_mutex_unlock(&g_state.reg_lock);
 		return -ENOENT;
+	}
 
 	r = *prev;
 	*prev = r->next;
+	pthread_mutex_unlock(&g_state.reg_lock);
 
 	up.mem_handle = r->handle;
 	up.reserved = 0;
-	if (ioctl(g_state.book_fd, IOCTL_UNREGISTER_MEM, &up) < 0)
+	if (ioctl(g_state.book_fd, IOCTL_UNREGISTER_MEM, &up) < 0) {
 		ret = -errno;
+		fprintf(stderr,
+			"nds: unregister memory addr=%p size=%llu handle=%llu failed %d\n",
+			r->addr, (unsigned long long)r->size,
+			(unsigned long long)r->handle, ret);
+	}
 	free(r);
 	return ret;
 }
@@ -223,23 +246,23 @@ int nds_io_new_ctx(const struct nds_io_ctx_param *param, struct nds_io_ctx **ctx
 	struct nds_io_ctx *c;
 	int fd;
 
-	if (!is_init() || !param || !ctx)
+	if (!param || !ctx)
 		return -EINVAL;
-	if (param->max_io_nr == 0 || param->flags || param->reserved)
+	if (!param->max_io_cnt || param->max_io_cnt > NDS_IO_MAX_IO_CNT ||
+	    param->flags ||
+	    param->reserved)
 		return -EINVAL;
-
-	fd = p2p_open_dev();
-	if (fd < 0)
-		return fd;
 
 	c = calloc(1, sizeof(*c));
-	if (!c) {
-		close(fd);
+	if (!c)
 		return -ENOMEM;
+
+	fd = p2p_open_dev();
+	if (fd < 0) {
+		free(c);
+		return fd;
 	}
 	c->p2p_fd = fd;
-	c->max_io_nr = param->max_io_nr;
-	atomic_init(&c->inflight, 0);
 	*ctx = c;
 	return 0;
 }
@@ -251,37 +274,56 @@ int nds_io_destroy_ctx(struct nds_io_ctx *ctx)
 	if (!ctx)
 		return -EINVAL;
 
-	if (atomic_load_explicit(&ctx->inflight, memory_order_acquire)) {
-		ret = ioctl(ctx->p2p_fd, IOCTL_DRAIN_IO);
-		if (ret < 0)
-			fprintf(stderr, "nds: destroy_ctx drain warning %d\n",
-				-errno);
-	}
+	ret = ioctl(ctx->p2p_fd, IOCTL_DRAIN_IO);
+	if (ret < 0)
+		fprintf(stderr, "nds: destroy_ctx drain warning %d\n", -errno);
 	ret = close(ctx->p2p_fd);
+	ctx->p2p_fd = -1;
 	free(ctx);
 	return ret;
 }
 
-static int resolve_obj_to_fd(struct nds_io_obj *obj, int *fd_out)
+static int find_registered_mem(const struct nds_io_vec *iov,
+			       uint64_t *handle_out)
 {
-	if (!obj)
-		return -EINVAL;
-	if (obj->type == NDS_IO_OBJ_FD) {
-		if (obj->fd < 0)
-			return -EINVAL;
-		*fd_out = obj->fd;
-		return 0;
+	struct nds_reg_entry *r;
+	uint64_t addr = iov->buf_addr;
+	uint64_t len = iov->buf_len;
+	int ret = -EINVAL;
+
+	pthread_mutex_lock(&g_state.reg_lock);
+	for (r = g_state.regs; r; r = r->next) {
+		uint64_t base = (uint64_t)(uintptr_t)r->addr;
+
+		if (addr >= base && len <= r->size &&
+		    addr - base <= r->size - len) {
+			*handle_out = r->handle;
+			ret = 0;
+			break;
+		}
 	}
-	if (obj->type == NDS_IO_OBJ_ID)
-		return -EOPNOTSUPP;
-	return -EINVAL;
+	pthread_mutex_unlock(&g_state.reg_lock);
+	return ret;
 }
 
-static int nds_iocb_to_io_param(struct nds_io_cb *cb, int file_fd,
-				struct p2p_io_param **io_out,
-				struct p2p_iov *iov)
+static int validate_nds_iov(const struct nds_io_cb *cb, unsigned long *io_size)
 {
-	struct nds_reg_entry *r = NULL;
+	unsigned long size = 0;
+	uint32_t i;
+
+	if (!cb->iov || !cb->iov_cnt || cb->iov_cnt > NDS_IO_MAX_IOV)
+		return -EINVAL;
+	for (i = 0; i < cb->iov_cnt; i++) {
+		if (__builtin_add_overflow(size, (unsigned long)cb->iov[i].buf_len, &size))
+			return -EINVAL;
+	}
+	*io_size = size;
+	return 0;
+}
+
+static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
+				struct p2p_io_param **io_out)
+{
 	struct p2p_io_param *io;
 	struct fiemap *exts = NULL;
 	struct stat file_stat;
@@ -289,40 +331,22 @@ static int nds_iocb_to_io_param(struct nds_io_cb *cb, int file_fd,
 	unsigned long long total_size = 0;
 	size_t request_size;
 	unsigned int ext_num = 0;
-	uint64_t buf_addr;
+	uint64_t mem_handle = 0;
 	int err;
 
-	if (cb->opcode > NDS_IO_OP_PWRITEV)
-		return -EOPNOTSUPP;
-	if (cb->opcode == NDS_IO_OP_PREADV || cb->opcode == NDS_IO_OP_PWRITEV)
-		return -EOPNOTSUPP; /* TODO */
-	if (cb->rw_flags & ~NDS_IO_F_MASK)
+	if (cb->opcode > NDS_IO_OP_PWRITE || (cb->rw_flags & ~NDS_IO_F_MASK))
 		return -EOPNOTSUPP;
 
-	iov->addr = cb->buf_addr;
-	iov->size = cb->buf_len;
-	err = p2p_get_iov_size(iov, 1, &io_size);
+	err = validate_nds_iov(cb, &io_size);
 	if (err)
 		return err;
-	if (ULONG_MAX - cb->offset < io_size)
-		return -EOVERFLOW;
 
-	/*
-	 * Mem-mode precheck before fstat/FIEMAP (p2p_api.md §3.10). A
-	 * REGISTERED_MEM request with an unregistered buf_addr must not pay
-	 * the FIEMAP cost before being rejected.
-	 */
 	if (cb->rw_flags & NDS_IO_F_REGISTERED_MEM) {
 		if (cb->host_pid)
 			return -EINVAL;
-		buf_addr = cb->buf_addr;
-		for (r = g_state.regs; r; r = r->next) {
-			if (buf_addr >= (uint64_t)(uintptr_t)r->addr &&
-			    buf_addr < (uint64_t)(uintptr_t)r->addr + r->size)
-				break;
-		}
-		if (!r)
-			return -EINVAL;
+		err = find_registered_mem(&cb->iov[0], &mem_handle);
+		if (err)
+			return err;
 	} else if (cb->host_pid < 0) {
 		return -EINVAL;
 	}
@@ -334,10 +358,6 @@ static int nds_iocb_to_io_param(struct nds_io_cb *cb, int file_fd,
 		return err;
 	}
 
-	if ((cb->opcode == NDS_IO_OP_PWRITE) && !S_ISBLK(file_stat.st_mode)) {
-		return S_ISREG(file_stat.st_mode) ? -EOPNOTSUPP : -EINVAL;
-	}
-
 	err = p2p_prepare_io_extents(file_fd, &file_stat, cb->offset, io_size,
 				     &exts, &ext_num, &total_size);
 	if (err) {
@@ -347,27 +367,28 @@ static int nds_iocb_to_io_param(struct nds_io_cb *cb, int file_fd,
 	if (!ext_num || total_size < io_size) {
 		fprintf(stderr, "nds: extent size %llu < IOV size %lu\n",
 			total_size, io_size);
-		free(exts);
-		return -ENODATA;
+		err = -ENODATA;
+		goto free_exts;
 	}
 
 	if (__builtin_mul_overflow((size_t)ext_num, sizeof(io->extents[0]),
 				   &request_size) ||
 	    __builtin_add_overflow(request_size, sizeof(*io), &request_size)) {
-		free(exts);
-		return -E2BIG;
+		err = -E2BIG;
+		goto free_exts;
 	}
 	io = calloc(1, request_size);
 	if (!io) {
-		free(exts);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto free_exts;
 	}
 
 	io->op = (cb->opcode == NDS_IO_OP_PWRITE) ? P2P_IO_WRITE : P2P_IO_READ;
 	io->file_fd = file_fd;
 	io->user_data = cb->user_data;
-	io->iov = iov;
-	io->iov_nr = 1;
+	/* nds_io_vec is layout-identical to p2p_iov; the ioctl copies it now. */
+	io->iov = (struct p2p_iov *)(uintptr_t)cb->iov;
+	io->iov_nr = cb->iov_cnt;
 	io->ext_nr = ext_num;
 	memcpy(io->extents, exts->fm_extents, ext_num * sizeof(io->extents[0]));
 	free(exts);
@@ -375,7 +396,7 @@ static int nds_iocb_to_io_param(struct nds_io_cb *cb, int file_fd,
 	if (cb->rw_flags & NDS_IO_F_REGISTERED_MEM) {
 		io->flags = P2P_IO_F_REGISTERED_MEM;
 		io->host_pid = 0;
-		io->mem_handle = r->handle;
+		io->mem_handle = mem_handle;
 	} else {
 		io->flags = 0;
 		io->host_pid = cb->host_pid ? cb->host_pid : getpid();
@@ -384,54 +405,36 @@ static int nds_iocb_to_io_param(struct nds_io_cb *cb, int file_fd,
 
 	*io_out = io;
 	return 0;
+
+free_exts:
+	free(exts);
+	return err;
 }
 
-int nds_io_submit(struct nds_io_ctx *ctx, unsigned int nr, struct nds_io_cb *iocb)
+int nds_io_submit(struct nds_io_ctx *ctx, int nr, struct nds_io_cb *iocb)
 {
-	unsigned int i;
+	int i;
 	int ret;
 
 	if (!ctx || !iocb)
 		return -EINVAL;
-	if (nr == 0)
+	if (nr < 0)
+		return -EINVAL;
+	if (!nr)
 		return 0;
 
 	for (i = 0; i < nr; i++) {
 		struct p2p_io_param *io = NULL;
-		struct p2p_iov iov;
-		struct nds_io_cb *cb = &iocb[i];
-		unsigned int cur;
-		int file_fd;
+		const struct nds_io_cb *cb = &iocb[i];
+		int file_fd = cb->obj.fd;
 
-		/*
-		 * Reserve a slot before the ioctl so concurrent submitters
-		 * cannot overshoot max_io_nr. Roll back on any failure path.
-		 */
-		cur = atomic_load_explicit(&ctx->inflight, memory_order_relaxed);
-		for (;;) {
-			if (cur >= ctx->max_io_nr)
-				return i ? (int)i : -EAGAIN;
-			if (atomic_compare_exchange_weak_explicit(
-				    &ctx->inflight, &cur, cur + 1,
-				    memory_order_acquire,
-				    memory_order_relaxed))
-				break;
-		}
+		if (cb->reserved || cb->obj.reserved || file_fd < 0)
+			return i ? i : -EINVAL;
 
-		ret = resolve_obj_to_fd(&cb->obj, &file_fd);
-		if (ret) {
-			fprintf(stderr, "nds: resolve_obj failed %d\n", ret);
-			atomic_fetch_sub_explicit(&ctx->inflight, 1,
-						  memory_order_release);
-			return i ? (int)i : ret;
-		}
-
-		ret = nds_iocb_to_io_param(cb, file_fd, &io, &iov);
+		ret = nds_iocb_to_io_param(cb, file_fd, &io);
 		if (ret) {
 			fprintf(stderr, "nds: translate iocb failed %d\n", ret);
-			atomic_fetch_sub_explicit(&ctx->inflight, 1,
-						  memory_order_release);
-			return i ? (int)i : ret;
+			return i ? i : ret;
 		}
 
 		ret = ioctl(ctx->p2p_fd, IOCTL_RW_FILE, io);
@@ -439,27 +442,27 @@ int nds_io_submit(struct nds_io_ctx *ctx, unsigned int nr, struct nds_io_cb *ioc
 			ret = -errno;
 			fprintf(stderr, "nds: rw ioctl failed %d\n", ret);
 			free(io);
-			atomic_fetch_sub_explicit(&ctx->inflight, 1,
-						  memory_order_release);
-			return i ? (int)i : ret;
+			return i ? i : ret;
 		}
 		free(io);
 	}
-	return (int)i;
+	return i;
 }
 
-int nds_io_getevents(struct nds_io_ctx *ctx, unsigned int min_nr,
-		     unsigned int nr, struct nds_io_event *events,
+int nds_io_getevents(struct nds_io_ctx *ctx, int min_nr,
+		     int nr, struct nds_io_event *events,
 		     struct timespec *timeout)
 {
 	struct p2p_getevents_param param = { 0 };
 	int ret;
 
-	if (!ctx || !events)
+	if (!ctx)
 		return -EINVAL;
-	if (nr == 0)
+	if (min_nr < 0 || nr < 0 || min_nr > nr)
+		return -EINVAL;
+	if (!nr)
 		return 0;
-	if (min_nr > nr)
+	if (!events)
 		return -EINVAL;
 
 	/*
@@ -482,8 +485,5 @@ int nds_io_getevents(struct nds_io_ctx *ctx, unsigned int min_nr,
 		fprintf(stderr, "nds: getevents ioctl failed %d\n", ret);
 		return ret;
 	}
-	if (ret > 0)
-		atomic_fetch_sub_explicit(&ctx->inflight, (unsigned int)ret,
-					  memory_order_release);
 	return ret;
 }

@@ -39,6 +39,8 @@ static int parse_iovs(PyObject *object, struct p2p_iov **iov_out,
 	for (i = 0; i < count; i++) {
 		PyObject *entry;
 		PyObject **items;
+		unsigned long long addr;
+		unsigned long long size;
 
 		entry = PySequence_Fast(PySequence_Fast_GET_ITEM(sequence, i),
 					"IOV must be (addr, size)");
@@ -51,11 +53,19 @@ static int parse_iovs(PyObject *object, struct p2p_iov **iov_out,
 			goto error;
 		}
 		items = PySequence_Fast_ITEMS(entry);
-		iov[i].addr = PyLong_AsUnsignedLong(items[0]);
-		iov[i].size = PyLong_AsUnsignedLong(items[1]);
+		addr = PyLong_AsUnsignedLongLong(items[0]);
+		size = PyLong_AsUnsignedLongLong(items[1]);
 		Py_DECREF(entry);
 		if (PyErr_Occurred())
 			goto error;
+		if (size > UINT32_MAX) {
+			PyErr_SetString(PyExc_ValueError,
+					"IOV size exceeds the 32-bit UAPI limit");
+			goto error;
+		}
+		iov[i].addr = addr;
+		iov[i].size = (uint32_t)size;
+		iov[i].reserved = 0;
 	}
 
 	Py_DECREF(sequence);

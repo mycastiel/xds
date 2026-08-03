@@ -718,9 +718,6 @@ static int trim_fiemap_extents(struct fiemap_extent *extents,
 	unsigned int out = 0;
 	unsigned int i;
 
-	if (request_end < request_start)
-		return -EOVERFLOW;
-
 	for (i = 0; i < ext_num; i++) {
 		struct fiemap_extent extent = extents[i];
 		unsigned long long extent_start = extent.fe_logical;
@@ -728,8 +725,6 @@ static int trim_fiemap_extents(struct fiemap_extent *extents,
 		unsigned long long trim_start;
 		unsigned long long trim_end;
 
-		if (extent_end < extent_start)
-			return -EOVERFLOW;
 		if (extent_end <= request_start || extent_start >= request_end)
 			continue;
 		if (extent.fe_flags & P2P_UNSUPPORTED_FIEMAP_FLAGS) {
@@ -748,15 +743,6 @@ static int trim_fiemap_extents(struct fiemap_extent *extents,
 		extent.fe_physical += trim_start - extent_start;
 		extent.fe_logical = trim_start;
 		extent.fe_length = trim_end - trim_start;
-		if (!is_sector_aligned(extent.fe_logical) ||
-		    !is_sector_aligned(extent.fe_physical) ||
-		    !is_sector_aligned(extent.fe_length)) {
-			fprintf(stderr,
-				"unaligned FIEMAP extent logical 0x%llx physical 0x%llx length 0x%llx\n",
-				extent.fe_logical, extent.fe_physical,
-				extent.fe_length);
-			return -EINVAL;
-		}
 		extents[out++] = extent;
 		total += extent.fe_length;
 	}
@@ -845,10 +831,10 @@ int p2p_get_iov_size(const struct p2p_iov *iov, unsigned int iov_nr,
 		return -EINVAL;
 
 	for (i = 0; i < iov_nr; i++) {
-		if (!iov[i].size ||
+		if (!iov[i].size || iov[i].reserved ||
 		    ((iov[i].addr | iov[i].size) &
 		     (P2P_SECTOR_SIZE - 1)) ||
-		    ULONG_MAX - iov[i].addr < iov[i].size ||
+		    UINT64_MAX - iov[i].addr < iov[i].size ||
 		    ULONG_MAX - size < iov[i].size)
 			return -EINVAL;
 		size += iov[i].size;
