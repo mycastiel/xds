@@ -21,6 +21,7 @@
 #define STRESS_KIB (1UL << 10)
 #define STRESS_MIN_LENGTH (4UL << 10)
 #define STRESS_MAX_LENGTH (4UL << 20)
+#define HARVEST_TIMEOUT_SEC 300
 
 enum run_mode {
 	MODE_SINGLE,
@@ -442,6 +443,7 @@ static int load_stress_manifest(const char *path,
 static int harvest_io(struct nds_io_ctx *ctx,
 		      struct expected_io_event *expected, unsigned int nr)
 {
+	struct timespec timeout = { .tv_sec = HARVEST_TIMEOUT_SEC };
 	struct nds_io_event *events;
 	unsigned int got = 0;
 	unsigned int i;
@@ -454,7 +456,7 @@ static int harvest_io(struct nds_io_ctx *ctx,
 		return -ENOMEM;
 
 	while (got < nr) {
-		n = nds_io_getevents(ctx, 1, nr - got, events, NULL);
+		n = nds_io_getevents(ctx, 1, nr - got, events, &timeout);
 		if (n < 0) {
 			free(events);
 			return n;
@@ -737,6 +739,7 @@ static int run_reject(const char *topology)
 	struct nds_io_cb cb;
 	struct nds_io_event ev;
 	struct timespec timeout = { 0, 0 };
+	struct timespec overflow_timeout = { .tv_sec = INT64_MAX };
 	uint64_t size_bytes;
 	int topo_fd = -1;
 	int err;
@@ -781,6 +784,13 @@ static int run_reject(const char *topology)
 	if (err)
 		goto out;
 	cb.obj.reserved = 0;
+
+	cb.obj.fd = -1;
+	ret = nds_io_submit(ctx, 1, &cb);
+	err = expect_case("reject-bad-fd", ret, -EINVAL);
+	if (err)
+		goto out;
+	cb.obj.fd = topo_fd;
 
 	iov[1].reserved = 1;
 	ret = nds_io_submit(ctx, 1, &cb);
@@ -842,12 +852,24 @@ static int run_reject(const char *topology)
 	if (err)
 		goto out;
 
+	cb.rw_flags = 0;
+	cb.offset = UINT64_MAX - 4095;
+	ret = nds_io_submit(ctx, 1, &cb);
+	err = expect_case("reject-offset-overflow", ret, -EOVERFLOW);
+	if (err)
+		goto out;
+	cb.offset = 0;
+
 	ret = nds_io_getevents(ctx, 1, 1, &ev, &timeout);
 	err = expect_case("reject-getevents-empty", ret, 0);
 	if (err)
 		goto out;
 	ret = nds_io_getevents(ctx, -1, 1, &ev, &timeout);
 	err = expect_case("reject-getevents-negative-min", ret, -EINVAL);
+	if (err)
+		goto out;
+	ret = nds_io_getevents(ctx, 1, 1, &ev, &overflow_timeout);
+	err = expect_case("reject-getevents-timeout-overflow", ret, -EINVAL);
 
 out:
 	nds_io_destroy_ctx(ctx);
@@ -1507,10 +1529,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 	if (mode == MODE_REJECT) {
-		struct nds_init_param invalid_init = {
-			.desc = { .fs_fd = (int32_t[]){ topo_fd },
-				  .fs_fd_cnt = 1 },
-		};
+		struct nds_init_param invalid_init;
 
 		if (workers || iterations || cmb_size || va_granularity ||
 		    backing_page_size || result_manifest) {
@@ -1524,7 +1543,10 @@ int main(int argc, char **argv)
 				strerror(errno));
 			return EXIT_FAILURE;
 		}
-		invalid_init.desc.fs_fd[0] = topo_fd;
+		invalid_init = (struct nds_init_param) {
+			.desc = { .fs_fd = (int32_t[]){ topo_fd },
+				  .fs_fd_cnt = 1 },
+		};
 		invalid_init.flags = 1;
 		err = expect_case("reject-init-flags", nds_init(&invalid_init),
 				  -EINVAL);

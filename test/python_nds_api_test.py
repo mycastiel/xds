@@ -13,6 +13,9 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 import nds
 
 
+HARVEST_TIMEOUT_SEC = 300.0
+
+
 @dataclass
 class TestCase:
     case_id: str
@@ -130,11 +133,11 @@ def destroy_ctx(ctx) -> None:
 def harvest(ctx, nr: int) -> None:
     got = 0
     while got < nr:
-        events = nds.io_getevents(ctx, 1, nr - got)
+        events = nds.io_getevents(ctx, 1, nr - got, HARVEST_TIMEOUT_SEC)
         if isinstance(events, int):
             raise RuntimeError(f"nds.io_getevents returned {events}")
         if not events:
-            raise RuntimeError("nds.io_getevents returned 0 events")
+            raise TimeoutError(errno.ETIMEDOUT, "nds.io_getevents timed out")
         got += len(events)
 
 
@@ -297,6 +300,21 @@ def run_reject(topology: str) -> None:
             ),
             -errno.EOPNOTSUPP,
         )
+        require(
+            "reject-offset-overflow",
+            nds.io_submit(
+                ctx,
+                [
+                    (
+                        nds.NDS_IO_OP_PREAD,
+                        topo_fd,
+                        2**64 - 4096,
+                        [(buf_addr, buf_len)],
+                    )
+                ],
+            ),
+            -errno.EOVERFLOW,
+        )
 
         events = nds.io_getevents(ctx, 1, 1, 0.0)
         if isinstance(events, int):
@@ -306,6 +324,21 @@ def run_reject(topology: str) -> None:
         else:
             count = len(events)
         require("reject-getevents-empty", count, 0)
+        require(
+            "reject-getevents-timeout-nan",
+            nds.io_getevents(ctx, 0, 1, float("nan")),
+            -errno.EINVAL,
+        )
+        require(
+            "reject-getevents-timeout-inf",
+            nds.io_getevents(ctx, 0, 1, float("inf")),
+            -errno.EINVAL,
+        )
+        require(
+            "reject-getevents-timeout-neg-inf",
+            nds.io_getevents(ctx, 0, 1, float("-inf")),
+            -errno.EINVAL,
+        )
     finally:
         destroy_ctx(ctx)
         os.close(topo_fd)

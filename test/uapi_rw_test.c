@@ -20,6 +20,11 @@ _Static_assert(sizeof(struct p2p_iov) == 16,
 	       "p2p_iov must remain a 16-byte UAPI record");
 _Static_assert(offsetof(struct p2p_iov, reserved) == 12,
 	       "p2p_iov reserved field must occupy the old padding");
+_Static_assert(sizeof(((struct p2p_io_param *)0)->iov) == sizeof(uint64_t),
+	       "p2p_io_param iov address must be fixed-width");
+_Static_assert(sizeof(((struct p2p_getevents_param *)0)->events) ==
+	       sizeof(uint64_t),
+	       "p2p_getevents_param events address must be fixed-width");
 
 static int expect(const char *name, int actual, int expected)
 {
@@ -83,7 +88,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	param->op = P2P_IO_WRITE;
 	param->host_pid = getpid();
-	param->iov = &iov;
+	param->iov = (uint64_t)(uintptr_t)&iov;
 	param->iov_nr = 1;
 	param->ext_nr = 1;
 	param->extents[0].fe_logical = 0;

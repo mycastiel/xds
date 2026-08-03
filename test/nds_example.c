@@ -47,6 +47,9 @@ int main(int argc, char **argv)
 	int topo_fd = -1;
 	int file_fd = -1;
 	int32_t fs_fds[1];
+	struct nds_init_param init_param = {
+		.desc = { .fs_fd = fs_fds, .fs_fd_cnt = 1 },
+	};
 	struct nds_io_ctx *ctx = NULL;
 	struct nds_io_cb cb;
 	struct nds_io_vec iov;
@@ -80,12 +83,10 @@ int main(int argc, char **argv)
 
 	/* ---- 2. Process-wide init (registers topology once) ---- */
 	fs_fds[0] = topo_fd;
-	err = nds_init(&(struct nds_init_param){
-		.version = NDS_API_VERSION,
-		.desc = { .fs_fd = fs_fds, .fs_fd_cnt = 1 },
-	});
+	err = nds_init(&init_param);
 	if (err)
 		die("nds_init", err);
+	printf("XDS API version: %u\n", init_param.version);
 
 	/*
 	 * ---- 3. Register the HBM window (optional but recommended) ----
