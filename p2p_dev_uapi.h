@@ -5,8 +5,9 @@
 #include <linux/fiemap.h>
 
 struct p2p_iov {
-	unsigned long addr;
-	unsigned long size;
+	__u64 addr;
+	__u32 size;
+	__u32 reserved;
 };
 
 #define P2P_IO_F_REGISTERED_MEM (1U << 0)
@@ -21,24 +22,22 @@ struct p2p_io_param {
 	int file_fd;
 	int host_pid;
 	__u64 mem_handle;
+	__u64 user_data;          /* echo'd in completion event */
 	struct p2p_iov *iov;
 	unsigned int iov_nr;
 	unsigned int ext_nr;
-	__u64 user_data;          /* echo'd in completion event */
 	struct fiemap_extent extents[];
 };
 
 struct p2p_io_event {
 	__u64 user_data;
-	__s64 res;                /* bytes or -errno */
-	__u32 op;                 /* echoed P2P_IO_READ/WRITE */
-	__u32 flags;              /* v1: 0 */
+	__s64 res;                /* 0 on success or -errno */
 	__u64 reserved[2];        /* pad to 32B; matches NDS nds_io_event */
 };
 
 struct p2p_getevents_param {
-	__u32 min_nr;
-	__u32 max_nr;
+	__s32 min_nr;
+	__s32 max_nr;
 	__s64 timeout_ns;       /* <0 infinite, 0 nonblock, >0 relative */
 	struct p2p_io_event *events;
 };
