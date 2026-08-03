@@ -1,5 +1,9 @@
 # XDS portable P2P API (NDS)
 
+> **Status:** This is the original API proposal. The authoritative contract
+> implemented by this tree is [fix3](p2p_api/fix3.md); where this document
+> conflicts with `fix3.md` or `file_p2p/nds_api.h`, those sources supersede it.
+
 ## 1. Status and scope
 
 This document is the entry point for a GDS-aligned userspace API on top of
@@ -233,7 +237,7 @@ struct nds_io_cb {
 
 struct nds_io_event {
 	__u64 user_data;      /* from iocb */
-	__s64 res;            /* >=0 bytes transferred; <0 negated errno */
+	__s64 res;            /* 0 on success; <0 negated errno */
 	__u32 opcode;         /* echoed opcode */
 	__u32 flags;          /* v1: 0 */
 	__u64 reserved[2];

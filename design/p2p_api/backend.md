@@ -1,5 +1,9 @@
 # NDS backend abstraction
 
+> **Status:** Historical proposal. The authoritative implemented v1 contract
+> is [fix3](fix3.md); conflicting backend and helper descriptions below are
+> superseded.
+
 This document is part of the [p2p_api](../p2p_api.md) design.  It must not be
 implemented in isolation from the [UAPI](uapi.md), [completion](completion.md),
 [objects](objects.md), or [testing](testing.md) contracts.

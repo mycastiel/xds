@@ -1,5 +1,9 @@
 # NDS completion model
 
+> **Status:** Historical proposal. The authoritative implemented v1 contract
+> is [fix3](fix3.md); conflicting completion descriptions below are
+> superseded.
+
 This document is part of the [p2p_api](../p2p_api.md) design.  It must not be
 implemented in isolation from the [UAPI](uapi.md), [backend](backend.md),
 [objects](objects.md), or [testing](testing.md) contracts.
@@ -13,7 +17,7 @@ surface.  Applications see getevents; they do not call `drain_io`.
 - Preserve XDS async accept semantics: submit publishes work; completion is
   separate.
 - Present completions as discrete `nds_io_event` records with echoed
-  `user_data` and a byte-or-errno `res`.
+  `user_data` and a zero-or-errno `res`.
 - Honor aio/GDS-shaped **`min_nr` / `max_nr` / timeout`** on getevents; do
   not pretend fd-wide `IOCTL_DRAIN_IO` already provides that (see §5).
 - Keep buffer lifetime rules as strong as the existing drain contract.
@@ -63,8 +67,8 @@ This fail-stop-within-batch rule is intentional for v1 simplicity and matches
 a predictable GDS-like batch behavior.  Already-accepted requests remain
 inflight and must be harvested with getevents.
 
-A successful accept does **not** mean NVMe completion and does **not** return
-bytes transferred; bytes appear only in `nds_io_event.res`.
+A successful accept does **not** mean NVMe completion. Completion success is
+reported as zero in `nds_io_event.res`.
 
 ## 4. getevents and timeouts
 
@@ -82,7 +86,7 @@ int nds_io_getevents(struct nds_io_ctx *ctx, unsigned int min_nr,
 - `timeout` with zero or expired interval returns the number of events already
   available (possibly `0`) without treating timeout as an error.
 - Each event echoes `user_data` and `opcode` from the accepted iocb.
-- `res >= 0` is the transferred byte count for that logical request;
+- `res == 0` means the logical request completed successfully;
   `res < 0` is a negated errno for that request after children have finished.
 
 Error aggregation follows the spirit of drain: hardware children are waited;
@@ -148,7 +152,7 @@ follow-on UAPI patch; this locks intent):
 ```c
 struct p2p_io_event {
 	__u64 user_data;   /* correlated at submit time — see below */
-	__s64 res;         /* bytes or -errno */
+	__s64 res;         /* 0 on success or -errno */
 	__u32 op;          /* read/write echo optional */
 	__u32 flags;
 };

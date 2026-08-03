@@ -1,5 +1,9 @@
 # NDS I/O objects and topologies
 
+> **Status:** Historical proposal. The authoritative implemented v1 contract
+> is [fix3](fix3.md); conflicting PATH-object and topology descriptions below
+> are superseded.
+
 This document is part of the [p2p_api](../p2p_api.md) design.  It must not be
 implemented in isolation from the [UAPI](uapi.md), [backend](backend.md),
 [completion](completion.md), or [testing](testing.md) contracts.

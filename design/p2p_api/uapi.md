@@ -1,5 +1,8 @@
 # NDS UAPI and userspace contract
 
+> **Status:** Historical proposal. The authoritative implemented v1 contract
+> is [fix3](fix3.md); conflicting interface descriptions below are superseded.
+
 This document is part of the [p2p_api](../p2p_api.md) design.  It must not be
 implemented in isolation from the [backend](backend.md),
 [completion](completion.md), [objects](objects.md), or [testing](testing.md)
@@ -109,7 +112,7 @@ struct nds_io_cb {
 
 struct nds_io_event {
 	__u64 user_data;
-	__s64 res;         /* >=0 bytes; <0 negated errno */
+	__s64 res;         /* 0 on success; <0 negated errno */
 	__u32 opcode;
 	__u32 flags;       /* v1: 0 on output */
 	__u64 reserved[2]; /* must be zero on input if ever reused as in-param */
