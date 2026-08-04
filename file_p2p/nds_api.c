@@ -330,14 +330,13 @@ static int validate_nds_iov(const struct nds_io_cb *cb, unsigned long *io_size)
 }
 
 static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
-				struct p2p_io_param **io_out)
+				struct p2p_io_param *io,
+				struct fiemap **exts_out)
 {
-	struct p2p_io_param *io;
 	struct fiemap *exts = NULL;
 	struct stat file_stat;
 	unsigned long io_size;
 	unsigned long long total_size = 0;
-	size_t request_size;
 	unsigned int ext_num = 0;
 	uint64_t mem_handle = 0;
 	int err;
@@ -378,31 +377,18 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 	if (!ext_num || total_size < io_size) {
 		fprintf(stderr, "nds: extent size %llu < IOV size %lu\n",
 			total_size, io_size);
-		err = -ENODATA;
-		goto free_exts;
+		free(exts);
+		return -ENODATA;
 	}
 
-	if (__builtin_mul_overflow((size_t)ext_num, sizeof(io->extents[0]),
-				   &request_size) ||
-	    __builtin_add_overflow(request_size, sizeof(*io), &request_size)) {
-		err = -E2BIG;
-		goto free_exts;
-	}
-	io = calloc(1, request_size);
-	if (!io) {
-		err = -ENOMEM;
-		goto free_exts;
-	}
-
+	memset(io, 0, sizeof(*io));
 	io->op = (cb->opcode == NDS_IO_OP_PWRITE) ? P2P_IO_WRITE : P2P_IO_READ;
 	io->file_fd = file_fd;
 	io->user_data = cb->user_data;
-	/* nds_io_vec is layout-identical to p2p_iov; the ioctl copies it now. */
 	io->iov = (uint64_t)(uintptr_t)cb->iov;
 	io->iov_nr = cb->iov_cnt;
 	io->ext_nr = ext_num;
-	memcpy(io->extents, exts->fm_extents, ext_num * sizeof(io->extents[0]));
-	free(exts);
+	io->extents = (uint64_t)(uintptr_t)exts->fm_extents;
 
 	if (cb->rw_flags & NDS_IO_F_REGISTERED_MEM) {
 		io->flags = P2P_IO_F_REGISTERED_MEM;
@@ -414,18 +400,18 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 		io->mem_handle = 0;
 	}
 
-	*io_out = io;
+	*exts_out = exts;
 	return 0;
-
-free_exts:
-	free(exts);
-	return err;
 }
 
 int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 		  const struct nds_io_cb *iocb)
 {
+	struct p2p_io_param *params = NULL;
+	struct fiemap **exts = NULL;
+	struct p2p_io_batch_param batch;
 	int i;
+	int prepared = 0;
 	int ret;
 
 	if (!ctx || !iocb)
@@ -434,31 +420,56 @@ int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 		return -EINVAL;
 	if (!nr)
 		return 0;
+	if ((unsigned int)nr > NDS_IO_MAX_IO_CNT)
+		return -EINVAL;
+
+	params = calloc((size_t)nr, sizeof(*params));
+	exts = calloc((size_t)nr, sizeof(*exts));
+	if (!params || !exts) {
+		free(params);
+		free(exts);
+		return -ENOMEM;
+	}
 
 	for (i = 0; i < nr; i++) {
-		struct p2p_io_param *io = NULL;
 		const struct nds_io_cb *cb = &iocb[i];
 		int file_fd = cb->obj.fd;
 
-		if (cb->reserved || cb->obj.reserved || file_fd < 0)
-			return i ? i : -EINVAL;
+		if (cb->reserved || cb->obj.reserved || file_fd < 0) {
+			ret = -EINVAL;
+			goto fail_prepare;
+		}
 
-		ret = nds_iocb_to_io_param(cb, file_fd, &io);
+		ret = nds_iocb_to_io_param(cb, file_fd, &params[i], &exts[i]);
 		if (ret) {
 			fprintf(stderr, "nds: translate iocb failed %d\n", ret);
-			return i ? i : ret;
+			goto fail_prepare;
 		}
-
-		ret = ioctl(ctx->p2p_fd, IOCTL_RW_FILE, io);
-		if (ret < 0) {
-			ret = -errno;
-			fprintf(stderr, "nds: rw ioctl failed %d\n", ret);
-			free(io);
-			return i ? i : ret;
-		}
-		free(io);
+		prepared = i + 1;
 	}
-	return i;
+
+	memset(&batch, 0, sizeof(batch));
+	batch.nr = (uint32_t)nr;
+	batch.items = (uint64_t)(uintptr_t)params;
+	ret = ioctl(ctx->p2p_fd, IOCTL_RW_FILE_BATCH, &batch);
+	if (ret < 0) {
+		ret = -errno;
+		fprintf(stderr, "nds: rw batch ioctl failed %d\n", ret);
+	}
+
+	for (i = 0; i < prepared; i++)
+		free(exts[i]);
+	free(exts);
+	free(params);
+	return ret;
+
+fail_prepare:
+	/* Nothing has been accepted by the kernel yet. */
+	for (i = 0; i < prepared; i++)
+		free(exts[i]);
+	free(exts);
+	free(params);
+	return ret;
 }
 
 int nds_io_getevents(struct nds_io_ctx *ctx, int min_nr,

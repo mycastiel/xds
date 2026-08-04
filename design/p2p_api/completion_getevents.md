@@ -338,6 +338,10 @@ Kernel / UAPI target:
    #define IOCTL_RW_FILE_BATCH _IOWR('k', /* next */, struct p2p_io_batch_param)
    ```
 
+   Each item carries its own `file_fd`; mixed-file batches are allowed.
+   The win is one syscall boundary for the array (AIO `io_submit` shaped),
+   not a shared open across items.
+
 3. Kernel handler walks `items[0..nr)`, fail-stop like `io_submit`, returns
    accepted count or `-errno` if none accepted.
 4. Keep single-request `IOCTL_RW_FILE` for `file_p2p` and compatibility.

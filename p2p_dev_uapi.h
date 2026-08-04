@@ -16,6 +16,7 @@ struct p2p_iov {
 #define P2P_IO_READ 0U
 #define P2P_IO_WRITE 1U
 
+/* Fixed-size request; iov and extents are userspace pointers. */
 struct p2p_io_param {
 	unsigned int op;
 	unsigned int flags;
@@ -26,7 +27,13 @@ struct p2p_io_param {
 	__u64 iov;                /* userspace pointer to struct p2p_iov[] */
 	unsigned int iov_nr;
 	unsigned int ext_nr;
-	struct fiemap_extent extents[];
+	__u64 extents;            /* userspace pointer to struct fiemap_extent[] */
+};
+
+struct p2p_io_batch_param {
+	__u32 nr;
+	__u32 reserved;
+	__u64 items; /* userspace pointer to struct p2p_io_param[nr] */
 };
 
 struct p2p_io_event {
@@ -89,5 +96,6 @@ struct topo_user_cfg {
 #define IOCTL_REGISTER_MEM _IOWR('k', 4, struct p2p_mem_register_param)
 #define IOCTL_UNREGISTER_MEM _IOW('k', 5, struct p2p_mem_unregister_param)
 #define IOCTL_GET_IO_EVENTS _IOWR('k', 6, struct p2p_getevents_param)
+#define IOCTL_RW_FILE_BATCH _IOWR('k', 7, struct p2p_io_batch_param)
 
 #endif
