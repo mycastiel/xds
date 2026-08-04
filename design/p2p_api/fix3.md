@@ -214,3 +214,8 @@ remains the kernel's responsibility; NDS just propagates the errno.
   enough headroom for KASAN and stress configurations.
 - The reject names are not consumed by `report_test.py`; the report tracks only
   per-case `ret`/`expected` pairs, so no report changes were needed.
+
+## Related designs
+
+- Kernel completion queue and getevents (AIO / io_uring aligned target):
+  [completion_getevents.md](completion_getevents.md).

@@ -2,7 +2,9 @@
 
 > **Status:** Historical proposal. The authoritative implemented v1 contract
 > is [fix3](fix3.md); conflicting completion descriptions below are
-> superseded.
+> superseded. For the target kernel completion-queue / getevents design
+> (AIO / io_uring comparison and CQ + lock split), see
+> [completion_getevents.md](completion_getevents.md).
 
 This document is part of the [p2p_api](../p2p_api.md) design.  It must not be
 implemented in isolation from the [UAPI](uapi.md), [backend](backend.md),
