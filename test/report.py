@@ -26,7 +26,7 @@ KERNEL_BAD_RE = re.compile(
     re.IGNORECASE,
 )
 EXPECTED_VARIANTS = {"kasan", "nokasan"}
-STRESS_APIS = ("c", "python")
+STRESS_APIS = ("c", "python", "nds-c", "nds-python")
 STRESS_MEMORY_MODES = ("normal", "registered")
 STRESS_TOPOLOGIES = ("dm", "nvme", "raid0")
 STRESS_ITERATIONS = 16
