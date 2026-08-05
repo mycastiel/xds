@@ -202,10 +202,14 @@ remains the kernel's responsibility; NDS just propagates the errno.
   to `nds_init` as the single element of `desc.fs_fd`.
 - Reject mode updated to the new surface:
   `reject-reg-unregistered-buf` (replaces `reject-reg-zero-handle` and
-  `reject-oneshot-with-handle`), `reject-host-pid-neg`,
+  `reject-oneshot-with-handle`), `reject-reg-iov-out-of-region` (register a
+  small window, multi-iov with later vector outside → `-ERANGE`),
+  `reject-host-pid-neg`,
   `reject-reg-host-pid`, `reject-unknown-rw-flags`, reserved-field checks,
   Python integer-overflow checks, init/ctx range checks, negative completion
   results, and `reject-getevents-empty`.
+- `nds_init` is process-wide and not thread-safe: call once from one thread.
+- `nds_io_destroy_ctx` frees the ctx; double destroy is undefined behavior.
 - Completion tests match each event to its request by `user_data` and verify
   `res` and reserved output fields, including queued
   completions that may arrive out of order.

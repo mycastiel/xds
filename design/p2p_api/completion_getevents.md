@@ -230,10 +230,11 @@ user nds_io_event[]
 Getevents **must not** take `completion_lock` to copy events out. Completions
 **must not** take the harvest lock to publish.
 
-`complete(&io_ctx->io_done)` moves **out of** `completion_lock`. Lifetime for
-drain remains: drain detaches outstanding contexts, waits on `io_done`, then
-frees; publish that races drain already has an off-batch path today and must
-keep that invariant.
+`complete(&io_ctx->io_done)` moves **out of** `completion_lock`. Drain and
+getevents share `ring_lock` (they are not used concurrently by the NDS API;
+the mutex serializes them if they ever overlap). Drain waits for natural
+publish then harvests the CQ — it does **not** steal in-flight contexts or
+suppress publish, so there is no `on_batch` flag.
 
 ### 6.3 Getevents behavior (locked semantics)
 
@@ -248,10 +249,14 @@ Matches current UAPI and AIO-shaped wait rules:
 | `res` | `0` on success, `-errno` on failure (fix3) |
 | Order | CQ publication / completion order; not submit order |
 
-Harvest copies **directly** into the user `events` array with per-slot
-`__copy_to_user`. On fault after partial harvest, requeue unconsumed slots (or
-equivalent) so completions are not lost — same spirit as today’s
-`p2p_requeue_harvested`.
+Harvest copies **directly** into the user `events` array with per-event
+`copy_to_user` *before* consuming (advancing the cursor / head). On fault or
+when `max_nr` stops mid-slot, the consumer-owned cursor (`cq_head_consumed`)
+simply stays where it is and the next call resumes — no requeue path needed.
+
+With merged submissions (§8.4) one CQ slot expands into `nr_ios` events;
+`min_nr` / `max_nr` and the wait condition are counted in logical I/Os via
+`ready_events` / `outstanding_events`, not CQ slots.
 
 ### 6.4 Public API boundary
 
@@ -323,44 +328,42 @@ int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 		  const struct nds_io_cb *iocb);
 ```
 
-Kernel / UAPI target:
+Kernel / UAPI target — no batch ioctl. `IOCTL_RW_FILE` already carries
+`iov[iov_nr]` / `extents[ext_nr]` arrays, so a batch is expressed as one
+merged request plus a sub-I/O table that preserves the per-iocb boundaries:
 
-1. Make `struct p2p_io_param` fixed-size: `iov` and `extents` are userspace
-   pointers (same pattern as today’s `iov` field), not a trailing flex array.
-2. Add a batch ioctl, conceptually:
-
-   ```c
-   struct p2p_io_batch_param {
-	   __u32 nr;
-	   __u32 reserved;
-	   __u64 items; /* pointer to struct p2p_io_param[nr] */
-   };
-   #define IOCTL_RW_FILE_BATCH _IOWR('k', /* next */, struct p2p_io_batch_param)
-   ```
-
-   Each item carries its own `file_fd`; mixed-file batches are allowed.
-   The win is one syscall boundary for the array (AIO `io_submit` shaped),
-   not a shared open across items.
-
-3. Kernel handler walks `items[0..nr)`, fail-stop like `io_submit`, returns
-   accepted count or `-errno` if none accepted.
-4. Keep single-request `IOCTL_RW_FILE` for `file_p2p` and compatibility.
-5. NDS prepares the `p2p_io_param[nr]` array in userspace (FIEMAP may remain
-   per-request there), then issues **one** `IOCTL_RW_FILE_BATCH`.
-6. Every accepted request still publishes into the same per-batch CQ and is
-   harvested with `IOCTL_GET_IO_EVENTS` — orthogonal to §6.
+1. `struct p2p_io_param` gains `sub_ios` (pointer to
+   `struct p2p_sub_io[nr_ios]`) and `nr_ios`. Each `p2p_sub_io` is
+   `{ user_data, iov_cnt, ext_cnt }`: one logical I/O owning the next
+   `iov_cnt` iovs and `ext_cnt` extents of the merged arrays.
+   `nr_ios == 0` keeps today's single-I/O semantics (`file_p2p` unchanged).
+2. The kernel accepts the merged request as **one** `io_ctx` / one CQ slot,
+   but counts and completes it as `nr_ios` logical I/Os:
+   - submit: `outstanding_events += nr_ios`;
+   - publish: one CQ slot, `ready_events += nr_ios`;
+   - `getevents` waits on `ready_events` (so `min_nr`/`max_nr` are counted
+     in logical I/Os) and expands the slot into `nr_ios` events carrying the
+     per-sub `user_data`, resuming mid-slot when `max_nr` stops early.
+   Sub-I/O extent slices are consumed independently, so a FIEMAP-oversized
+   trailing extent of one iocb cannot leak into the next iocb's buffers.
+3. NDS merges consecutive iocbs sharing `(op, flags, file_fd, host_pid,
+   mem_handle)` into one `IOCTL_RW_FILE`, fail-stop across groups, and
+   returns the accepted iocb count or `-errno` if none accepted.
+4. Every accepted logical I/O is still harvested with
+   `IOCTL_GET_IO_EVENTS` — orthogonal to §6.
 
 ```text
 nds_io_submit(nr)
   prepare param[0..nr) in userspace
-  one IOCTL_RW_FILE_BATCH
+  merge consecutive mergeable iocbs → few (typically one) IOCTL_RW_FILE,
+  each carrying iov[] + extents[] + sub_ios[]
   return accepted count or -errno
         │
         ▼
-   accepted I/Os → CQ (this doc §6)
+   accepted logical I/Os → CQ (this doc §6)
         │
         ▼
-nds_io_getevents
+nds_io_getevents (events counted per logical I/O)
 ```
 
 ## 9. Comparison summary
@@ -380,8 +383,8 @@ nds_io_getevents
 
 | | AIO | io_uring | XDS today | XDS target |
 | --- | --- | --- | --- | --- |
-| Submit API | `io_submit` one syscall | SQ + `io_uring_enter` | N × `IOCTL_RW_FILE` | one `IOCTL_RW_FILE_BATCH` |
-| Fail-stop within batch | yes (kernel) | per-SQE / ring rules | yes (userspace loop) | yes (kernel batch) |
+| Submit API | `io_submit` one syscall | SQ + `io_uring_enter` | N × `IOCTL_RW_FILE` | one merged `IOCTL_RW_FILE` (`sub_ios[]`) |
+| Fail-stop within batch | yes (kernel) | per-SQE / ring rules | yes (userspace loop) | group all-or-nothing, fail-stop across groups |
 | Accept vs complete | split | SQE vs CQE | split | split |
 | Extent / FIEMAP prep | N/A (page cache path) | N/A | userspace per iocb | userspace per iocb OK |
 
@@ -397,7 +400,7 @@ nds_io_getevents
 5. Drain still retires all published work and leaves the module unloadable
    after destroy/exit in existing tests.
 6. Existing NDS and `file_p2p` basic/stress suites still pass.
-7. For `nds_io_submit` with `nr > 1` on the success path, the library enters
-   the kernel **once** via `IOCTL_RW_FILE_BATCH` (not N times via
-   `IOCTL_RW_FILE`). Partial failure still returns an accepted count or a
-   negative errno consistent with `io_submit`.
+7. For `nds_io_submit` with `nr > 1` mergeable iocbs on the success path, the
+   library enters the kernel **once** via a merged `IOCTL_RW_FILE` carrying a
+   `sub_ios[]` table (not N times). Partial failure still returns an accepted
+   count or a negative errno consistent with `io_submit`.
