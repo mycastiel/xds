@@ -7,6 +7,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <errno.h>
 #include <stddef.h>
@@ -118,6 +119,7 @@ int nds_init(struct nds_init_param *param)
 	uint32_t i;
 	int ret;
 
+	/* Not thread-safe: see nds_api.h. Concurrent init is undefined. */
 	if (!param || param->flags || is_init() || !param->desc.fs_fd ||
 	    !param->desc.fs_fd_cnt || param->desc.reserved || param->_data[2] ||
 	    param->_data[3])
@@ -279,15 +281,24 @@ int nds_io_destroy_ctx(struct nds_io_ctx *ctx)
 
 	if (!ctx)
 		return -EINVAL;
+	/*
+	 * Catches a closed-but-not-yet-freed ctx. A second destroy after
+	 * free() is still use-after-free (caller bug / UB).
+	 */
+	if (ctx->p2p_fd < 0)
+		return -EINVAL;
 
 	if (ioctl(ctx->p2p_fd, IOCTL_DRAIN_IO) < 0) {
 		drain_err = -errno;
 		fprintf(stderr, "nds: destroy_ctx drain failed %d\n", drain_err);
 	}
-	if (close(ctx->p2p_fd) < 0)
+	if (close(ctx->p2p_fd) < 0) {
 		close_err = -errno;
+		fprintf(stderr, "nds: destroy_ctx close failed %d\n", close_err);
+	}
 	ctx->p2p_fd = -1;
 	free(ctx);
+	/* Prefer the first failure; both are logged when both fail. */
 	return drain_err ? drain_err : close_err;
 }
 
@@ -404,15 +415,96 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 	return 0;
 }
 
+/* Conservative merge cap, well below the kernel's extent limit. */
+#define NDS_MERGE_MAX_EXTENTS 65536u
+
+static bool nds_params_mergeable(const struct p2p_io_param *a,
+				 const struct p2p_io_param *b)
+{
+	return a->op == b->op && a->flags == b->flags &&
+	       a->file_fd == b->file_fd && a->host_pid == b->host_pid &&
+	       a->mem_handle == b->mem_handle;
+}
+
+/*
+ * Submit iocbs [begin, end) as one IOCTL_RW_FILE. A single iocb goes through
+ * unchanged (nr_ios == 0); a run of mergeable iocbs is concatenated into one
+ * iov/extent array plus a p2p_sub_io table, so the kernel accepts and
+ * completes them as end-begin logical I/Os from a single submission.
+ */
+static int nds_submit_group(struct nds_io_ctx *ctx,
+			    const struct p2p_io_param *params,
+			    struct fiemap **exts, int begin, int end)
+{
+	struct p2p_io_param merged;
+	struct p2p_iov *iov = NULL;
+	struct fiemap_extent *extents = NULL;
+	struct p2p_sub_io *subs = NULL;
+	unsigned int iov_nr = 0;
+	unsigned int ext_nr = 0;
+	int i;
+	int ret = 0;
+
+	if (end - begin == 1) {
+		if (ioctl(ctx->p2p_fd, IOCTL_RW_FILE, &params[begin]) < 0)
+			return -errno;
+		return 0;
+	}
+
+	for (i = begin; i < end; i++) {
+		iov_nr += params[i].iov_nr;
+		ext_nr += params[i].ext_nr;
+	}
+	iov = calloc(iov_nr, sizeof(*iov));
+	extents = calloc(ext_nr, sizeof(*extents));
+	subs = calloc((size_t)(end - begin), sizeof(*subs));
+	if (!iov || !extents || !subs) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	iov_nr = 0;
+	ext_nr = 0;
+	for (i = begin; i < end; i++) {
+		/* nds_io_vec is layout-identical to p2p_iov. */
+		memcpy(&iov[iov_nr], (const void *)(uintptr_t)params[i].iov,
+		       params[i].iov_nr * sizeof(*iov));
+		memcpy(&extents[ext_nr], exts[i]->fm_extents,
+		       params[i].ext_nr * sizeof(*extents));
+		subs[i - begin].user_data = params[i].user_data;
+		subs[i - begin].iov_cnt = params[i].iov_nr;
+		subs[i - begin].ext_cnt = params[i].ext_nr;
+		iov_nr += params[i].iov_nr;
+		ext_nr += params[i].ext_nr;
+	}
+
+	merged = params[begin];
+	merged.user_data = 0;
+	merged.iov = (uint64_t)(uintptr_t)iov;
+	merged.iov_nr = iov_nr;
+	merged.extents = (uint64_t)(uintptr_t)extents;
+	merged.ext_nr = ext_nr;
+	merged.sub_ios = (uint64_t)(uintptr_t)subs;
+	merged.nr_ios = (uint32_t)(end - begin);
+
+	if (ioctl(ctx->p2p_fd, IOCTL_RW_FILE, &merged) < 0)
+		ret = -errno;
+out:
+	free(subs);
+	free(extents);
+	free(iov);
+	return ret;
+}
+
 int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 		  const struct nds_io_cb *iocb)
 {
 	struct p2p_io_param *params = NULL;
 	struct fiemap **exts = NULL;
-	struct p2p_io_batch_param batch;
+	int accepted = 0;
 	int i;
 	int prepared = 0;
-	int ret;
+	int ret = 0;
 
 	if (!ctx || !iocb)
 		return -EINVAL;
@@ -448,20 +540,39 @@ int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 		prepared = i + 1;
 	}
 
-	memset(&batch, 0, sizeof(batch));
-	batch.nr = (uint32_t)nr;
-	batch.items = (uint64_t)(uintptr_t)params;
-	ret = ioctl(ctx->p2p_fd, IOCTL_RW_FILE_BATCH, &batch);
-	if (ret < 0) {
-		ret = -errno;
-		fprintf(stderr, "nds: rw batch ioctl failed %d\n", ret);
+	/*
+	 * Merge consecutive mergeable iocbs into one ioctl each; fail-stop
+	 * across groups like io_submit (return the accepted count, or the
+	 * error when nothing was accepted).
+	 */
+	i = 0;
+	while (i < nr) {
+		unsigned int iov_sum = params[i].iov_nr;
+		unsigned int ext_sum = params[i].ext_nr;
+		int j = i + 1;
+
+		while (j < nr && nds_params_mergeable(&params[i], &params[j]) &&
+		       iov_sum + params[j].iov_nr <= NDS_IO_MAX_IOV &&
+		       ext_sum + params[j].ext_nr <= NDS_MERGE_MAX_EXTENTS) {
+			iov_sum += params[j].iov_nr;
+			ext_sum += params[j].ext_nr;
+			j++;
+		}
+
+		ret = nds_submit_group(ctx, params, exts, i, j);
+		if (ret) {
+			fprintf(stderr, "nds: rw ioctl failed %d\n", ret);
+			break;
+		}
+		accepted += j - i;
+		i = j;
 	}
 
 	for (i = 0; i < prepared; i++)
 		free(exts[i]);
 	free(exts);
 	free(params);
-	return ret;
+	return accepted ? accepted : ret;
 
 fail_prepare:
 	/* Nothing has been accepted by the kernel yet. */

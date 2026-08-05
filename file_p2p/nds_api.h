@@ -144,7 +144,9 @@ struct nds_io_event {
 	uint64_t reserved[2];
 };
 
-/* Process-wide init / teardown. nds_init is not re-entrant; call once. */
+/* Process-wide init / teardown.
+ * nds_init is not thread-safe and not re-entrant: call it once from a single
+ * thread before any other NDS call; concurrent nds_init is undefined. */
 int nds_init(struct nds_init_param *param);
 int nds_exit(void);
 
@@ -157,7 +159,9 @@ int nds_exit(void);
 int nds_register_mem(void *addr, uint64_t size, int flags);
 int nds_unregister_mem(void *addr);
 
-/* Create / destroy a per-queue I/O context. Destroy drains outstanding I/O. */
+/* Create / destroy a per-queue I/O context. Destroy drains outstanding I/O
+ * and frees @ctx. The caller owns the pointer until destroy; double destroy
+ * (or any use after destroy) is undefined behavior. */
 int nds_io_new_ctx(const struct nds_io_ctx_param *param,
 		   struct nds_io_ctx **ctx);
 int nds_io_destroy_ctx(struct nds_io_ctx *ctx);

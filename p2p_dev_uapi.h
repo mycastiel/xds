@@ -16,24 +16,39 @@ struct p2p_iov {
 #define P2P_IO_READ 0U
 #define P2P_IO_WRITE 1U
 
-/* Fixed-size request; iov and extents are userspace pointers. */
+/*
+ * One logical I/O inside a merged IOCTL_RW_FILE submission. It owns the next
+ * iov_cnt entries of p2p_io_param.iov and the next ext_cnt entries of
+ * p2p_io_param.extents, and completes as one p2p_io_event.
+ */
+struct p2p_sub_io {
+	__u64 user_data;          /* echo'd in this sub-I/O's completion event */
+	__u32 iov_cnt;
+	__u32 ext_cnt;
+};
+
+/*
+ * Fixed-size request; iov, extents and sub_ios are userspace pointers.
+ *
+ * nr_ios == 0 submits a single logical I/O covering all iov/extents and
+ * completing as one event carrying user_data. nr_ios > 0 submits nr_ios
+ * logical I/Os described by sub_ios[]; they share op/flags/file_fd and are
+ * accepted (and later complete) as a group of nr_ios events.
+ */
 struct p2p_io_param {
 	unsigned int op;
 	unsigned int flags;
 	int file_fd;
 	int host_pid;
 	__u64 mem_handle;
-	__u64 user_data;          /* echo'd in completion event */
+	__u64 user_data;          /* echo'd in the event when nr_ios == 0 */
 	__u64 iov;                /* userspace pointer to struct p2p_iov[] */
 	unsigned int iov_nr;
 	unsigned int ext_nr;
 	__u64 extents;            /* userspace pointer to struct fiemap_extent[] */
-};
-
-struct p2p_io_batch_param {
-	__u32 nr;
+	__u64 sub_ios;            /* userspace pointer to struct p2p_sub_io[] */
+	__u32 nr_ios;
 	__u32 reserved;
-	__u64 items; /* userspace pointer to struct p2p_io_param[nr] */
 };
 
 struct p2p_io_event {
@@ -96,6 +111,5 @@ struct topo_user_cfg {
 #define IOCTL_REGISTER_MEM _IOWR('k', 4, struct p2p_mem_register_param)
 #define IOCTL_UNREGISTER_MEM _IOW('k', 5, struct p2p_mem_unregister_param)
 #define IOCTL_GET_IO_EVENTS _IOWR('k', 6, struct p2p_getevents_param)
-#define IOCTL_RW_FILE_BATCH _IOWR('k', 7, struct p2p_io_batch_param)
 
 #endif
