@@ -246,6 +246,32 @@ def run_reject(topology: str) -> None:
             ),
             -errno.EINVAL,
         )
+        require("reject-reg-range-register", nds.register_mem(0, 4096), 0)
+        try:
+            require(
+                "reject-reg-iov-out-of-region",
+                nds.io_submit(
+                    ctx,
+                    [
+                        (
+                            nds.NDS_IO_OP_PREAD,
+                            topo_fd,
+                            0,
+                            [(0, 4096), (4096, 4096)],
+                            nds.NDS_IO_F_REGISTERED_MEM,
+                            0,
+                            2,
+                        )
+                    ],
+                ),
+                -errno.ERANGE,
+            )
+        finally:
+            require(
+                "reject-reg-range-unregister",
+                nds.unregister_mem(0),
+                0,
+            )
         require(
             "reject-host-pid-neg",
             nds.io_submit(

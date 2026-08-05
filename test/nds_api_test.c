@@ -830,6 +830,28 @@ static int run_reject(const char *topology)
 	if (err)
 		goto out;
 
+	/*
+	 * iov[0] selects the registered region; iov[1] lies outside it. NDS
+	 * accepts the request from iov[0]; the kernel returns -ERANGE.
+	 */
+	ret = nds_register_mem((void *)(uintptr_t)0, 4096, 0);
+	err = expect_case("reject-reg-range-register", ret, 0);
+	if (err)
+		goto out;
+	cb.rw_flags = NDS_IO_F_REGISTERED_MEM;
+	cb.host_pid = 0;
+	cb.iov_cnt = 2;
+	ret = nds_io_submit(ctx, 1, &cb);
+	err = expect_case("reject-reg-iov-out-of-region", ret, -ERANGE);
+	{
+		int uret = nds_unregister_mem((void *)(uintptr_t)0);
+
+		if (uret && !err)
+			err = expect_case("reject-reg-range-unregister", uret, 0);
+	}
+	if (err)
+		goto out;
+
 	cb.obj.fd = topo_fd;
 	cb.host_pid = -1;
 	cb.rw_flags = 0;

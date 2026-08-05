@@ -8,6 +8,9 @@
  * Example:
  *   sudo ./test/nds_bw_bench --topology /dev/nvme0n1 --target /dev/nvme0n1 \
  *        --cmb-va 0 --total-size 1G --io-min 32K --io-max 128K --queue-depth 64
+ *
+ * --total-size is the aggregate bytes transferred (offsets wrap within the
+ * target when the device/file is smaller).
  */
 
 #define _GNU_SOURCE
@@ -139,12 +142,12 @@ static void usage(const char *argv0)
 	fprintf(stderr,
 		"Usage: %s --topology DEV --target PATH [options]\n"
 		"  --cmb-va ADDR       CMB/HBM VA base (default 0)\n"
-		"  --total-size BYTES  bytes to transfer (default 256M; K/M/G ok)\n"
+		"  --total-size BYTES  aggregate bytes to transfer (default 256M; K/M/G ok)\n"
 		"  --io-min BYTES      min I/O size (default 32K)\n"
 		"  --io-max BYTES      max I/O size (default 128K)\n"
 		"  --queue-depth N     outstanding I/Os (default 64)\n"
-		"  --passes N          full passes over the window (default 1)\n"
-		"  --sequential        sequential offsets (default)\n"
+		"  --passes N          repeat total-size this many times (default 1)\n"
+		"  --sequential        sequential offsets, wrap at EOF (default)\n"
 		"  --random            random offsets within target\n"
 		"  --no-register-mem   one-shot VAs (default: register CMB window)\n",
 		argv0);
@@ -186,16 +189,17 @@ int main(int argc, char **argv)
 	struct nds_io_ctx *ctx = NULL;
 	struct slot *slots = NULL;
 	struct nds_io_event *events = NULL;
+	struct nds_io_cb *batch_cbs = NULL;
+	uint32_t *batch_slots = NULL;
 	uint64_t target_bytes;
-	uint64_t window;
 	uint64_t goal;
 	uint64_t completed = 0;
+	uint64_t issued = 0;
 	uint64_t next_off = 0;
 	uint64_t inflight = 0;
 	uint64_t ios = 0;
 	uint64_t buf_span;
 	unsigned int rng = 1;
-	unsigned int pass;
 	struct timespec t0, t1;
 	double sec;
 	double gib;
@@ -273,15 +277,16 @@ int main(int argc, char **argv)
 	target_bytes = align_down(target_size_bytes(file_fd), SECTOR);
 	if (target_bytes < io_min)
 		die("target too small", -ENOSPC);
-	window = total_size;
-	if (window > target_bytes)
-		window = target_bytes;
-	goal = window * passes;
+	if (total_size > UINT64_MAX / passes)
+		die("total-size * passes overflow", -EOVERFLOW);
+	goal = total_size * passes;
 
 	buf_span = (uint64_t)qd * io_max;
 	slots = calloc(qd, sizeof(*slots));
 	events = calloc(qd, sizeof(*events));
-	if (!slots || !events)
+	batch_cbs = calloc(qd, sizeof(*batch_cbs));
+	batch_slots = calloc(qd, sizeof(*batch_slots));
+	if (!slots || !events || !batch_cbs || !batch_slots)
 		die("calloc", -ENOMEM);
 	for (i = 0; i < qd; i++) {
 		slots[i].buf_addr = cmb_va + (uint64_t)i * io_max;
@@ -307,10 +312,10 @@ int main(int argc, char **argv)
 
 	printf("topology=%s target=%s cmb_va=0x%" PRIx64 "\n", topo_path,
 	       target_path, cmb_va);
-	printf("target_size=%" PRIu64 " (%.2f MiB) window=%" PRIu64
-	       " passes=%u goal=%" PRIu64 "\n",
-	       target_bytes, target_bytes / (1024.0 * 1024.0), window, passes,
-	       goal);
+	printf("target_size=%" PRIu64 " (%.2f MiB) total_size=%" PRIu64
+	       " passes=%u goal=%" PRIu64 " (%.2f MiB)\n",
+	       target_bytes, target_bytes / (1024.0 * 1024.0), total_size,
+	       passes, goal, goal / (1024.0 * 1024.0));
 	printf("io_size=%u..%u queue_depth=%u register_mem=%d pattern=%s\n",
 	       io_min, io_max, qd, register_mem,
 	       random_off ? "random" : "sequential");
@@ -319,103 +324,111 @@ int main(int argc, char **argv)
 	if (clock_gettime(CLOCK_MONOTONIC, &t0))
 		die("clock_gettime", -errno);
 
-	for (pass = 0; pass < passes; pass++) {
-		uint64_t issued = 0;
-		uint64_t done = 0;
+	while (completed < goal) {
+		uint32_t batch_nr = 0;
 
-		next_off = 0;
-		while (done < window) {
-			while (inflight < qd && issued < window) {
-				uint32_t slot;
-				uint32_t len;
-				uint64_t off;
-				uint64_t remain = window - issued;
-				int n;
+		while (inflight < qd && issued < goal) {
+			uint32_t slot;
+			uint32_t len;
+			uint64_t off;
+			uint64_t remain = goal - issued;
 
-				for (slot = 0; slot < qd; slot++) {
-					if (!slots[slot].busy)
-						break;
-				}
-				if (slot >= qd)
+			for (slot = 0; slot < qd; slot++) {
+				if (!slots[slot].busy)
 					break;
+			}
+			if (slot >= qd)
+				break;
 
-				len = pick_io_size(io_min, io_max, remain, &rng);
-				if (!len)
-					break;
+			len = pick_io_size(io_min, io_max, remain, &rng);
+			if (!len)
+				break;
 
-				if (random_off) {
-					uint64_t max_off =
-						align_down(target_bytes - len,
-							   SECTOR);
+			if (random_off) {
+				uint64_t max_off =
+					align_down(target_bytes - len, SECTOR);
 
-					rng = rng * 1103515245u + 12345u;
-					if (max_off)
-						off = ((uint64_t)rng * SECTOR) %
-						      (max_off + SECTOR);
-					else
-						off = 0;
-					off = align_down(off, SECTOR);
-				} else {
-					if (next_off + len > target_bytes)
-						next_off = 0;
-					off = next_off;
-					next_off += len;
-					if (next_off >= target_bytes)
-						next_off = 0;
-				}
-
-				memset(&slots[slot].cb, 0, sizeof(slots[slot].cb));
-				slots[slot].iov.buf_addr = slots[slot].buf_addr;
-				slots[slot].iov.buf_len = len;
-				slots[slot].length = len;
-				slots[slot].cb.opcode = NDS_IO_OP_PREAD;
-				slots[slot].cb.rw_flags =
-					register_mem ? NDS_IO_F_REGISTERED_MEM :
-						       0;
-				slots[slot].cb.obj.fd = file_fd;
-				slots[slot].cb.offset = off;
-				slots[slot].cb.iov = &slots[slot].iov;
-				slots[slot].cb.iov_cnt = 1;
-				slots[slot].cb.host_pid = 0;
-				slots[slot].cb.user_data = slot;
-
-				n = nds_io_submit(ctx, 1, &slots[slot].cb);
-				if (n != 1)
-					die("nds_io_submit", n < 0 ? n : -EIO);
-				slots[slot].busy = true;
-				inflight++;
-				issued += len;
+				rng = rng * 1103515245u + 12345u;
+				if (max_off)
+					off = ((uint64_t)rng * SECTOR) %
+					      (max_off + SECTOR);
+				else
+					off = 0;
+				off = align_down(off, SECTOR);
+			} else {
+				if (next_off + len > target_bytes)
+					next_off = 0;
+				off = next_off;
+				next_off += len;
+				if (next_off >= target_bytes)
+					next_off = 0;
 			}
 
-			{
-				int got = nds_io_getevents(ctx, 1, (int)inflight,
-							   events, NULL);
-				int j;
+			memset(&slots[slot].cb, 0, sizeof(slots[slot].cb));
+			slots[slot].iov.buf_addr = slots[slot].buf_addr;
+			slots[slot].iov.buf_len = len;
+			slots[slot].length = len;
+			slots[slot].cb.opcode = NDS_IO_OP_PREAD;
+			slots[slot].cb.rw_flags =
+				register_mem ? NDS_IO_F_REGISTERED_MEM : 0;
+			slots[slot].cb.obj.fd = file_fd;
+			slots[slot].cb.offset = off;
+			slots[slot].cb.iov = &slots[slot].iov;
+			slots[slot].cb.iov_cnt = 1;
+			slots[slot].cb.host_pid = 0;
+			slots[slot].cb.user_data = slot;
 
-				if (got < 0)
-					die("nds_io_getevents", got);
-				for (j = 0; j < got; j++) {
-					uint32_t slot =
-						(uint32_t)events[j].user_data;
+			batch_cbs[batch_nr] = slots[slot].cb;
+			batch_slots[batch_nr] = slot;
+			batch_nr++;
+			slots[slot].busy = true;
+			inflight++;
+			issued += len;
+		}
 
-					if (events[j].res) {
-						fprintf(stderr,
-							"I/O failed slot=%u res=%" PRId64
-							"\n",
-							slot, events[j].res);
-						die("completion",
-						    (int)events[j].res);
-					}
-					if (slot >= qd || !slots[slot].busy)
-						die("bad completion cookie",
-						    -EINVAL);
-					done += slots[slot].length;
-					completed += slots[slot].length;
-					ios++;
-					slots[slot].busy = false;
+		if (batch_nr) {
+			int n = nds_io_submit(ctx, (int)batch_nr, batch_cbs);
+
+			if (n != (int)batch_nr) {
+				/* Roll back bookkeeping for unsubmitted tail. */
+				uint32_t k;
+
+				for (k = (uint32_t)(n < 0 ? 0 : n); k < batch_nr;
+				     k++) {
+					slots[batch_slots[k]].busy = false;
 					inflight--;
+					issued -= slots[batch_slots[k]].length;
 				}
+				die("nds_io_submit", n < 0 ? n : -EIO);
 			}
+		}
+
+		if (inflight) {
+			int got = nds_io_getevents(ctx, 1, (int)inflight,
+						   events, NULL);
+			int j;
+
+			if (got < 0)
+				die("nds_io_getevents", got);
+			for (j = 0; j < got; j++) {
+				uint32_t slot = (uint32_t)events[j].user_data;
+
+				if (events[j].res) {
+					fprintf(stderr,
+						"I/O failed slot=%u res=%" PRId64
+						"\n",
+						slot, events[j].res);
+					die("completion", (int)events[j].res);
+				}
+				if (slot >= qd || !slots[slot].busy)
+					die("bad completion cookie", -EINVAL);
+				completed += slots[slot].length;
+				ios++;
+				slots[slot].busy = false;
+				inflight--;
+			}
+		} else if (completed < goal) {
+			die("stalled with no inflight I/O", -EIO);
 		}
 	}
 
@@ -434,6 +447,11 @@ int main(int argc, char **argv)
 	printf("bandwidth=%.2f MiB/s (%.3f GiB/s) iops=%.0f avg_io=%.1f KiB\n",
 	       mib_s, mib_s / 1024.0, ios / sec,
 	       ios ? (completed / (double)ios) / 1024.0 : 0.0);
+	/* Machine-parseable one-liner for matrix scripts. */
+	printf("RESULT pattern=%s register_mem=%d io_min=%u io_max=%u qd=%u "
+	       "bytes=%" PRIu64 " ios=%" PRIu64 " sec=%.6f mib_s=%.2f iops=%.0f\n",
+	       random_off ? "random" : "sequential", register_mem ? 1 : 0,
+	       io_min, io_max, qd, completed, ios, sec, mib_s, ios / sec);
 
 	nds_io_destroy_ctx(ctx);
 	if (register_mem)
@@ -441,6 +459,8 @@ int main(int argc, char **argv)
 	nds_exit();
 	close(file_fd);
 	close(topo_fd);
+	free(batch_slots);
+	free(batch_cbs);
 	free(events);
 	free(slots);
 	return 0;
