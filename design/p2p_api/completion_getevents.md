@@ -225,7 +225,7 @@ user nds_io_event[]
 | --- | --- | --- |
 | `completion_lock` | Completion / publish path | CQ slot write, `tail`, wake decision inputs owned by producer |
 | Harvest lock (`ring_lock` or equivalent) | `IOCTL_GET_IO_EVENTS` | `head`, consuming slots, free-after-copy |
-| Optional short inflight lock | Submit / drain | Membership of not-yet-complete work for drain snapshots |
+| Inflight accounting | Submit / retire (process) | Accepted CQ slot count (`io_cnt`); see [fix4.md](fix4.md) Change A to drop redundant `io_lock`/`io_list` |
 
 Getevents **must not** take `completion_lock` to copy events out. Completions
 **must not** take the harvest lock to publish.
@@ -242,12 +242,13 @@ Matches current UAPI and AIO-shaped wait rules:
 
 | Input | Behavior |
 | --- | --- |
-| `timeout_ns < 0` | Wait until at least `min_nr` harvestable completions, or no remaining work that can still complete |
+| `timeout_ns < 0` | Wait until at least `min_nr` harvestable completions, or no remaining work that can still complete (`ready_events == outstanding_events`) |
 | `timeout_ns == 0` | Non-blocking harvest up to `max_nr` |
 | `timeout_ns > 0` | Relative timeout; return how many were harvested (may be 0); not an error |
 | `-EINTR` / restart | If any events already harvested, return that count; else return `-EINTR` |
 | `res` | `0` on success, `-errno` on failure (fix3) |
 | Order | CQ publication / completion order; not submit order |
+| `min_nr > 0`, no outstanding | Returns immediately with `0` events (does not block like AIO on an empty ctx); see [fix4.md](fix4.md) |
 
 Harvest copies **directly** into the user `events` array with per-event
 `copy_to_user` *before* consuming (advancing the cursor / head). On fault or
