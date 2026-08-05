@@ -109,11 +109,11 @@ struct p2p_pinned_io_mem {
 struct p2p_io_context;
 
 struct p2p_batch {
-	/* Every accepted io_ctx, from submit until harvest/drain frees it. */
-	struct list_head io_list;
-	/* Accepted io_ctxs (CQ slots); limited to P2P_CQ_SIZE. */
-	unsigned int io_cnt;
-	spinlock_t io_lock;
+	/*
+	 * Accepted CQ slots not yet retired; limited to P2P_CQ_SIZE.
+	 * Independent of outstanding_events (logical I/Os / sub_ios).
+	 */
+	atomic_t io_cnt;
 
 	/*
 	 * AIO-style completion ring (fs/aio.c shape): the producer publishes
@@ -161,7 +161,6 @@ struct p2p_io_context {
 	int io_err;
 	int issue_err;
 	struct p2p_batch *batch;
-	struct list_head io_list;
 #if defined(CALC_CRC32) || defined(DUMP_CONTENT)
 	struct work_struct finalize_work;
 #endif
@@ -216,15 +215,13 @@ static int p2p_open(struct inode *inode, struct file *file)
 		return -ENOMEM;
 	}
 
-	spin_lock_init(&batch->io_lock);
 	spin_lock_init(&batch->completion_lock);
 	mutex_init(&batch->ring_lock);
-	INIT_LIST_HEAD(&batch->io_list);
 	init_waitqueue_head(&batch->wait);
 	spin_lock_init(&batch->shared_topos.lock);
 	INIT_LIST_HEAD(&batch->shared_topos.head);
 	INIT_LIST_HEAD(&batch->owned_mems);
-	batch->io_cnt = 0;
+	atomic_set(&batch->io_cnt, 0);
 	batch->cq_head = 0;
 	batch->cq_tail = 0;
 	batch->cq_head_consumed = 0;
@@ -244,7 +241,7 @@ static int p2p_release(struct inode *inode, struct file *file)
 
 	p2p_revoke_all_registered_mem(batch, &revoked_mems);
 
-	if (batch->io_cnt > 0)
+	if (atomic_read(&batch->io_cnt) > 0)
 		p2p_drain_io(batch);
 
 	p2p_destroy_registered_mem_list(&revoked_mems);
@@ -894,6 +891,11 @@ static void p2p_unpin_io_mem(struct p2p_pinned_io_mem *pinned_mem)
 
 static void free_io_ctx(struct p2p_io_context *io_ctx)
 {
+	/*
+	 * Safety net: normal paths unpin before free (registered in put /
+	 * finalize; one-shot in retire). Failed-submit (-EAGAIN) still needs
+	 * this. p2p_unpin_io_mem is a no-op when pinned == false.
+	 */
 	p2p_unpin_io_mem(&io_ctx->pinned_mem);
 	kvfree(io_ctx->pa_iov);
 	kvfree(io_ctx->subs);
@@ -932,7 +934,6 @@ static struct p2p_io_context *new_io_ctx(u32 op, struct file *file, struct p2p_p
 	io_ctx->nr_subs = nr_subs;
 
 	atomic_set(&io_ctx->io_ref, 1);
-	INIT_LIST_HEAD(&io_ctx->io_list);
 	init_completion(&io_ctx->io_done);
 #if defined(CALC_CRC32) || defined(DUMP_CONTENT)
 	INIT_WORK(&io_ctx->finalize_work, p2p_finalize_io_work);
@@ -1303,12 +1304,25 @@ static void p2p_finalize_io_work(struct work_struct *work)
 	dump_io_ctx_crc32(io_ctx);
 	dump_pa_content(io_ctx->pa_iov[0].addr,
 			min_t(u64, io_ctx->data_size, io_ctx->pa_iov[0].len));
+	/*
+	 * Registered unpin here (process context). One-shot stays pinned until
+	 * retire; pinned_mem itself is an embedded field and remains valid.
+	 */
 	if (io_ctx->pinned_mem.reg_mem)
 		p2p_unpin_io_mem(&io_ctx->pinned_mem);
-	/* Publish completion only after the worker's final io_ctx access. */
 	p2p_publish_io_done(io_ctx);
 }
 #endif
+
+static int p2p_io_ctx_errno(const struct p2p_io_context *io_ctx)
+{
+	int err = io_ctx->issue_err;
+	int io_err = io_ctx->io_err;
+
+	if (io_err && !err)
+		err = blk_status_to_errno(io_err);
+	return err;
+}
 
 static void p2p_io_ctx_put(struct p2p_io_context *io_ctx)
 {
@@ -1322,8 +1336,19 @@ static void p2p_io_ctx_put(struct p2p_io_context *io_ctx)
 	}
 #endif
 
+	/*
+	 * Registered: drop the percpu_ref on the completion path (safe).
+	 * One-shot: leave pinned until p2p_retire_cq_head so
+	 * devmm_put_mem_pa_list never runs in softirq.
+	 */
 	if (io_ctx->pinned_mem.reg_mem)
 		p2p_unpin_io_mem(&io_ctx->pinned_mem);
+
+	/* Log once per io_ctx when NVMe completion carried a blk error. */
+	if (io_ctx->io_err && !io_ctx->issue_err)
+		pr_err("I/O error status %d errno %d\n", io_ctx->io_err,
+		       blk_status_to_errno(io_ctx->io_err));
+
 	p2p_publish_io_done(io_ctx);
 }
 
@@ -1545,7 +1570,6 @@ static int p2p_issue_prepared(struct p2p_batch *batch,
 	struct p2p_io_context *io_ctx;
 	struct p2p_pinned_io_mem pinned_mem = { };
 	unsigned int pa_iov_nr;
-	unsigned long flags;
 	int err;
 
 	if (param->flags & P2P_IO_F_REGISTERED_MEM) {
@@ -1574,19 +1598,15 @@ static int p2p_issue_prepared(struct p2p_batch *batch,
 	pinned_mem.pinned = false;
 
 	io_ctx->batch = batch;
-	spin_lock_irqsave(&batch->io_lock, flags);
-	if (batch->io_cnt >= P2P_CQ_SIZE) {
-		spin_unlock_irqrestore(&batch->io_lock, flags);
+	if (atomic_inc_return(&batch->io_cnt) > P2P_CQ_SIZE) {
+		atomic_dec(&batch->io_cnt);
 		/* Leave @reg_file and @subs ownership with the caller. */
 		io_ctx->file = NULL;
 		io_ctx->subs = NULL;
 		free_io_ctx(io_ctx);
 		return -EAGAIN;
 	}
-	batch->io_cnt++;
 	atomic_add(nr_subs, &batch->outstanding_events);
-	list_add_tail(&io_ctx->io_list, &batch->io_list);
-	spin_unlock_irqrestore(&batch->io_lock, flags);
 
 	io_ctx->issue_err = do_ios(io_ctx, topo, extents);
 	if (io_ctx->issue_err)
@@ -1719,9 +1739,7 @@ free_bufs:
 static void p2p_retire_cq_head(struct p2p_batch *batch, int *first_err)
 {
 	struct p2p_io_context *io_ctx;
-	unsigned long flags;
 	int err;
-	int io_err;
 
 	/* Pairs with the producer's smp_wmb() before cq_tail. */
 	smp_rmb();
@@ -1729,22 +1747,19 @@ static void p2p_retire_cq_head(struct p2p_batch *batch, int *first_err)
 	WRITE_ONCE(batch->cq_head, batch->cq_head + 1);
 	batch->cq_head_consumed = 0;
 
-	err = io_ctx->issue_err;
-	io_err = io_ctx->io_err;
-	if (io_err && !err) {
-		pr_err("I/O error status %d errno %d\n", io_err,
-		       blk_status_to_errno(io_err));
-		err = blk_status_to_errno(io_err);
-	}
+	err = p2p_io_ctx_errno(io_ctx);
 	if (first_err && err && !*first_err)
 		*first_err = err;
 
-	/* Publisher's complete() is its final io_ctx access. */
+	/* Publisher's complete() is its final field access before unpin. */
 	wait_for_completion(&io_ctx->io_done);
-	spin_lock_irqsave(&batch->io_lock, flags);
-	list_del_init(&io_ctx->io_list);
-	batch->io_cnt--;
-	spin_unlock_irqrestore(&batch->io_lock, flags);
+	/*
+	 * One-shot unpin in process context only (see fix4 Change B).
+	 * Registered was already dropped in put/finalize.
+	 */
+	if (!io_ctx->pinned_mem.reg_mem)
+		p2p_unpin_io_mem(&io_ctx->pinned_mem);
+	atomic_dec(&batch->io_cnt);
 	free_io_ctx(io_ctx);
 }
 
@@ -1758,14 +1773,14 @@ static int p2p_drain_io(struct p2p_batch *batch)
 	int first_err = 0;
 
 	mutex_lock(&batch->ring_lock);
-	while (READ_ONCE(batch->io_cnt)) {
+	while (atomic_read(&batch->io_cnt)) {
 		/*
 		 * Sleep with ring_lock held so getevents cannot interleave.
 		 * Publish only takes completion_lock, so it can still wake us.
 		 */
 		wait_event(batch->wait,
 			   batch->cq_head != READ_ONCE(batch->cq_tail) ||
-			   !READ_ONCE(batch->io_cnt));
+			   !atomic_read(&batch->io_cnt));
 
 		while (batch->cq_head != READ_ONCE(batch->cq_tail)) {
 			struct p2p_io_context *io_ctx;
@@ -1791,14 +1806,7 @@ static int p2p_drain_io(struct p2p_batch *batch)
 static void p2p_fill_io_event(struct p2p_io_context *io_ctx, unsigned int sub,
 			      struct p2p_io_event *out)
 {
-	int err = io_ctx->issue_err;
-	int io_err = io_ctx->io_err;
-
-	if (io_err && !err) {
-		pr_err("I/O error status %d errno %d\n", io_err,
-		       blk_status_to_errno(io_err));
-		err = blk_status_to_errno(io_err);
-	}
+	int err = p2p_io_ctx_errno(io_ctx);
 
 	out->user_data = io_ctx->subs[sub].user_data;
 	out->res = err ? err : 0;

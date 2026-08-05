@@ -161,7 +161,9 @@ int nds_unregister_mem(void *addr);
 
 /* Create / destroy a per-queue I/O context. Destroy drains outstanding I/O
  * and frees @ctx. The caller owns the pointer until destroy; double destroy
- * (or any use after destroy) is undefined behavior. */
+ * (or any use after destroy) is undefined behavior.
+ * Do not call nds_io_getevents concurrently with destroy on the same ctx:
+ * destroy holds the kernel harvest lock until all I/O completes. */
 int nds_io_new_ctx(const struct nds_io_ctx_param *param,
 		   struct nds_io_ctx **ctx);
 int nds_io_destroy_ctx(struct nds_io_ctx *ctx);
@@ -177,6 +179,9 @@ int nds_io_submit(struct nds_io_ctx *ctx, int nr,
  * Wait for at least min_nr completions, up to nr.
  * timeout NULL = wait forever; {0,0} = non-blocking.
  * On success returns the number of events filled (>= 0); on failure -errno.
+ * When no I/Os are outstanding, returns 0 immediately even if min_nr > 0
+ * (does not block until timeout like Linux AIO on an empty ctx).
+ * Must not run concurrently with nds_io_destroy_ctx on the same ctx.
  */
 int nds_io_getevents(struct nds_io_ctx *ctx, int min_nr,
 		     int nr, struct nds_io_event *events,
