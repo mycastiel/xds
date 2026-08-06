@@ -169,8 +169,17 @@ int nds_io_new_ctx(const struct nds_io_ctx_param *param,
 int nds_io_destroy_ctx(struct nds_io_ctx *ctx);
 
 /*
- * Submit nr control blocks. Returns number submitted, or -errno.
- * Completions are reaped with nds_io_getevents().
+ * Submit nr control blocks. Returns the number accepted, or -errno.
+ *
+ * Each iocb is one logical I/O: its iov[] is scatter-gather on a single
+ * obj.fd / offset and completes as one event (user_data). Different iocbs
+ * may target different files; the library issues one IOCTL_RW_FILE per
+ * iocb (no cross-iocb merge).
+ *
+ * Fail-stop like Linux io_submit: on a mid-batch failure return the count
+ * of iocbs already accepted (positive); the failed iocb's errno is not
+ * returned. If nothing was accepted, return -errno. Accepted I/Os are not
+ * rolled back — reap them with nds_io_getevents().
  */
 int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 		  const struct nds_io_cb *iocb);

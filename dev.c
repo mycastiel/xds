@@ -1839,6 +1839,7 @@ static int p2p_get_io_events(struct p2p_batch *batch, void __user *arg)
 	struct p2p_io_context *io_ctx;
 	struct p2p_io_event event;
 	unsigned int total = 0;
+	bool copy_fault = false;
 	ktime_t until;
 	int wait_ret = 0;
 
@@ -1880,13 +1881,11 @@ static int p2p_get_io_events(struct p2p_batch *batch, void __user *arg)
 					 sizeof(event))) {
 				/* Nothing is lost: resume from here next call. */
 				batch->cq_head_consumed = consumed;
-				mutex_unlock(&batch->ring_lock);
-				return total ? (int)total : -EFAULT;
+				copy_fault = true;
+				goto out_unlock;
 			}
 			consumed++;
 			total++;
-			atomic_dec(&batch->ready_events);
-			atomic_dec(&batch->outstanding_events);
 		}
 		batch->cq_head_consumed = consumed;
 		if (consumed < io_ctx->nr_subs)
@@ -1894,11 +1893,25 @@ static int p2p_get_io_events(struct p2p_batch *batch, void __user *arg)
 
 		p2p_retire_cq_head(batch, NULL);
 	}
+
+out_unlock:
+	/*
+	 * Single consumer under ring_lock: one atomic_sub for all successfully
+	 * copied events instead of a per-event atomic_dec.
+	 */
+	if (total) {
+		atomic_sub(total, &batch->ready_events);
+		atomic_sub(total, &batch->outstanding_events);
+	}
 	mutex_unlock(&batch->ring_lock);
 
-	if (!total && wait_ret && wait_ret != -ETIME)
+	if (total)
+		return (int)total;
+	if (copy_fault)
+		return -EFAULT;
+	if (wait_ret && wait_ret != -ETIME)
 		return wait_ret;
-	return total;
+	return 0;
 }
 
 static int p2p_add_topo(struct p2p_batch *batch, void __user *arg)
