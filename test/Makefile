@@ -47,10 +47,12 @@ nds_example: nds_example.c ../file_p2p/nds_api.c ../file_p2p/p2p_common.c \
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ \
 		nds_example.c ../file_p2p/nds_api.c ../file_p2p/p2p_common.c
 
-nds_bw_bench: nds_bw_bench.c ../file_p2p/nds_api.c ../file_p2p/p2p_common.c \
-		../file_p2p/nds_api.h ../file_p2p/p2p_common.h ../p2p_dev_uapi.h
+nds_bw_bench: nds_bw_bench.c hbm_acl.c hbm_acl.h ../file_p2p/nds_api.c \
+		../file_p2p/p2p_common.c ../file_p2p/nds_api.h \
+		../file_p2p/p2p_common.h ../p2p_dev_uapi.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ \
-		nds_bw_bench.c ../file_p2p/nds_api.c ../file_p2p/p2p_common.c
+		nds_bw_bench.c hbm_acl.c ../file_p2p/nds_api.c \
+		../file_p2p/p2p_common.c -ldl
 
 clean:
 	rm -f $(TEST_BINS)

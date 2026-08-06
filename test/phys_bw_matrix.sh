@@ -6,7 +6,8 @@
 # python_nds_bw_bench.py against real files on a mounted filesystem.
 #
 # Required env:
-#   XDS_DEV_1   block device used as NDS topology (and usually the FS device)
+#   XDS_DEV_1            block device used as NDS topology (and usually the FS device)
+#   XDS_BW_NPU_DEVICE    NPU id for aclrtSetDevice + aclrtMalloc HBM (physical)
 #
 # Optional env:
 #   XDS_BW_MOUNT_DIR     mountpoint (default: create under workdir)
@@ -15,7 +16,8 @@
 #   XDS_BW_QD            queue depth (default: 64)
 #   XDS_BW_PASSES        passes over each file (default: 1)
 #   XDS_BW_TOTAL_SIZE    if set, transfer this much instead of whole file
-#   XDS_BW_CMB_VA        CMB VA base (default: 0)
+#   XDS_BW_ACL_POLICY    aclrtMemMallocPolicy (default: 0 = HUGE_FIRST)
+#   XDS_BW_CMB_VA        only for VM/stub CMB (ignored when XDS_BW_NPU_DEVICE set)
 #   XDS_BW_MEM_MODE      comma list: register,noregister (default: register)
 #   XDS_BW_PATTERN       comma list: sequential,random (default: sequential)
 #   XDS_BW_APIS          c,python or subset (default: c,python)
@@ -23,15 +25,15 @@
 #   XDS_BW_SKIP_BUILD    1 = skip rebuild
 #   XDS_KERNEL_VARIANT   kasan|nokasan when loading modules via common.sh
 #   KSRC                 kernel build tree for modules
+#   ASCEND_ACL_LIB       path to libascendcl.so if not on the default search path
 #
-# Example (destructive mkfs on XDS_DEV_1):
-#   sudo env XDS_DEV_1=/dev/nvme0n1 XDS_DEV_2=/dev/nvme0n2 KSRC=/path/to/knl \
-#     ./test/phys_bw_matrix.sh
+# Physical machine (source Ascend env first; preserve it under sudo -E):
+#   source /usr/local/Ascend/ascend-toolkit/set_env.sh
+#   sudo -E env XDS_DEV_1=/dev/nvme0n1 XDS_BW_NPU_DEVICE=0 XDS_BW_SKIP_MKFS=1 \
+#     XDS_BW_MOUNT_DIR=/mnt/data XDS_BW_FILE_SIZES=256M \
+#     XDS_BW_BS_LIST=128K ./test/phys_bw_matrix.sh
 #
-# Example (reuse existing mounted FS; still needs topology device):
-#   sudo env XDS_DEV_1=/dev/nvme0n1 XDS_BW_SKIP_MKFS=1 \
-#     XDS_BW_MOUNT_DIR=/mnt/data XDS_BW_FILE_SIZES=256M,1G \
-#     XDS_BW_BS_LIST=32K,128K ./test/phys_bw_matrix.sh
+# VM / stub CMB (no NPU): set XDS_BW_NPU_DEVICE=-1 and XDS_BW_CMB_VA=0.
 
 set -Eeuo pipefail
 
@@ -42,6 +44,8 @@ FILE_SIZES=${XDS_BW_FILE_SIZES:-64M,256M,1G}
 BS_LIST=${XDS_BW_BS_LIST:-4K,32K,128K,1M}
 QD=${XDS_BW_QD:-64}
 PASSES=${XDS_BW_PASSES:-1}
+NPU_DEVICE=${XDS_BW_NPU_DEVICE:--1}
+ACL_POLICY=${XDS_BW_ACL_POLICY:-0}
 CMB_VA=${XDS_BW_CMB_VA:-0}
 MEM_MODE=${XDS_BW_MEM_MODE:-register}
 PATTERN=${XDS_BW_PATTERN:-sequential}
@@ -151,9 +155,14 @@ run_one()
 	label="$api.$pattern.$bs.$file_size.$mem"
 	log "bench $label"
 
-	args=(--topology "$DEV1" --target "$file" --cmb-va "$CMB_VA"
+	args=(--topology "$DEV1" --target "$file"
 		--total-size "$total_arg" --io-min "$bs" --io-max "$bs"
 		--queue-depth "$QD" --passes "$PASSES")
+	if (( NPU_DEVICE >= 0 )); then
+		args+=(--npu-device "$NPU_DEVICE" --acl-policy "$ACL_POLICY")
+	else
+		args+=(--cmb-va "$CMB_VA")
+	fi
 	case $pattern in
 		sequential) args+=(--sequential) ;;
 		random) args+=(--random) ;;
@@ -169,8 +178,10 @@ run_one()
 	esac
 
 	local span=$((QD * $(parse_size_bytes "$bs")))
-	(( span <= CMB_SIZE )) ||
-		die "$label needs ${span}B CMB window (>${CMB_SIZE})"
+	if (( NPU_DEVICE < 0 )); then
+		(( span <= CMB_SIZE )) ||
+			die "$label needs ${span}B CMB window (>${CMB_SIZE})"
+	fi
 
 	ensure_modules
 	if [[ $api == c ]]; then
@@ -201,8 +212,8 @@ write_summary()
 {
 	{
 		printf 'Physical NDS bandwidth matrix\n'
-		printf 'topology=%s mount=%s qd=%s passes=%s\n' \
-			"$DEV1" "$MOUNT_DIR" "$QD" "$PASSES"
+		printf 'topology=%s mount=%s qd=%s passes=%s npu=%s\n' \
+			"$DEV1" "$MOUNT_DIR" "$QD" "$PASSES" "$NPU_DEVICE"
 		printf 'file_sizes=%s bs=%s apis=%s mem=%s pattern=%s\n\n' \
 			"$FILE_SIZES" "$BS_LIST" "$APIS" "$MEM_MODE" "$PATTERN"
 		column -t -s $'\t' "$RESULTS_TSV"
@@ -215,6 +226,8 @@ main()
 
 	(( $# == 0 )) || die "phys_bw_matrix.sh does not accept positional args"
 	[[ -n ${XDS_DEV_1:-} ]] || die "set XDS_DEV_1 to the topology/block device"
+	[[ -n ${XDS_BW_NPU_DEVICE+x} ]] ||
+		die "set XDS_BW_NPU_DEVICE (NPU id, or -1 for VM/stub --cmb-va)"
 	# common.sh preflight needs DEV2 too for the standard flow.
 	[[ -n ${XDS_DEV_2:-} ]] || export XDS_DEV_2=${XDS_DEV_2_FALLBACK:-$XDS_DEV_1}
 

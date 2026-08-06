@@ -1,24 +1,87 @@
 #!/usr/bin/env python3
 """NDS PREAD bandwidth bench (Python), mirrored from nds_bw_bench.c.
 
-Example:
+VM / stub CMB:
   sudo PYTHONPATH=file_p2p python3 test/python_nds_bw_bench.py \\
     --topology /dev/nvme0n1 --target /mnt/xds/file.bin \\
     --cmb-va 0 --total-size 1G --io-min 32K --io-max 128K --queue-depth 64
+
+Physical NPU HBM (aclrt):
+  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+  sudo PYTHONPATH=file_p2p python3 test/python_nds_bw_bench.py \\
+    --topology /dev/nvme0n1 --target /mnt/data/f.bin \\
+    --npu-device 0 --total-size 256M --io-min 128K --io-max 128K --queue-depth 64
 """
 
 from __future__ import annotations
 
 import argparse
-import errno
+import ctypes
 import os
 import sys
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import nds
 
 SECTOR = 512
+
+ACL_MEM_MALLOC_HUGE_FIRST = 0
+ACL_ERROR_REPEAT_INITIALIZE = 100002
+
+
+class AscendHbm:
+    """Allocate device HBM via libascendcl.so (dlopen / ctypes)."""
+
+    def __init__(self, device_id: int, size: int, policy: int = ACL_MEM_MALLOC_HUGE_FIRST):
+        self.device_id = device_id
+        self.size = size
+        self.addr = 0
+        lib_path = os.environ.get("ASCEND_ACL_LIB", "libascendcl.so")
+        self.lib = ctypes.CDLL(lib_path)
+        self.lib.aclInit.argtypes = [ctypes.c_char_p]
+        self.lib.aclInit.restype = ctypes.c_int
+        self.lib.aclFinalize.argtypes = []
+        self.lib.aclFinalize.restype = ctypes.c_int
+        self.lib.aclrtSetDevice.argtypes = [ctypes.c_int]
+        self.lib.aclrtSetDevice.restype = ctypes.c_int
+        self.lib.aclrtResetDevice.argtypes = [ctypes.c_int]
+        self.lib.aclrtResetDevice.restype = ctypes.c_int
+        self.lib.aclrtMalloc.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+            ctypes.c_int,
+        ]
+        self.lib.aclrtMalloc.restype = ctypes.c_int
+        self.lib.aclrtFree.argtypes = [ctypes.c_void_p]
+        self.lib.aclrtFree.restype = ctypes.c_int
+
+        ret = self.lib.aclInit(None)
+        if ret not in (0, ACL_ERROR_REPEAT_INITIALIZE):
+            raise RuntimeError(f"aclInit failed: {ret}")
+        ret = self.lib.aclrtSetDevice(device_id)
+        if ret != 0:
+            raise RuntimeError(f"aclrtSetDevice({device_id}) failed: {ret}")
+        ptr = ctypes.c_void_p()
+        ret = self.lib.aclrtMalloc(ctypes.byref(ptr), size, policy)
+        if ret != 0 or not ptr.value:
+            raise RuntimeError(
+                f"aclrtMalloc(size={size}, policy={policy}) failed: {ret}"
+            )
+        self.addr = int(ptr.value)
+        print(
+            f"hbm_acl: device={device_id} HBM {size} bytes at 0x{self.addr:x} "
+            f"(policy={policy})",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def close(self) -> None:
+        if self.addr:
+            self.lib.aclrtFree(ctypes.c_void_p(self.addr))
+            self.addr = 0
+        self.lib.aclrtResetDevice(self.device_id)
+        self.lib.aclFinalize()
 
 
 def parse_size(text: str) -> int:
@@ -74,6 +137,10 @@ def main() -> int:
     parser.add_argument("--topology", required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--cmb-va", type=lambda s: int(s, 0), default=0)
+    parser.add_argument("--npu-device", type=int, default=-1,
+                        help="physical: aclrtSetDevice + aclrtMalloc HBM")
+    parser.add_argument("--acl-policy", type=int, default=ACL_MEM_MALLOC_HUGE_FIRST,
+                        help="aclrtMemMallocPolicy (default HUGE_FIRST=0)")
     parser.add_argument("--total-size", type=parse_size, default=parse_size("256M"))
     parser.add_argument("--io-min", type=parse_size, default=parse_size("32K"))
     parser.add_argument("--io-max", type=parse_size, default=parse_size("128K"))
@@ -91,6 +158,7 @@ def main() -> int:
     io_max = args.io_max
     total_size = args.total_size
     cmb_va = args.cmb_va
+    hbm: Optional[AscendHbm] = None
 
     if qd <= 0 or qd > nds.NDS_IO_MAX_IO_CNT:
         raise SystemExit("invalid --queue-depth")
@@ -109,6 +177,9 @@ def main() -> int:
             raise SystemExit("target too small")
         goal = total_size * args.passes
         buf_span = qd * io_max
+        if args.npu_device >= 0:
+            hbm = AscendHbm(args.npu_device, buf_span, args.acl_policy)
+            cmb_va = hbm.addr
 
         ret = nds.init([topo_fd])
         if ret:
@@ -132,7 +203,7 @@ def main() -> int:
                 ]
                 print(
                     f"topology={args.topology} target={args.target} "
-                    f"cmb_va=0x{cmb_va:x}"
+                    f"cmb_va=0x{cmb_va:x} npu_device={args.npu_device}"
                 )
                 print(
                     f"target_size={target_bytes} ({target_bytes / (1024 * 1024):.2f} MiB) "
@@ -244,6 +315,8 @@ def main() -> int:
     finally:
         os.close(file_fd)
         os.close(topo_fd)
+        if hbm is not None:
+            hbm.close()
     return 0
 
 

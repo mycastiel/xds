@@ -5,9 +5,14 @@
  * block device or file into CMB/HBM VAs, reaping with nds_io_getevents.
  *
  * Build: make -C test nds_bw_bench
- * Example:
+ * Example (VM / stub CMB):
  *   sudo ./test/nds_bw_bench --topology /dev/nvme0n1 --target /dev/nvme0n1 \
  *        --cmb-va 0 --total-size 1G --io-min 32K --io-max 128K --queue-depth 64
+ *
+ * Example (physical NPU HBM via aclrt):
+ *   source /usr/local/Ascend/ascend-toolkit/set_env.sh   # or your CANN env
+ *   sudo ./test/nds_bw_bench --topology /dev/nvme0n1 --target /mnt/data/f.bin \
+ *        --npu-device 0 --total-size 256M --io-min 128K --io-max 128K --queue-depth 64
  *
  * --total-size is the aggregate bytes transferred (offsets wrap within the
  * target when the device/file is smaller).
@@ -30,6 +35,7 @@
 #include <unistd.h>
 
 #include "nds_api.h"
+#include "hbm_acl.h"
 
 #define SECTOR 512u
 #define DEFAULT_IO_MIN (32u << 10)
@@ -141,7 +147,9 @@ static void usage(const char *argv0)
 {
 	fprintf(stderr,
 		"Usage: %s --topology DEV --target PATH [options]\n"
-		"  --cmb-va ADDR       CMB/HBM VA base (default 0)\n"
+		"  --cmb-va ADDR       CMB/HBM VA base (default 0; VM stub only)\n"
+		"  --npu-device ID      physical: aclrtSetDevice + aclrtMalloc HBM\n"
+		"  --acl-policy N      aclrt malloc policy (default 0=HUGE_FIRST)\n"
 		"  --total-size BYTES  aggregate bytes to transfer (default 256M; K/M/G ok)\n"
 		"  --io-min BYTES      min I/O size (default 32K)\n"
 		"  --io-max BYTES      max I/O size (default 128K)\n"
@@ -149,7 +157,7 @@ static void usage(const char *argv0)
 		"  --passes N          repeat total-size this many times (default 1)\n"
 		"  --sequential        sequential offsets, wrap at EOF (default)\n"
 		"  --random            random offsets within target\n"
-		"  --no-register-mem   one-shot VAs (default: register CMB window)\n",
+		"  --no-register-mem   one-shot VAs (default: register CMB/HBM window)\n",
 		argv0);
 }
 
@@ -159,6 +167,8 @@ int main(int argc, char **argv)
 		{ "topology", required_argument, NULL, 't' },
 		{ "target", required_argument, NULL, 'f' },
 		{ "cmb-va", required_argument, NULL, 'a' },
+		{ "npu-device", required_argument, NULL, 'd' },
+		{ "acl-policy", required_argument, NULL, 'A' },
 		{ "total-size", required_argument, NULL, 'T' },
 		{ "io-min", required_argument, NULL, 'i' },
 		{ "io-max", required_argument, NULL, 'I' },
@@ -173,6 +183,8 @@ int main(int argc, char **argv)
 	const char *topo_path = NULL;
 	const char *target_path = NULL;
 	uint64_t cmb_va = 0;
+	int npu_device = -1;
+	int acl_policy = XDS_ACL_MEM_MALLOC_HUGE_FIRST;
 	uint64_t total_size = DEFAULT_TOTAL;
 	uint32_t io_min = DEFAULT_IO_MIN;
 	uint32_t io_max = DEFAULT_IO_MAX;
@@ -180,6 +192,7 @@ int main(int argc, char **argv)
 	unsigned int passes = 1;
 	bool random_off = false;
 	bool register_mem = true;
+	struct xds_hbm_buf hbm = { 0 };
 	int topo_fd = -1;
 	int file_fd = -1;
 	int32_t fs_fds[1];
@@ -208,7 +221,7 @@ int main(int argc, char **argv)
 	int c;
 	uint32_t i;
 
-	while ((c = getopt_long(argc, argv, "t:f:a:T:i:I:q:p:SRNh", opts,
+	while ((c = getopt_long(argc, argv, "t:f:a:d:A:T:i:I:q:p:SRNh", opts,
 				NULL)) != -1) {
 		switch (c) {
 		case 't':
@@ -219,6 +232,12 @@ int main(int argc, char **argv)
 			break;
 		case 'a':
 			cmb_va = strtoull(optarg, NULL, 0);
+			break;
+		case 'd':
+			npu_device = (int)strtol(optarg, NULL, 0);
+			break;
+		case 'A':
+			acl_policy = (int)strtol(optarg, NULL, 0);
 			break;
 		case 'T':
 			total_size = parse_size(optarg);
@@ -282,6 +301,13 @@ int main(int argc, char **argv)
 	goal = total_size * passes;
 
 	buf_span = (uint64_t)qd * io_max;
+	if (npu_device >= 0) {
+		err = xds_hbm_alloc(&hbm, npu_device, (size_t)buf_span,
+				    acl_policy);
+		if (err)
+			die("xds_hbm_alloc (aclrt)", err);
+		cmb_va = (uint64_t)(uintptr_t)hbm.addr;
+	}
 	slots = calloc(qd, sizeof(*slots));
 	events = calloc(qd, sizeof(*events));
 	batch_cbs = calloc(qd, sizeof(*batch_cbs));
@@ -310,8 +336,8 @@ int main(int argc, char **argv)
 	if (err)
 		die("nds_io_new_ctx", err);
 
-	printf("topology=%s target=%s cmb_va=0x%" PRIx64 "\n", topo_path,
-	       target_path, cmb_va);
+	printf("topology=%s target=%s cmb_va=0x%" PRIx64 " npu_device=%d\n",
+	       topo_path, target_path, cmb_va, npu_device);
 	printf("target_size=%" PRIu64 " (%.2f MiB) total_size=%" PRIu64
 	       " passes=%u goal=%" PRIu64 " (%.2f MiB)\n",
 	       target_bytes, target_bytes / (1024.0 * 1024.0), total_size,
@@ -457,6 +483,7 @@ int main(int argc, char **argv)
 	if (register_mem)
 		nds_unregister_mem((void *)(uintptr_t)cmb_va);
 	nds_exit();
+	xds_hbm_free(&hbm);
 	close(file_fd);
 	close(topo_fd);
 	free(batch_slots);
