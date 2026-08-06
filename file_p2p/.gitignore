@@ -1,0 +1,4 @@
+__pycache__/
+build/
+file_p2p*.so
+libfile_p2p.so

@@ -1,0 +1,10 @@
+/__pycache__/
+/c_api_test
+/crc32_verify
+/direct_io_test
+/mem_registration_test
+/nds_api_test
+/nds_example
+/rw_api_test
+/uapi_rw_test
+/remote_test.env
