@@ -456,6 +456,11 @@ static int read_raid0_member(int md_fd, const char *name,
 	if (err)
 		goto out;
 
+	/*
+	 * member is stack-allocated by the caller; zero reserved so
+	 * topo_validate_cfg does not reject uninitialized garbage.
+	 */
+	memset(member, 0, sizeof(*member));
 	member->slot = slot;
 	member->bdev.dev_id = component;
 	member->bdev.size_sector = size_kb * P2P_SECTORS_PER_KB;
