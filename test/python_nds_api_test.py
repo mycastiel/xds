@@ -6,6 +6,7 @@ import errno
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -14,6 +15,9 @@ import nds
 
 
 HARVEST_TIMEOUT_SEC = 300.0
+CQ_RACE_GETEVENTS_TIMEOUT_SEC = 0.05
+CQ_RACE_EAGAIN_RETRIES = 100000
+CQ_RACE_JOIN_TIMEOUT_SEC = 300.0
 
 
 @dataclass
@@ -670,6 +674,489 @@ def run_stress(
     write_stress_results(result_manifest, tests)
 
 
+class CqRaceContext:
+    def __init__(
+        self,
+        workers: int,
+        iterations: int,
+        with_drain: bool,
+        flags: int,
+        matrix: List[List[StressCase]],
+        allocator: VaAllocator,
+        granularity: int,
+        backing_page_size: int,
+        live_drain_submit_overlap: bool,
+        require_full_results: bool,
+        drain_overlap_ms: int = 0,
+    ) -> None:
+        self.workers = workers
+        self.iterations = iterations
+        self.expected = workers * iterations
+        self.with_drain = with_drain
+        self.flags = flags
+        self.matrix = matrix
+        self.allocator = allocator
+        self.granularity = granularity
+        self.backing_page_size = backing_page_size
+        self.live_drain_submit_overlap = live_drain_submit_overlap
+        self.require_full_results = require_full_results
+        self.drain_overlap_ms = drain_overlap_ms
+        self.iter_phase = threading.Barrier(workers)
+        self.gate = threading.Condition()
+        self.go = False
+        self.abort = False
+        self.error_lock = threading.Lock()
+        self.error: Optional[BaseException] = None
+        self.submitters_done = False
+        self.destroy_done = False
+        self.stop_submit = False
+        self.submitted = 0
+        self.completed = 0
+        self.counter_lock = threading.Lock()
+        self.seen = [False] * self.expected
+        self.seen_lock = threading.Lock()
+        self.live_slots: List[Optional[Tuple[int, int]]] = (
+            [None] * 1024 if live_drain_submit_overlap else []
+        )
+        self.live_slots_lock = threading.Lock()
+        self.ctx: Optional[object] = None
+        self.destroy_err = 0
+
+    def failed(self) -> bool:
+        with self.error_lock:
+            return self.error is not None
+
+    def fail(self, error: BaseException) -> None:
+        with self.error_lock:
+            if self.error is None:
+                self.error = error
+
+    def start_workers(self, count: int) -> None:
+        with self.gate:
+            if count == self.workers:
+                self.go = True
+            else:
+                self.abort = True
+            self.gate.notify_all()
+
+
+def join_cq_race_thread(thread: threading.Thread, role: str) -> None:
+    thread.join(CQ_RACE_JOIN_TIMEOUT_SEC)
+    if thread.is_alive():
+        raise RuntimeError(
+            f"cq-race {role} thread join timed out after "
+            f"{CQ_RACE_JOIN_TIMEOUT_SEC}s"
+        )
+
+
+def cq_race_submit_one(
+    context: CqRaceContext, test: StressCase, user_data: int
+) -> None:
+    if context.ctx is None:
+        if context.stop_submit or context.destroy_done:
+            raise InterruptedError(f"{test.case_id}: stop_submit")
+        raise RuntimeError(f"{test.case_id}: ctx not open")
+    tries = 0
+    while True:
+        if context.stop_submit:
+            raise InterruptedError(f"{test.case_id}: stop_submit")
+        ret = nds.io_submit(
+            context.ctx,
+            [
+                (
+                    nds.NDS_IO_OP_PREAD,
+                    test.fd,
+                    test.file_offset,
+                    [(test.cmb_va, test.length)],
+                    context.flags,
+                    0,
+                    user_data,
+                )
+            ],
+        )
+        if ret == 1:
+            test.result = 0
+            with context.counter_lock:
+                context.submitted += 1
+            print(
+                f"api=nds-python case={test.case_id} va=0x{test.cmb_va:x} "
+                f"ret=0 expected=0",
+                flush=True,
+            )
+            return
+        if ret != -errno.EAGAIN:
+            if context.stop_submit or context.destroy_done:
+                if ret in (
+                    -errno.EBADF,
+                    -errno.EINVAL,
+                    -errno.ENODEV,
+                    -errno.EIO,
+                    -errno.ENXIO,
+                ):
+                    raise InterruptedError(f"{test.case_id}: stop_submit")
+            test.result = ret
+            print(
+                f"api=nds-python case={test.case_id} va=0x{test.cmb_va:x} "
+                f"ret={ret} expected=0",
+                flush=True,
+            )
+            raise RuntimeError(f"{test.case_id}: io_submit returned {ret}")
+        tries += 1
+        if tries > CQ_RACE_EAGAIN_RETRIES:
+            raise RuntimeError(f"{test.case_id}: io_submit EAGAIN limit")
+        time.sleep(0.0001)
+
+
+def cq_race_submitter(context: CqRaceContext, worker_id: int) -> None:
+    with context.gate:
+        while not context.go and not context.abort:
+            context.gate.wait()
+        if context.abort:
+            return
+    try:
+        iteration = 0
+        while True:
+            if context.failed() or context.stop_submit:
+                break
+            if (
+                not context.live_drain_submit_overlap
+                and iteration >= context.iterations
+            ):
+                break
+            test = context.matrix[iteration % context.iterations][worker_id]
+            test.result = None
+            slot: Optional[int] = None
+            while True:
+                if context.failed() or context.stop_submit:
+                    return
+                try:
+                    test.cmb_va = context.allocator.allocate(test.length)
+                    break
+                except RuntimeError as error:
+                    if "cannot allocate" not in str(error):
+                        raise
+                    time.sleep(0.0001)
+            if not context.live_drain_submit_overlap:
+                try:
+                    context.iter_phase.wait()
+                except threading.BrokenBarrierError:
+                    return
+                if worker_id == 0 and not context.failed():
+                    try:
+                        validate_stress_allocations(
+                            context.matrix[iteration],
+                            context.granularity,
+                            context.backing_page_size,
+                        )
+                    except BaseException as error:
+                        context.fail(error)
+                try:
+                    context.iter_phase.wait()
+                except threading.BrokenBarrierError:
+                    return
+                if context.failed():
+                    break
+                user_data = (iteration << 32) | worker_id
+            else:
+                with context.live_slots_lock:
+                    for idx, entry in enumerate(context.live_slots):
+                        if entry is None:
+                            context.live_slots[idx] = (
+                                test.cmb_va,
+                                test.length,
+                            )
+                            slot = idx
+                            break
+                if slot is None:
+                    try:
+                        context.allocator.release(test.cmb_va, test.length)
+                    except BaseException:
+                        pass
+                    test.cmb_va = None
+                    time.sleep(0.0001)
+                    continue
+                user_data = slot
+            try:
+                cq_race_submit_one(context, test, user_data)
+            except InterruptedError:
+                if slot is not None:
+                    with context.live_slots_lock:
+                        context.live_slots[slot] = None
+                if test.cmb_va is not None:
+                    try:
+                        context.allocator.release(test.cmb_va, test.length)
+                    except BaseException:
+                        pass
+                    test.cmb_va = None
+                break
+            if context.stop_submit:
+                break
+            if test.result is not None and test.result != 0:
+                if slot is not None:
+                    with context.live_slots_lock:
+                        context.live_slots[slot] = None
+                try:
+                    context.allocator.release(test.cmb_va, test.length)
+                except BaseException:
+                    pass
+                test.cmb_va = None
+            iteration += 1
+    except BaseException as error:
+        context.fail(error)
+        context.iter_phase.abort()
+
+
+def cq_race_reaper(context: CqRaceContext) -> None:
+    with context.gate:
+        while not context.go and not context.abort:
+            context.gate.wait()
+        if context.abort:
+            return
+    while not context.failed():
+        with context.counter_lock:
+            submitted = context.submitted
+            completed = context.completed
+        if (
+            context.submitters_done
+            and completed >= submitted
+            and (
+                not context.with_drain
+                or context.destroy_done
+                or completed >= context.expected
+            )
+        ):
+            break
+        if context.destroy_done and completed >= submitted:
+            break
+
+        ctx = context.ctx
+        if ctx is None:
+            if context.destroy_done:
+                break
+            time.sleep(0.0001)
+            continue
+
+        events = nds.io_getevents(
+            ctx,
+            0,
+            64,
+            CQ_RACE_GETEVENTS_TIMEOUT_SEC,
+        )
+        if isinstance(events, int):
+            if context.destroy_done and events in (
+                -errno.EBADF,
+                -errno.EINVAL,
+                -errno.ENODEV,
+                -errno.EIO,
+            ):
+                break
+            context.fail(RuntimeError(f"nds.io_getevents returned {events}"))
+            break
+        for user_data, res in events:
+            if res != 0:
+                context.fail(
+                    RuntimeError(f"getevents res={res} for user_data={user_data}")
+                )
+                break
+            if context.live_drain_submit_overlap:
+                slot = int(user_data)
+                with context.live_slots_lock:
+                    if slot < 0 or slot >= len(context.live_slots):
+                        entry = None
+                    else:
+                        entry = context.live_slots[slot]
+                        context.live_slots[slot] = None
+                if entry is None:
+                    context.fail(RuntimeError(f"bad live slot {slot}"))
+                    break
+                try:
+                    context.allocator.release(entry[0], entry[1])
+                except BaseException as error:
+                    context.fail(error)
+                    break
+            else:
+                iteration = user_data >> 32
+                worker = user_data & 0xFFFFFFFF
+                if iteration >= context.iterations or worker >= context.workers:
+                    context.fail(
+                        RuntimeError(
+                            f"bad user_data 0x{user_data:x} "
+                            f"(iteration={iteration}, worker={worker})"
+                        )
+                    )
+                    break
+                index = iteration * context.workers + worker
+                with context.seen_lock:
+                    if context.seen[index]:
+                        context.fail(
+                            RuntimeError(
+                                f"duplicate event for iteration={iteration} "
+                                f"worker={worker}"
+                            )
+                        )
+                        break
+                    context.seen[index] = True
+                test = context.matrix[iteration][worker]
+                try:
+                    context.allocator.release(test.cmb_va, test.length)
+                except BaseException as error:
+                    context.fail(error)
+                    break
+            with context.counter_lock:
+                context.completed += 1
+        else:
+            continue
+        break
+
+
+def cq_race_drainer(context: CqRaceContext) -> None:
+    with context.gate:
+        while not context.go and not context.abort:
+            context.gate.wait()
+        if context.abort:
+            return
+    if context.live_drain_submit_overlap:
+        while not context.failed():
+            with context.counter_lock:
+                submitted = context.submitted
+            if submitted > 0:
+                break
+            time.sleep(0.001)
+        if not context.failed() and context.drain_overlap_ms:
+            left = context.drain_overlap_ms / 1000.0
+            while left > 0 and not context.failed():
+                slice_s = min(0.05, left)
+                time.sleep(slice_s)
+                left -= slice_s
+        if not context.failed():
+            context.stop_submit = True
+    else:
+        while not context.failed():
+            with context.counter_lock:
+                submitted = context.submitted
+            if submitted >= context.expected and context.submitters_done:
+                break
+            time.sleep(0.001)
+    if context.failed():
+        return
+    time.sleep(0.001)
+    if context.ctx is None:
+        context.fail(RuntimeError("drainer: ctx already closed"))
+        return
+    context.destroy_err = nds.io_destroy_ctx(context.ctx)
+    context.ctx = None
+    context.destroy_done = True
+    if context.destroy_err:
+        context.fail(
+            RuntimeError(f"nds.io_destroy_ctx returned {context.destroy_err}")
+        )
+
+
+def run_cq_race(
+    tests: List[StressCase],
+    workers: int,
+    iterations: int,
+    cmb_size: int,
+    granularity: int,
+    backing_page_size: int,
+    result_manifest: Path,
+    registered_mem: bool,
+    with_drain: bool,
+    live_drain_submit_overlap: bool,
+    require_full_results: bool,
+    drain_overlap_ms: int = 0,
+) -> None:
+    if (
+        workers < 2
+        or not iterations
+        or not cmb_size
+        or not granularity
+        or not backing_page_size
+        or cmb_size % granularity
+        or backing_page_size % granularity
+    ):
+        raise ValueError("invalid cq-race parameters")
+
+    matrix = stress_matrix(tests, workers, iterations)
+    allocator = VaAllocator(cmb_size, granularity)
+    flags = nds.NDS_IO_F_REGISTERED_MEM if registered_mem else 0
+    context = CqRaceContext(
+        workers,
+        iterations,
+        with_drain,
+        flags,
+        matrix,
+        allocator,
+        granularity,
+        backing_page_size,
+        live_drain_submit_overlap,
+        require_full_results,
+        drain_overlap_ms,
+    )
+
+    context.ctx = new_ctx(1024)
+    reaper = threading.Thread(target=cq_race_reaper, args=(context,))
+    drainer: Optional[threading.Thread] = None
+    submitters = [
+        threading.Thread(target=cq_race_submitter, args=(context, worker_id))
+        for worker_id in range(workers)
+    ]
+    started: List[threading.Thread] = []
+    try:
+        reaper.start()
+        started.append(reaper)
+        if with_drain:
+            drainer = threading.Thread(target=cq_race_drainer, args=(context,))
+            drainer.start()
+            started.append(drainer)
+        for thread in submitters:
+            thread.start()
+            started.append(thread)
+        context.start_workers(len(submitters))
+        for thread in submitters:
+            join_cq_race_thread(thread, "submitter")
+        context.submitters_done = True
+        if drainer is not None:
+            join_cq_race_thread(drainer, "drainer")
+        join_cq_race_thread(reaper, "reaper")
+    except BaseException:
+        context.start_workers(0)
+        for thread in started:
+            thread.join()
+        raise
+
+    if context.error is not None:
+        raise context.error
+
+    with context.counter_lock:
+        submitted = context.submitted
+        completed = context.completed
+    if completed > submitted:
+        raise RuntimeError(f"completed ({completed}) exceeds submitted ({submitted})")
+    if not with_drain and completed != submitted:
+        raise RuntimeError(
+            f"cq-race incomplete: completed={completed} submitted={submitted}"
+        )
+    if context.require_full_results and submitted != context.expected:
+        raise RuntimeError(
+            f"cq-race incomplete submits: {submitted}/{context.expected}"
+        )
+
+    if context.ctx is not None:
+        destroy_ctx(context.ctx)
+        context.ctx = None
+
+    if context.require_full_results:
+        write_stress_results(result_manifest, tests)
+    print(
+        f"cq-race summary: submitted={submitted} completed={completed} "
+        f"expected={context.expected} with_drain={int(context.with_drain)} "
+        f"live_submit_drain={int(context.live_drain_submit_overlap)} "
+        f"drain_overlap_ms={context.drain_overlap_ms}",
+        flush=True,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--topology", required=True)
@@ -677,7 +1164,16 @@ def main() -> int:
     parser.add_argument(
         "--mode",
         required=True,
-        choices=("single", "queued", "threaded", "stress", "reject"),
+        choices=(
+            "single",
+            "queued",
+            "threaded",
+            "stress",
+            "cq-race",
+            "cq-race-drain",
+            "cq-race-drain-live",
+            "reject",
+        ),
     )
     parser.add_argument("--workers", type=integer)
     parser.add_argument("--iterations", type=integer)
@@ -686,6 +1182,7 @@ def main() -> int:
     parser.add_argument("--backing-page-size", type=integer)
     parser.add_argument("--result-manifest", type=Path)
     parser.add_argument("--registered-mem", action="store_true")
+    parser.add_argument("--drain-overlap-ms", type=integer, default=0)
     args = parser.parse_args()
 
     stress_values = (
@@ -728,9 +1225,11 @@ def main() -> int:
     if args.manifest is None:
         parser.error("--manifest is required unless --mode reject")
 
-    if args.mode == "stress":
-        if any(value is None for value in stress_values):
+    if args.mode in ("stress", "cq-race", "cq-race-drain", "cq-race-drain-live"):
+        if any(value is None for value in stress_values[:-1]):
             parser.error("stress mode requires all stress-specific options")
+        if args.mode != "cq-race-drain-live" and args.result_manifest is None:
+            parser.error("--result-manifest is required for this mode")
         tests = load_stress_manifest(args.manifest)
         topo_fd = os.open(args.topology, os.O_RDONLY | os.O_DIRECT)
         try:
@@ -745,16 +1244,34 @@ def main() -> int:
                         raise RuntimeError(f"register_mem returned {result}")
                     reg_addr = 0
                 open_case_fds(tests)
-                run_stress(
-                    tests,
-                    args.workers,
-                    args.iterations,
-                    args.cmb_size,
-                    args.va_granularity,
-                    args.backing_page_size,
-                    args.result_manifest,
-                    args.registered_mem,
-                )
+                if args.mode == "stress":
+                    run_stress(
+                        tests,
+                        args.workers,
+                        args.iterations,
+                        args.cmb_size,
+                        args.va_granularity,
+                        args.backing_page_size,
+                        args.result_manifest,
+                        args.registered_mem,
+                    )
+                else:
+                    run_cq_race(
+                        tests,
+                        args.workers,
+                        args.iterations,
+                        args.cmb_size,
+                        args.va_granularity,
+                        args.backing_page_size,
+                        args.result_manifest,
+                        args.registered_mem,
+                        args.mode != "cq-race",
+                        args.mode == "cq-race-drain-live",
+                        args.mode != "cq-race-drain-live",
+                        args.drain_overlap_ms
+                        if args.mode == "cq-race-drain-live"
+                        else 0,
+                    )
             finally:
                 cleanup_errors = []
                 close_case_fds(tests)
@@ -778,7 +1295,10 @@ def main() -> int:
         return 0
 
     if any(value is not None for value in stress_values):
-        parser.error("stress-specific options require --mode stress")
+        parser.error(
+            "stress-specific options require --mode stress, cq-race, "
+            "cq-race-drain, or cq-race-drain-live"
+        )
 
     tests = load_manifest(args.manifest)
     topo_fd = os.open(args.topology, os.O_RDONLY | os.O_DIRECT)

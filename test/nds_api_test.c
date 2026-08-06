@@ -22,12 +22,16 @@
 #define STRESS_MIN_LENGTH (4UL << 10)
 #define STRESS_MAX_LENGTH (4UL << 20)
 #define HARVEST_TIMEOUT_SEC 300
+#define CQ_RACE_JOIN_TIMEOUT_SEC 300
 
 enum run_mode {
 	MODE_SINGLE,
 	MODE_QUEUED,
 	MODE_THREADED,
 	MODE_STRESS,
+	MODE_CQ_RACE,
+	MODE_CQ_RACE_DRAIN,
+	MODE_CQ_RACE_DRAIN_LIVE,
 	MODE_REJECT,
 };
 
@@ -111,7 +115,7 @@ static void usage(const char *program)
 {
 	fprintf(stderr,
 		"Usage: %s --topology <block-device> [--manifest <tsv>] "
-		"--mode <single|queued|threaded|stress|reject> "
+		"--mode <single|queued|threaded|stress|cq-race|cq-race-drain|cq-race-drain-live|reject> "
 		"[--registered-mem] [stress options]\n",
 		program);
 }
@@ -1289,6 +1293,693 @@ static int write_stress_results(const char *path, struct stress_case **matrix,
 	return 0;
 }
 
+struct cq_race_context {
+	struct stress_case **matrix;
+	struct start_gate gate;
+	pthread_barrier_t iter_phase;
+	pthread_mutex_t error_lock;
+	struct va_allocator allocator;
+	struct nds_io_ctx *ctx;
+	unsigned int workers;
+	unsigned int iterations;
+	unsigned int expected;
+	unsigned long cmb_size;
+	unsigned long granularity;
+	unsigned long backing_page_size;
+	unsigned int flags;
+	bool with_drain;
+	bool live_drain_submit_overlap;
+	bool require_full_results;
+	unsigned int drain_overlap_ms;
+	bool iter_barrier_initialized;
+	bool allocator_initialized;
+	int stop_submit;
+	int submitters_done;
+	int destroy_done;
+	unsigned int submitted;
+	unsigned int completed;
+	unsigned char *seen;
+	struct {
+		unsigned long va;
+		unsigned long length;
+		int active;
+	} *live_slots;
+	unsigned int live_slot_count;
+	int error;
+	int destroy_err;
+};
+
+static bool cq_race_failed(struct cq_race_context *context)
+{
+	bool failed;
+
+	pthread_mutex_lock(&context->error_lock);
+	failed = context->error != 0;
+	pthread_mutex_unlock(&context->error_lock);
+	return failed;
+}
+
+static int cq_race_timedjoin(pthread_t thread, const char *role)
+{
+	struct timespec deadline;
+	int ret;
+
+	if (clock_gettime(CLOCK_REALTIME, &deadline))
+		return -errno;
+	deadline.tv_sec += CQ_RACE_JOIN_TIMEOUT_SEC;
+	ret = pthread_timedjoin_np(thread, NULL, &deadline);
+	if (ret == ETIMEDOUT) {
+		fprintf(stderr, "cq-race %s thread join timed out after %ds\n",
+			role, CQ_RACE_JOIN_TIMEOUT_SEC);
+		return -ETIMEDOUT;
+	}
+	if (ret)
+		return -ret;
+	return 0;
+}
+
+static void cq_race_fail(struct cq_race_context *context, int err,
+			 const char *operation, unsigned int worker)
+{
+	if (!err)
+		err = -EINVAL;
+	pthread_mutex_lock(&context->error_lock);
+	if (!context->error) {
+		context->error = err;
+		fprintf(stderr, "cq-race worker %u: %s failed: %d\n", worker,
+			operation, err);
+	}
+	pthread_mutex_unlock(&context->error_lock);
+}
+
+static int cq_race_submit_one(struct cq_race_context *context,
+			      struct stress_case *test, uint64_t user_data)
+{
+	struct nds_io_vec iov = {
+		.buf_addr = test->cmb_va,
+		.buf_len = (uint32_t)test->length,
+	};
+	struct nds_io_cb cb = {
+		.opcode = NDS_IO_OP_PREAD,
+		.rw_flags = context->flags,
+		.obj = { .fd = test->fd },
+		.offset = test->file_offset,
+		.user_data = user_data,
+		.iov = &iov,
+		.iov_cnt = 1,
+		.host_pid = 0,
+	};
+	unsigned int tries = 0;
+	int ret;
+
+	for (;;) {
+		if (__atomic_load_n(&context->stop_submit, __ATOMIC_ACQUIRE))
+			return -ECANCELED;
+		ret = nds_io_submit(context->ctx, 1, &cb);
+		if (ret == 1) {
+			test->result = 0;
+			__atomic_fetch_add(&context->submitted, 1,
+					   __ATOMIC_ACQ_REL);
+			printf("api=nds-c case=%s va=0x%lx ret=0 expected=0\n",
+			       test->id, test->cmb_va);
+			return 0;
+		}
+		if (ret != -EAGAIN) {
+			if (__atomic_load_n(&context->stop_submit,
+					    __ATOMIC_ACQUIRE) ||
+			    __atomic_load_n(&context->destroy_done,
+					    __ATOMIC_ACQUIRE)) {
+				if (ret == -EBADF || ret == -EINVAL ||
+				    ret == -ENODEV || ret == -EIO ||
+				    ret == -ENXIO)
+					return -ECANCELED;
+			}
+			test->result = ret;
+			printf("api=nds-c case=%s va=0x%lx ret=%d expected=0\n",
+			       test->id, test->cmb_va, test->result);
+			return ret < 0 ? ret : -EINVAL;
+		}
+		if (++tries > 100000)
+			return -EAGAIN;
+		usleep(100);
+	}
+}
+
+static void *cq_race_submitter(void *argument)
+{
+	struct stress_worker *worker = argument;
+	struct cq_race_context *context =
+		(struct cq_race_context *)worker->context;
+	unsigned int worker_id = worker->worker;
+	unsigned int iteration;
+
+	pthread_mutex_lock(&context->gate.lock);
+	while (!context->gate.go && !context->gate.abort)
+		pthread_cond_wait(&context->gate.cond, &context->gate.lock);
+	if (context->gate.abort) {
+		pthread_mutex_unlock(&context->gate.lock);
+		return NULL;
+	}
+	pthread_mutex_unlock(&context->gate.lock);
+
+	iteration = 0;
+	for (;;) {
+		struct stress_case *test;
+		unsigned long va = ULONG_MAX;
+		uint64_t user_data;
+		unsigned int slot = UINT_MAX;
+		int err;
+
+		if (cq_race_failed(context))
+			break;
+		if (__atomic_load_n(&context->stop_submit, __ATOMIC_ACQUIRE))
+			break;
+		if (!context->live_drain_submit_overlap &&
+		    iteration >= context->iterations)
+			break;
+
+		test = context->matrix[(iteration % context->iterations) *
+					       context->workers +
+				       worker_id];
+
+		for (;;) {
+			if (__atomic_load_n(&context->stop_submit,
+					    __ATOMIC_ACQUIRE)) {
+				err = -ECANCELED;
+				break;
+			}
+			err = va_allocate(&context->allocator, test->length,
+					  &va);
+			if (!err) {
+				test->cmb_va = va;
+				break;
+			}
+			if (err != -ENOSPC || cq_race_failed(context))
+				break;
+			usleep(100);
+		}
+		if (err == -ECANCELED)
+			break;
+		if (err) {
+			cq_race_fail(context, err, "va_allocate", worker_id);
+			break;
+		}
+
+		if (!context->live_drain_submit_overlap) {
+			pthread_barrier_wait(&context->iter_phase);
+			if (worker_id == 0 && !cq_race_failed(context)) {
+				err = validate_stress_round(
+					&(struct stress_context){
+						.matrix = context->matrix,
+						.workers = context->workers,
+						.iterations = context->iterations,
+						.cmb_size = context->cmb_size,
+						.granularity = context->granularity,
+						.backing_page_size =
+							context->backing_page_size,
+					},
+					iteration);
+				if (err)
+					cq_race_fail(context, err, "validate", 0);
+			}
+			pthread_barrier_wait(&context->iter_phase);
+			if (cq_race_failed(context))
+				break;
+			user_data = (uint64_t)iteration << 32 | worker_id;
+		} else {
+			for (slot = 0; slot < context->live_slot_count; slot++) {
+				int expected = 0;
+
+				if (__atomic_compare_exchange_n(
+					    &context->live_slots[slot].active,
+					    &expected, 1, 0, __ATOMIC_ACQ_REL,
+					    __ATOMIC_ACQUIRE)) {
+					context->live_slots[slot].va = va;
+					context->live_slots[slot].length =
+						test->length;
+					break;
+				}
+			}
+			if (slot >= context->live_slot_count) {
+				va_release(&context->allocator, va, test->length);
+				test->cmb_va = ULONG_MAX;
+				usleep(100);
+				continue;
+			}
+			user_data = slot;
+		}
+
+		err = cq_race_submit_one(context, test, user_data);
+		if (err == -ECANCELED) {
+			if (slot != UINT_MAX) {
+				context->live_slots[slot].active = 0;
+				slot = UINT_MAX;
+			}
+			if (test->cmb_va != ULONG_MAX) {
+				va_release(&context->allocator, test->cmb_va,
+					   test->length);
+				test->cmb_va = ULONG_MAX;
+			}
+			break;
+		}
+		if (err) {
+			if (slot != UINT_MAX) {
+				context->live_slots[slot].active = 0;
+				slot = UINT_MAX;
+			}
+			if (test->cmb_va != ULONG_MAX) {
+				va_release(&context->allocator, test->cmb_va,
+					   test->length);
+				test->cmb_va = ULONG_MAX;
+			}
+			cq_race_fail(context, err, "submit", worker_id);
+			break;
+		}
+		iteration++;
+	}
+	return NULL;
+}
+
+static void *cq_race_reaper(void *argument)
+{
+	struct cq_race_context *context = argument;
+	struct nds_io_event events[64];
+	struct timespec timeout = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };
+	unsigned int expected = context->expected;
+
+	pthread_mutex_lock(&context->gate.lock);
+	while (!context->gate.go && !context->gate.abort)
+		pthread_cond_wait(&context->gate.cond, &context->gate.lock);
+	if (context->gate.abort) {
+		pthread_mutex_unlock(&context->gate.lock);
+		return NULL;
+	}
+	pthread_mutex_unlock(&context->gate.lock);
+
+	while (!cq_race_failed(context)) {
+		unsigned int submitted =
+			__atomic_load_n(&context->submitted, __ATOMIC_ACQUIRE);
+		unsigned int completed =
+			__atomic_load_n(&context->completed, __ATOMIC_ACQUIRE);
+		int n;
+		int i;
+
+		if (__atomic_load_n(&context->submitters_done, __ATOMIC_ACQUIRE) &&
+		    completed >= submitted &&
+		    (!context->with_drain ||
+		     __atomic_load_n(&context->destroy_done, __ATOMIC_ACQUIRE) ||
+		     completed >= expected))
+			break;
+		if (__atomic_load_n(&context->destroy_done, __ATOMIC_ACQUIRE) &&
+		    completed >= submitted)
+			break;
+
+		n = nds_io_getevents(context->ctx, 0, 64, events, &timeout);
+		if (n < 0) {
+			if (__atomic_load_n(&context->destroy_done,
+					    __ATOMIC_ACQUIRE) &&
+			    (n == -EBADF || n == -EINVAL || n == -ENODEV ||
+			     n == -EIO))
+				break;
+			cq_race_fail(context, n, "getevents", UINT_MAX);
+			break;
+		}
+		for (i = 0; i < n; i++) {
+			uint64_t user_data = events[i].user_data;
+			unsigned int iteration = (unsigned int)(user_data >> 32);
+			unsigned int worker = (unsigned int)user_data;
+			size_t index;
+
+			if (events[i].reserved[0] || events[i].reserved[1] ||
+			    events[i].res != 0) {
+				cq_race_fail(context, -EINVAL, "bad event",
+					     UINT_MAX);
+				break;
+			}
+			if (!context->live_drain_submit_overlap &&
+			    (iteration >= context->iterations ||
+			     worker >= context->workers)) {
+				cq_race_fail(context, -EINVAL, "bad user_data",
+					     worker);
+				break;
+			}
+			if (context->live_drain_submit_overlap) {
+				unsigned int slot = (unsigned int)user_data;
+				int release_err;
+
+				if (slot >= context->live_slot_count ||
+				    !context->live_slots[slot].active) {
+					cq_race_fail(context, -EINVAL,
+						     "bad live slot", worker);
+					break;
+				}
+				release_err = va_release(
+					&context->allocator,
+					context->live_slots[slot].va,
+					context->live_slots[slot].length);
+				context->live_slots[slot].active = 0;
+				if (release_err) {
+					cq_race_fail(context, release_err,
+						     "va_release", worker);
+					break;
+				}
+			} else {
+				index = (size_t)iteration * context->workers +
+					worker;
+				if (context->seen[index]) {
+					cq_race_fail(context, -EEXIST,
+						     "dup event", worker);
+					break;
+				}
+				context->seen[index] = 1;
+				if (context->allocator_initialized) {
+					struct stress_case *test =
+						context->matrix[index];
+					int release_err;
+
+					release_err = va_release(
+						&context->allocator,
+						test->cmb_va, test->length);
+					if (release_err) {
+						cq_race_fail(context,
+							     release_err,
+							     "va_release",
+							     worker);
+						break;
+					}
+					test->cmb_va = ULONG_MAX;
+				}
+			}
+			__atomic_fetch_add(&context->completed, 1,
+					   __ATOMIC_ACQ_REL);
+		}
+	}
+	return NULL;
+}
+
+static void *cq_race_drainer(void *argument)
+{
+	struct cq_race_context *context = argument;
+	unsigned int expected = context->expected;
+
+	pthread_mutex_lock(&context->gate.lock);
+	while (!context->gate.go && !context->gate.abort)
+		pthread_cond_wait(&context->gate.cond, &context->gate.lock);
+	if (context->gate.abort) {
+		pthread_mutex_unlock(&context->gate.lock);
+		return NULL;
+	}
+	pthread_mutex_unlock(&context->gate.lock);
+
+	if (context->live_drain_submit_overlap) {
+		while (!cq_race_failed(context)) {
+			if (__atomic_load_n(&context->submitted,
+					    __ATOMIC_ACQUIRE) > 0)
+				break;
+			usleep(1000);
+		}
+		/*
+		 * Keep submit∥getevents∥drain racing for drain_overlap_ms
+		 * before stopping new submits and destroying.
+		 */
+		if (!cq_race_failed(context) && context->drain_overlap_ms) {
+			unsigned int left = context->drain_overlap_ms;
+
+			while (left && !cq_race_failed(context)) {
+				unsigned int slice = left > 50 ? 50 : left;
+
+				usleep(slice * 1000u);
+				left -= slice;
+			}
+		}
+		if (!cq_race_failed(context))
+			__atomic_store_n(&context->stop_submit, 1,
+					 __ATOMIC_RELEASE);
+	} else {
+		/*
+		 * Wait until every submit has been accepted so check_stress still
+		 * sees a full result set, then destroy while reaper may still
+		 * harvest.
+		 */
+		while (!cq_race_failed(context)) {
+			if (__atomic_load_n(&context->submitted,
+					    __ATOMIC_ACQUIRE) >= expected &&
+			    __atomic_load_n(&context->submitters_done,
+					    __ATOMIC_ACQUIRE))
+				break;
+			usleep(1000);
+		}
+	}
+	if (cq_race_failed(context))
+		return NULL;
+
+	/* Widen the getevents∥drain race window slightly. */
+	usleep(1000);
+	context->destroy_err = nds_io_destroy_ctx(context->ctx);
+	context->ctx = NULL;
+	__atomic_store_n(&context->destroy_done, 1, __ATOMIC_RELEASE);
+	if (context->destroy_err)
+		cq_race_fail(context, context->destroy_err, "destroy/drain",
+			     UINT_MAX);
+	return NULL;
+}
+
+/*
+ * Shared-ctx race: many submitters + one getevents reaper.
+ * cq-race-drain also destroys (IOCTL_DRAIN_IO + close) while reaping.
+ */
+static int run_cq_race(struct stress_case *tests, size_t count,
+		       unsigned int workers, unsigned int iterations,
+		       unsigned long cmb_size, unsigned long granularity,
+		       unsigned long backing_page_size,
+		       const char *result_manifest, bool registered_mem,
+		       bool with_drain, bool live_drain_submit_overlap,
+		       bool require_full_results,
+		       unsigned int drain_overlap_ms)
+{
+	struct cq_race_context context = {
+		.workers = workers,
+		.iterations = iterations,
+		.expected = workers * iterations,
+		.with_drain = with_drain,
+		.live_drain_submit_overlap = live_drain_submit_overlap,
+		.require_full_results = require_full_results,
+		.drain_overlap_ms = drain_overlap_ms,
+		.gate = {
+			.lock = PTHREAD_MUTEX_INITIALIZER,
+			.cond = PTHREAD_COND_INITIALIZER,
+		},
+		.error_lock = PTHREAD_MUTEX_INITIALIZER,
+	};
+	struct stress_worker *worker_args = NULL;
+	pthread_t *submit_threads = NULL;
+	pthread_t reaper_thread;
+	pthread_t drain_thread;
+	bool reaper_started = false;
+	bool drain_started = false;
+	bool registered = false;
+	unsigned int created = 0;
+	unsigned int i;
+	int err;
+
+	if (workers < 2 || !iterations || !cmb_size || !granularity ||
+	    !backing_page_size || cmb_size % granularity ||
+	    backing_page_size % granularity)
+		return -EINVAL;
+
+	if (registered_mem) {
+		err = nds_register_mem((void *)(uintptr_t)0, cmb_size, 0);
+		if (err)
+			goto out;
+		registered = true;
+		context.flags = NDS_IO_F_REGISTERED_MEM;
+	}
+	err = prepare_stress_matrix(tests, count, workers, iterations,
+				    &context.matrix);
+	if (err)
+		goto out;
+
+	err = va_allocator_init(&context.allocator, cmb_size, granularity);
+	if (err)
+		goto out;
+	context.allocator_initialized = true;
+	context.cmb_size = cmb_size;
+	context.granularity = granularity;
+	context.backing_page_size = backing_page_size;
+
+	err = pthread_barrier_init(&context.iter_phase, NULL, workers);
+	if (err) {
+		err = -err;
+		goto out;
+	}
+	context.iter_barrier_initialized = true;
+
+	for (i = 0; i < workers * iterations; i++) {
+		context.matrix[i]->cmb_va = ULONG_MAX;
+		context.matrix[i]->result = INT_MIN;
+	}
+
+	context.seen = calloc(context.expected, 1);
+	worker_args = calloc(workers, sizeof(*worker_args));
+	submit_threads = calloc(workers, sizeof(*submit_threads));
+	if (!context.seen || !worker_args || !submit_threads) {
+		err = -ENOMEM;
+		goto out;
+	}
+	if (live_drain_submit_overlap) {
+		context.live_slot_count = 1024;
+		context.live_slots =
+			calloc(context.live_slot_count, sizeof(*context.live_slots));
+		if (!context.live_slots) {
+			err = -ENOMEM;
+			goto out;
+		}
+	}
+
+	err = nds_io_new_ctx(
+		&(struct nds_io_ctx_param){ .max_io_cnt = 1024 }, &context.ctx);
+	if (err)
+		goto out;
+
+	err = pthread_create(&reaper_thread, NULL, cq_race_reaper, &context);
+	if (err) {
+		err = -err;
+		goto out;
+	}
+	reaper_started = true;
+
+	if (with_drain) {
+		err = pthread_create(&drain_thread, NULL, cq_race_drainer,
+				     &context);
+		if (err) {
+			err = -err;
+			goto out;
+		}
+		drain_started = true;
+	}
+
+	for (i = 0; i < workers; i++) {
+		/*
+		 * stress_worker.context is struct stress_context *; reuse the
+		 * pointer slot to pass cq_race_context.
+		 */
+		worker_args[i].context =
+			(struct stress_context *)&context;
+		worker_args[i].worker = i;
+		err = pthread_create(&submit_threads[i], NULL, cq_race_submitter,
+				     &worker_args[i]);
+		if (err) {
+			err = -err;
+			break;
+		}
+		created++;
+	}
+
+	pthread_mutex_lock(&context.gate.lock);
+	if (created == workers)
+		context.gate.go = true;
+	else
+		context.gate.abort = true;
+	pthread_cond_broadcast(&context.gate.cond);
+	pthread_mutex_unlock(&context.gate.lock);
+
+	for (i = 0; i < created; i++) {
+		int join_err = cq_race_timedjoin(submit_threads[i], "submitter");
+
+		if (join_err && !err)
+			err = join_err;
+	}
+	__atomic_store_n(&context.submitters_done, 1, __ATOMIC_RELEASE);
+
+	if (drain_started) {
+		int join_err = cq_race_timedjoin(drain_thread, "drainer");
+
+		if (join_err && !err)
+			err = join_err;
+	}
+	if (reaper_started) {
+		int join_err = cq_race_timedjoin(reaper_thread, "reaper");
+
+		if (join_err && !err)
+			err = join_err;
+	}
+
+	if (created != workers) {
+		if (!err)
+			err = -EINVAL;
+		goto out;
+	}
+
+	pthread_mutex_lock(&context.error_lock);
+	err = context.error;
+	pthread_mutex_unlock(&context.error_lock);
+	if (err)
+		goto out;
+
+	if (__atomic_load_n(&context.completed, __ATOMIC_ACQUIRE) >
+	    __atomic_load_n(&context.submitted, __ATOMIC_ACQUIRE)) {
+		err = -EINVAL;
+		goto out;
+	}
+	if (!with_drain &&
+	    __atomic_load_n(&context.completed, __ATOMIC_ACQUIRE) !=
+		    __atomic_load_n(&context.submitted, __ATOMIC_ACQUIRE)) {
+		err = -ETIMEDOUT;
+		goto out;
+	}
+	if (context.require_full_results &&
+	    __atomic_load_n(&context.submitted, __ATOMIC_ACQUIRE) !=
+		    context.expected) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	if (context.ctx) {
+		err = nds_io_destroy_ctx(context.ctx);
+		context.ctx = NULL;
+		if (err)
+			goto out;
+	}
+
+	if (context.require_full_results) {
+		err = write_stress_results(result_manifest, context.matrix,
+					   workers, iterations);
+		if (err)
+			goto out;
+	}
+	printf("cq-race summary: submitted=%u completed=%u expected=%u "
+	       "with_drain=%u live_submit_drain=%u drain_overlap_ms=%u\n",
+	       __atomic_load_n(&context.submitted, __ATOMIC_ACQUIRE),
+	       __atomic_load_n(&context.completed, __ATOMIC_ACQUIRE),
+	       context.expected, context.with_drain ? 1 : 0,
+	       context.live_drain_submit_overlap ? 1 : 0,
+	       context.drain_overlap_ms);
+
+out:
+	if (context.ctx)
+		nds_io_destroy_ctx(context.ctx);
+	if (registered) {
+		int unregister_err;
+
+		unregister_err = nds_unregister_mem((void *)(uintptr_t)0);
+		if (unregister_err && !err)
+			err = unregister_err;
+	}
+	free(submit_threads);
+	free(worker_args);
+	free(context.seen);
+	free(context.live_slots);
+	free(context.matrix);
+	if (context.iter_barrier_initialized)
+		pthread_barrier_destroy(&context.iter_phase);
+	if (context.allocator_initialized)
+		va_allocator_destroy(&context.allocator);
+	pthread_cond_destroy(&context.gate.cond);
+	pthread_mutex_destroy(&context.gate.lock);
+	pthread_mutex_destroy(&context.error_lock);
+	return err;
+}
+
 static int run_stress(struct stress_case *tests, size_t count,
 		      unsigned int workers, unsigned int iterations,
 		      unsigned long cmb_size, unsigned long granularity,
@@ -1442,6 +2133,7 @@ int main(int argc, char **argv)
 		OPT_VA_GRANULARITY,
 		OPT_BACKING_PAGE_SIZE,
 		OPT_RESULT_MANIFEST,
+		OPT_DRAIN_OVERLAP_MS,
 	};
 	const char *topology = NULL;
 	const char *manifest = NULL;
@@ -1457,6 +2149,7 @@ int main(int argc, char **argv)
 	unsigned long cmb_size = 0;
 	unsigned long va_granularity = 0;
 	unsigned long backing_page_size = 0;
+	unsigned int drain_overlap_ms = 0;
 	uint64_t reg_addr = 0;
 	bool registered_mem = false;
 	bool registered = false;
@@ -1476,6 +2169,8 @@ int main(int argc, char **argv)
 		  OPT_BACKING_PAGE_SIZE },
 		{ "result-manifest", required_argument, NULL,
 		  OPT_RESULT_MANIFEST },
+		{ "drain-overlap-ms", required_argument, NULL,
+		  OPT_DRAIN_OVERLAP_MS },
 		{ "registered-mem", no_argument, NULL, 'r' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
@@ -1500,6 +2195,12 @@ int main(int argc, char **argv)
 				mode = MODE_THREADED;
 			else if (!strcmp(optarg, "stress"))
 				mode = MODE_STRESS;
+			else if (!strcmp(optarg, "cq-race"))
+				mode = MODE_CQ_RACE;
+			else if (!strcmp(optarg, "cq-race-drain"))
+				mode = MODE_CQ_RACE_DRAIN;
+			else if (!strcmp(optarg, "cq-race-drain-live"))
+				mode = MODE_CQ_RACE_DRAIN_LIVE;
 			else if (!strcmp(optarg, "reject"))
 				mode = MODE_REJECT;
 			else {
@@ -1535,6 +2236,11 @@ int main(int argc, char **argv)
 		case OPT_RESULT_MANIFEST:
 			result_manifest = optarg;
 			break;
+		case OPT_DRAIN_OVERLAP_MS:
+			err = parse_uint(optarg, &drain_overlap_ms);
+			if (err)
+				goto invalid_option;
+			break;
 		case 'r':
 			registered_mem = true;
 			break;
@@ -1556,7 +2262,7 @@ int main(int argc, char **argv)
 		if (workers || iterations || cmb_size || va_granularity ||
 		    backing_page_size || result_manifest) {
 			fprintf(stderr,
-				"stress-specific options require --mode stress\n");
+				"stress-specific options require --mode stress|cq-race|cq-race-drain|cq-race-drain-live\n");
 			return EXIT_FAILURE;
 		}
 		topo_fd = open(topology, O_RDONLY | O_DIRECT);
@@ -1627,9 +2333,11 @@ int main(int argc, char **argv)
 		usage(argv[0]);
 		return EXIT_FAILURE;
 	}
-	if (mode == MODE_STRESS) {
+	if (mode == MODE_STRESS || mode == MODE_CQ_RACE ||
+	    mode == MODE_CQ_RACE_DRAIN || mode == MODE_CQ_RACE_DRAIN_LIVE) {
 		if (!workers || !iterations || !cmb_size || !va_granularity ||
-		    !backing_page_size || !result_manifest) {
+		    !backing_page_size ||
+		    (mode != MODE_CQ_RACE_DRAIN_LIVE && !result_manifest)) {
 			usage(argv[0]);
 			return EXIT_FAILURE;
 		}
@@ -1654,11 +2362,29 @@ int main(int argc, char **argv)
 			free_stress_cases(stress_tests, count);
 			return EXIT_FAILURE;
 		}
-		err = run_stress(stress_tests, count, workers, iterations,
-				 cmb_size, va_granularity, backing_page_size,
-				 result_manifest, registered_mem);
+		if (mode == MODE_STRESS)
+			err = run_stress(stress_tests, count, workers,
+					 iterations, cmb_size, va_granularity,
+					 backing_page_size, result_manifest,
+					 registered_mem);
+		else
+			err = run_cq_race(stress_tests, count, workers,
+					  iterations, cmb_size, va_granularity,
+					  backing_page_size, result_manifest,
+					  registered_mem,
+					  mode != MODE_CQ_RACE,
+					  mode == MODE_CQ_RACE_DRAIN_LIVE,
+					  mode != MODE_CQ_RACE_DRAIN_LIVE,
+					  mode == MODE_CQ_RACE_DRAIN_LIVE ?
+						  drain_overlap_ms :
+						  0);
 		if (err)
-			fprintf(stderr, "stress run failed: %s (%d)\n",
+			fprintf(stderr, "%s run failed: %s (%d)\n",
+				mode == MODE_STRESS		 ? "stress" :
+				mode == MODE_CQ_RACE_DRAIN_LIVE ?
+					"cq-race-drain-live" :
+				mode == MODE_CQ_RACE_DRAIN ? "cq-race-drain" :
+							     "cq-race",
 				strerror(-err), err);
 		nds_exit();
 		close(topo_fd);
@@ -1667,7 +2393,8 @@ int main(int argc, char **argv)
 	}
 	if (workers || iterations || cmb_size || va_granularity ||
 	    backing_page_size || result_manifest) {
-		fprintf(stderr, "stress-specific options require --mode stress\n");
+		fprintf(stderr,
+			"stress-specific options require --mode stress|cq-race|cq-race-drain|cq-race-drain-live\n");
 		return EXIT_FAILURE;
 	}
 
@@ -1722,6 +2449,9 @@ int main(int argc, char **argv)
 				   registered_mem ? NDS_IO_F_REGISTERED_MEM : 0);
 		break;
 	case MODE_STRESS:
+	case MODE_CQ_RACE:
+	case MODE_CQ_RACE_DRAIN:
+	case MODE_CQ_RACE_DRAIN_LIVE:
 	case MODE_REJECT:
 		err = -EINVAL;
 		break;

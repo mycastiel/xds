@@ -556,6 +556,97 @@ test_raid0_partitions()
 	cleanup_storage
 }
 
+run_cq_race_smoke()
+{
+	local cq_workers=8 cq_iterations=16
+	local va_granularity=$((4 << 10)) backing_page_size=$((2 << 20))
+	local data_dir workload mode api label output result kernel_log status
+	local -a command common_options
+
+	log "NDS cq-race smoke (workers=$cq_workers iterations=$cq_iterations)"
+	wipe_test_devices
+	mkfs.ext4 -F -q -b 4096 "$DEV1"
+	mount -o noatime "$DEV1" "$MOUNT_DIR"
+	data_dir=$MOUNT_DIR/cq-race-data
+	workload="$WORK_DIR/cq-race.workload.tsv"
+	python3 "$SCRIPT_DIR/generate_stress_workload.py" \
+		--directory "$data_dir" --manifest "$workload" \
+		--workers "$cq_workers" --iterations "$cq_iterations" \
+		--seed 0x584453 --mode nvme --topology "$DEV1"
+	sync
+
+	for mode in cq-race cq-race-drain; do
+		for api in nds-c nds-python; do
+			label="$mode-smoke.$api"
+			output="$WORK_DIR/$label.out"
+			result="$WORK_DIR/$label.result.tsv"
+			kernel_log="$WORK_DIR/$label.dmesg"
+			common_options=(--topology "$DEV1" --manifest "$workload" \
+				--mode "$mode" --workers "$cq_workers" \
+				--iterations "$cq_iterations" --cmb-size "$CMB_SIZE" \
+				--va-granularity "$va_granularity" \
+				--backing-page-size "$backing_page_size" \
+				--result-manifest "$result")
+			if [[ $api == nds-c ]]; then
+				command=("$SCRIPT_DIR/nds_api_test" "${common_options[@]}")
+			else
+				command=(env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
+					"$SCRIPT_DIR/python_nds_api_test.py" \
+					"${common_options[@]}")
+			fi
+			log "cq-race smoke: $mode via $api"
+			dmesg -C
+			set +e
+			"${command[@]}" >"$output" 2>&1
+			status=$?
+			set -e
+			dmesg -c >"$kernel_log"
+			cat "$output"
+			(( status == 0 )) ||
+				die "cq-race smoke $mode $api runner failed"
+			python3 "$SCRIPT_DIR/check_stress.py" --workload "$workload" \
+				--result "$result" --workers "$cq_workers" \
+				--iterations "$cq_iterations" \
+				--cmb-size "$CMB_SIZE" \
+				--granularity "$va_granularity" \
+				--backing-page-size "$backing_page_size"
+			python3 "$SCRIPT_DIR/check_crc.py" --manifest "$result" \
+				--log "$kernel_log" \
+				--crc-tool "$SCRIPT_DIR/crc32_verify"
+		done
+	done
+
+	for api in nds-c nds-python; do
+		label="cq-race-drain-live-smoke.$api"
+		output="$WORK_DIR/$label.out"
+		kernel_log="$WORK_DIR/$label.dmesg"
+		common_options=(--topology "$DEV1" --manifest "$workload" \
+			--mode cq-race-drain-live --workers "$cq_workers" \
+			--iterations "$cq_iterations" --cmb-size "$CMB_SIZE" \
+			--va-granularity "$va_granularity" \
+			--backing-page-size "$backing_page_size" \
+			--drain-overlap-ms 100)
+		if [[ $api == nds-c ]]; then
+			command=("$SCRIPT_DIR/nds_api_test" "${common_options[@]}")
+		else
+			command=(env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
+				"$SCRIPT_DIR/python_nds_api_test.py" \
+				"${common_options[@]}")
+		fi
+		log "cq-race smoke: cq-race-drain-live via $api (no CRC)"
+		dmesg -C
+		set +e
+		"${command[@]}" >"$output" 2>&1
+		status=$?
+		set -e
+		dmesg -c >"$kernel_log"
+		cat "$output"
+		(( status == 0 )) ||
+			die "cq-race smoke cq-race-drain-live $api runner failed"
+	done
+	umount "$MOUNT_DIR"
+}
+
 main()
 {
 	(( $# == 0 )) || die "basic_test.sh does not accept positional arguments"
@@ -571,6 +662,7 @@ main()
 	"$SCRIPT_DIR/nds_api_test" --topology "$DEV1" --mode reject
 	env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
 		"$SCRIPT_DIR/python_nds_api_test.py" --topology "$DEV1" --mode reject
+	run_cq_race_smoke
 	test_direct_nvme
 	test_nvme_partition
 	test_linear_dm

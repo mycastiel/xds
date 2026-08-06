@@ -109,9 +109,9 @@ def validate_files(workload: List[WorkloadCase], workers: int) -> int:
         if expected_size % KIB or not 4 * KIB <= expected_size <= 4 * MIB:
             raise ValueError(f"{path}: invalid file size {expected_size}")
         total += expected_size
-    if not 4 * MIB < total <= 48 * MIB:
+    if not 4 * MIB < total <= 96 * MIB:
         raise ValueError(
-            f"combined file size {total} is outside (4 MiB, 48 MiB]"
+            f"combined file size {total} is outside (4 MiB, 96 MiB]"
         )
     return total
 

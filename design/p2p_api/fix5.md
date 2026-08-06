@@ -56,3 +56,34 @@ cross-iocb merge**; each iocb uses `nr_ios=0`.
 - [x] Sync [`nds_api.h`](../../file_p2p/nds_api.h) and
       [`completion_getevents.md`](completion_getevents.md).
 - [x] Tests / KASAN smoke.
+
+## Concurrency stress (`cq-race` / `cq-race-drain` / `cq-race-drain-live`)
+
+Harness modes in [`nds_api_test.c`](../../test/nds_api_test.c) and
+[`python_nds_api_test.py`](../../test/python_nds_api_test.py):
+
+| Mode | Threads | Intent |
+| --- | --- | --- |
+| `cq-race` | N submitters + 1 reaper on **one** ctx | submit ∥ getevents; all accepted I/Os harvested |
+| `cq-race-drain` | + drainer calling `nds_io_destroy_ctx` | getevents ∥ drain after all submits accepted; CRC |
+| `cq-race-drain-live` | same, but destroy after first accepted submit | **true** submit ∥ getevents ∥ drain; no CRC |
+
+`cq-race-drain` keeps the CRC-friendly contract (wait for full submit set, then
+destroy while reaper may still harvest).
+
+`cq-race-drain-live` intentionally overlaps drain with live submitters:
+wait until `submitted > 0`, keep racing for `--drain-overlap-ms` (default stress
+30s), set `stop_submit`, then `nds_io_destroy_ctx`. Live mode cycles the
+workload until stop (not one-shot iterations). Incomplete harvest / partial
+accept counts are expected; survival without hang/UAF is the pass bar.
+
+Wired in:
+
+- [`stress_test.sh`](../../test/stress_test.sh): longer `cq-race` / `cq-race-drain`
+  (default workers=24, iterations=64) with CRC
+- [`cq_race_test.sh`](../../test/cq_race_test.sh): standalone live stress
+  (`XDS_CQ_RACE_OVERLAP_MS`, `XDS_CQ_RACE_ROUNDS`), **no CRC**
+- [`basic_test.sh`](../../test/basic_test.sh): short smoke for all three modes
+- Bandwidth on physical HW: [`phys_bw_matrix.sh`](../../test/phys_bw_matrix.sh)
+  + [`nds_bw_bench`](../../test/nds_bw_bench.c) /
+  [`python_nds_bw_bench.py`](../../test/python_nds_bw_bench.py)
