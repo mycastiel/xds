@@ -24,7 +24,7 @@
 #     --npu-devices 0,1,2,3 \
 #     --bs-list 32K,128K,1M --qd-list 16,32,64 \
 #     --mem-mode register,noregister \
-#     --total-size 1G --concurrent --drain
+#     --total-size 1G --concurrent --verify-each
 #
 # Outputs:
 #   <outdir>/results.tsv   raw rows
@@ -46,7 +46,7 @@ TOTAL_SIZE=1G
 PASSES=1
 ACL_POLICY=0
 CONCURRENT=0
-DRAIN=0
+VERIFY_EACH=0
 RUNTIME=
 OUTDIR=
 SKIP_BUILD=0
@@ -75,7 +75,7 @@ Bench options (forwarded to nds_bw_bench):
   --runtime SEC           timed mode (overrides total-size budget for bench)
   --passes N              (default: 1)
   --acl-policy N          aclrt malloc policy (default: 0)
-  --drain                 use nds_io_drain batches (no getevents)
+  --verify-each           after each getevents completion, D2H+CRC vs file
 
 Run mode:
   --concurrent            for each (bs,qd,mem), start one bench per NPU in parallel
@@ -206,22 +206,26 @@ poison_data_files()
 	sync
 }
 
-# Print: mib_s TAB iops TAB bytes TAB sec
+# Print: mib_s TAB iops TAB bytes TAB sec TAB verify_each TAB crc_checked TAB crc_ok
 parse_result_line()
 {
 	awk '
 		/^RESULT / {
 			mib=""; iops=""; bytes=""; sec="";
+			ve="0"; checked="0"; ok="1";
 			for (i = 1; i <= NF; i++) {
 				if ($i ~ /^mib_s=/) { mib=$i; sub(/^mib_s=/,"",mib) }
 				if ($i ~ /^iops=/) { iops=$i; sub(/^iops=/,"",iops) }
 				if ($i ~ /^bytes=/) { bytes=$i; sub(/^bytes=/,"",bytes) }
 				if ($i ~ /^sec=/) { sec=$i; sub(/^sec=/,"",sec) }
+				if ($i ~ /^verify_each=/) { ve=$i; sub(/^verify_each=/,"",ve) }
+				if ($i ~ /^crc_checked=/) { checked=$i; sub(/^crc_checked=/,"",checked) }
+				if ($i ~ /^crc_ok=/) { ok=$i; sub(/^crc_ok=/,"",ok) }
 			}
 		}
 		END {
 			if (mib == "" || iops == "" || bytes == "" || sec == "") exit 1
-			print mib "\t" iops "\t" bytes "\t" sec
+			print mib "\t" iops "\t" bytes "\t" sec "\t" ve "\t" checked "\t" ok
 		}'
 }
 
@@ -258,7 +262,7 @@ run_one_bench()
 		noregister) args+=(--no-register-mem) ;;
 		*) die "bad mem $mem" ;;
 	esac
-	[[ $DRAIN == 1 ]] && args+=(--drain)
+	[[ $VERIFY_EACH == 1 ]] && args+=(--verify-each)
 	if [[ -n $barrier_dir ]]; then
 		args+=(--barrier-dir "$barrier_dir" --barrier-world "$barrier_world")
 	fi
@@ -275,11 +279,11 @@ append_row()
 run_cell_sequential()
 {
 	local bs=$1 qd=$2 mem=$3 pattern=$4
-	local npu logf parsed mib iops bytes sec
+	local npu logf parsed mib iops bytes sec ve checked ok
 
 	for npu in $(split_csv "$NPU_DEVICES"); do
 		logf=$OUTDIR/logs/npu${npu}.${pattern}.${bs}.qd${qd}.${mem}.log
-		log "npu=$npu bs=$bs qd=$qd mem=$mem pattern=$pattern target=$(npu_file "$npu")"
+		log "npu=$npu bs=$bs qd=$qd mem=$mem pattern=$pattern target=$(npu_file "$npu") verify_each=$VERIFY_EACH"
 		run_one_bench "$npu" "$bs" "$qd" "$mem" "$pattern" "$logf" || \
 			die "bench failed; see $logf"
 		parsed=$(parse_result_line <"$logf") || die "no RESULT in $logf"
@@ -287,8 +291,22 @@ run_cell_sequential()
 		iops=$(printf '%s\n' "$parsed" | cut -f2)
 		bytes=$(printf '%s\n' "$parsed" | cut -f3)
 		sec=$(printf '%s\n' "$parsed" | cut -f4)
+		ve=$(printf '%s\n' "$parsed" | cut -f5)
+		checked=$(printf '%s\n' "$parsed" | cut -f6)
+		ok=$(printf '%s\n' "$parsed" | cut -f7)
+		if [[ $VERIFY_EACH == 1 && $ve != 1 ]]; then
+			die "expected verify_each=1 in $logf (old binary?); RESULT missing flag"
+		fi
+		if [[ $ve == 1 && $ok != 1 ]]; then
+			die "CRC failed npu=$npu; see $logf"
+		fi
 		append_row "$npu" "$pattern" "$bs" "$qd" "$mem" "$mib" "$iops" "$sec" "$bytes" "solo"
-		printf '  npu%s: %s MiB/s  %s IOPS  sec=%s\n' "$npu" "$mib" "$iops" "$sec"
+		if [[ $ve == 1 ]]; then
+			printf '  npu%s: %s MiB/s  %s IOPS  sec=%s  crc_checked=%s crc_ok=%s\n' \
+				"$npu" "$mib" "$iops" "$sec" "$checked" "$ok"
+		else
+			printf '  npu%s: %s MiB/s  %s IOPS  sec=%s\n' "$npu" "$mib" "$iops" "$sec"
+		fi
 	done
 	poison_data_files
 }
@@ -313,7 +331,7 @@ run_cell_concurrent()
 	local bs=$1 qd=$2 mem=$3 pattern=$4
 	local npu logf parsed mib iops bytes sec pids=() fails=0
 	local sum_mib=0 sum_iops=0 sum_bytes=0 max_sec=0 n_ok=0
-	local overlap_mib go_wall_mib
+	local overlap_mib go_wall_mib ve checked ok
 	local n_npus barrier_dir go_start go_end go_sec
 
 	n_npus=$(count_csv "$NPU_DEVICES")
@@ -321,7 +339,7 @@ run_cell_concurrent()
 	rm -rf -- "$barrier_dir"
 	mkdir -p "$barrier_dir"
 
-	log "CONCURRENT bs=$bs qd=$qd mem=$mem pattern=$pattern npus=$NPU_DEVICES drain=$DRAIN"
+	log "CONCURRENT bs=$bs qd=$qd mem=$mem pattern=$pattern npus=$NPU_DEVICES verify_each=$VERIFY_EACH"
 
 	for npu in $(split_csv "$NPU_DEVICES"); do
 		logf=$OUTDIR/logs/npu${npu}.${pattern}.${bs}.qd${qd}.${mem}.log
@@ -355,9 +373,23 @@ run_cell_concurrent()
 		iops=$(printf '%s\n' "$parsed" | cut -f2)
 		bytes=$(printf '%s\n' "$parsed" | cut -f3)
 		sec=$(printf '%s\n' "$parsed" | cut -f4)
+		ve=$(printf '%s\n' "$parsed" | cut -f5)
+		checked=$(printf '%s\n' "$parsed" | cut -f6)
+		ok=$(printf '%s\n' "$parsed" | cut -f7)
+		if [[ $VERIFY_EACH == 1 && $ve != 1 ]]; then
+			die "expected verify_each=1 in $logf (old binary?); RESULT missing flag"
+		fi
+		if [[ $ve == 1 && $ok != 1 ]]; then
+			die "CRC failed npu=$npu; see $logf"
+		fi
 		append_row "$npu" "$pattern" "$bs" "$qd" "$mem" "$mib" "$iops" "$sec" "$bytes" "concurrent"
-		printf '  npu%s: %s MiB/s  %s IOPS  bench_sec=%s bytes=%s\n' \
-			"$npu" "$mib" "$iops" "$sec" "$bytes"
+		if [[ $ve == 1 ]]; then
+			printf '  npu%s: %s MiB/s  %s IOPS  bench_sec=%s bytes=%s  crc_checked=%s crc_ok=%s\n' \
+				"$npu" "$mib" "$iops" "$sec" "$bytes" "$checked" "$ok"
+		else
+			printf '  npu%s: %s MiB/s  %s IOPS  bench_sec=%s bytes=%s\n' \
+				"$npu" "$mib" "$iops" "$sec" "$bytes"
+		fi
 		sum_mib=$(awk -v a="$sum_mib" -v b="$mib" 'BEGIN{printf "%.2f", a+b}')
 		sum_iops=$(awk -v a="$sum_iops" -v b="$iops" 'BEGIN{printf "%.0f", a+b}')
 		sum_bytes=$(awk -v a="$sum_bytes" -v b="$bytes" 'BEGIN{printf "%.0f", a+b}')
@@ -390,9 +422,9 @@ write_summary()
 {
 	{
 		printf 'Physical NPU NDS bandwidth matrix (nds_bw_bench)\n'
-		printf 'topology=%s data_dir=%s total=%s passes=%s runtime=%s drain=%s\n' \
+		printf 'topology=%s data_dir=%s total=%s passes=%s runtime=%s verify_each=%s\n' \
 			"$TOPOLOGY" "$DATA_DIR" "$TOTAL_SIZE" "$PASSES" \
-			"${RUNTIME:-none}" "$DRAIN"
+			"${RUNTIME:-none}" "$VERIFY_EACH"
 		printf 'npus=%s bs=%s qd=%s mem=%s pattern=%s concurrent=%s\n' \
 			"$NPU_DEVICES" "$BS_LIST" "$QD_LIST" "$MEM_MODE" "$PATTERN" "$CONCURRENT"
 		printf 'Note: concurrent ALL io_overlap_* = sum(bytes)/max(bench_sec); parent_go_wall includes teardown; sum_mib_unreliable is contrast only.\n\n'
@@ -424,8 +456,9 @@ main()
 			--acl-policy) ACL_POLICY=$2; shift 2 ;;
 			--outdir) OUTDIR=$2; shift 2 ;;
 			--concurrent) CONCURRENT=1; shift ;;
-			--drain) DRAIN=1; shift ;;
+			--verify-each) VERIFY_EACH=1; shift ;;
 			--skip-build) SKIP_BUILD=1; shift ;;
+			--drain) die "--drain removed; use getevents + --verify-each" ;;
 			-h|--help) usage; exit 0 ;;
 			*) die "unknown arg: $1 (try --help)" ;;
 		esac
