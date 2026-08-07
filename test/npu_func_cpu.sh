@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 
-# Physical Ascend: run nds_bw_bench under ftrace function_profiler to measure
-# p2p_* kernel function hit/time during I/O. Self-contained (no common.sh).
+# Physical Ascend: run nds_bw_bench while collecting:
+#   - /sys/kernel/debug/p2p_device/summary  (debugfs.c I/O counters)
+#   - proc_cpu_pct / sys_cpu_pct from nds_bw_bench RESULT (NDS userspace path)
 #
-# Automatically mounts debugfs if needed and always disables the profiler /
-# unmounts on exit (same lifecycle pattern as test/common.sh).
+# Same idea as test/common.sh: mount debugfs if needed, reset summary, run I/O,
+# snapshot summary, umount on exit if we mounted it. No ftrace / set_ftrace_filter.
 #
 # Requires:
 #   - p2p_dev already loaded
-#   - kernel with CONFIG_FUNCTION_PROFILER (function_profile_enabled)
 #   - Ascend ACL env sourced (set_env.sh)
 #   - topology block device + writable --data-dir
 #
@@ -19,10 +19,9 @@
 #     --npu-devices 0 --bs 128K --qd 64 --total-size 256M
 #
 # Outputs under <outdir>/:
-#   func_cpu.txt            sorted function_profiler summary
-#   trace_stat/             raw per-CPU function* dumps
-#   p2p_summary_after.txt   p2p_device/summary after the run
-#   logs/                   nds_bw_bench stdout
+#   p2p_summary_before.txt / p2p_summary_after.txt
+#   logs/npu*.log          nds_bw_bench stdout (incl. RESULT cpu fields)
+#   summary.txt            combined view
 
 set -Eeuo pipefail
 
@@ -44,8 +43,6 @@ OUTDIR=
 SKIP_BUILD=0
 
 DEBUGFS_MOUNTED=0
-FTRACE_ENABLED=0
-TRACING=/sys/kernel/debug/tracing
 P2P_SUMMARY=/sys/kernel/debug/p2p_device/summary
 
 die() { printf 'npu_func_cpu: %s\n' "$*" >&2; exit 1; }
@@ -55,6 +52,8 @@ usage()
 {
 	cat <<'EOF'
 Usage: npu_func_cpu.sh --topology DEV --data-dir DIR --npu-devices IDS [options]
+
+Collect p2p_device/summary (debugfs) + nds_bw_bench CPU%% around one I/O cell.
 
 Required:
   --topology DEV          NDS topology block device
@@ -84,11 +83,6 @@ cleanup()
 {
 	local ec=$?
 
-	if (( FTRACE_ENABLED )); then
-		echo 0 >"$TRACING/function_profile_enabled" 2>/dev/null || true
-		echo >"$TRACING/set_ftrace_filter" 2>/dev/null || true
-		FTRACE_ENABLED=0
-	fi
 	if (( DEBUGFS_MOUNTED )); then
 		umount /sys/kernel/debug >/dev/null 2>&1 || true
 		DEBUGFS_MOUNTED=0
@@ -208,87 +202,6 @@ mount_debugfs()
 		DEBUGFS_MOUNTED=1
 	fi
 	[[ -w $P2P_SUMMARY ]] || die "p2p debugfs summary unavailable at $P2P_SUMMARY"
-	[[ -e $TRACING/function_profile_enabled ]] || \
-		die "function_profile_enabled missing; kernel needs CONFIG_FUNCTION_PROFILER"
-}
-
-setup_ftrace_profiler()
-{
-	local n err=""
-
-	log "Configuring ftrace function_profiler (p2p_* filter)"
-	echo 0 >"$TRACING/function_profile_enabled" 2>/dev/null || true
-	# Clear any previous filter (empty write).
-	: >"$TRACING/set_ftrace_filter" 2>/dev/null || \
-		echo >"$TRACING/set_ftrace_filter" 2>/dev/null || true
-
-	# Prefer glob — avoids huge writes and "[module]" suffixes in
-	# available_filter_functions that make bulk cat fail.
-	if ! err=$(echo 'p2p_*' >"$TRACING/set_ftrace_filter" 2>&1); then
-		log "glob p2p_* failed (${err:-write error}); trying per-symbol"
-		: >"$TRACING/set_ftrace_filter" 2>/dev/null || true
-		n=0
-		while read -r sym _; do
-			[[ $sym == p2p_* ]] || continue
-			if ! echo "$sym" >>"$TRACING/set_ftrace_filter" 2>/dev/null; then
-				continue
-			fi
-			n=$((n + 1))
-		done <"$TRACING/available_filter_functions"
-		(( n > 0 )) || die "failed to write set_ftrace_filter (tried glob and per-symbol)"
-		log "Filtered $n p2p_* symbols (per-symbol)"
-	else
-		n=$(wc -l <"$TRACING/set_ftrace_filter" 2>/dev/null || echo 0)
-		log "Filtered via glob p2p_* (set_ftrace_filter lines=$n)"
-	fi
-
-	[[ -s $TRACING/set_ftrace_filter ]] || \
-		die "set_ftrace_filter is empty after setup"
-
-	echo 1 >"$TRACING/function_profile_enabled" || \
-		die "failed to enable function_profile_enabled"
-	FTRACE_ENABLED=1
-}
-
-disable_ftrace_profiler()
-{
-	if (( FTRACE_ENABLED )); then
-		echo 0 >"$TRACING/function_profile_enabled" 2>/dev/null || true
-		echo >"$TRACING/set_ftrace_filter" 2>/dev/null || true
-		FTRACE_ENABLED=0
-	fi
-}
-
-dump_profiler()
-{
-	local dest=$OUTDIR/trace_stat
-	local f
-
-	mkdir -p "$dest"
-	shopt -s nullglob
-	for f in "$TRACING"/trace_stat/function*; do
-		cp -a -- "$f" "$dest/"
-	done
-	shopt -u nullglob
-
-	{
-		printf '# ftrace function_profiler dump (p2p_* filter)\n'
-		printf '# columns typically: Function Hit Time Avg s^2\n\n'
-		# Aggregate hit counts across per-CPU function* files when present.
-		awk '
-			NF >= 2 && $1 !~ /^#/ && $1 != "Function" {
-				fn=$1; hit=$2+0
-				hits[fn]+=hit
-				if (NF >= 3) time[fn]+=$3+0
-			}
-			END {
-				for (fn in hits)
-					printf "%12d  %12.3f  %s\n", hits[fn], time[fn]+0, fn
-			}
-		' "$dest"/function* 2>/dev/null | sort -nr
-	} >"$OUTDIR/func_cpu.txt"
-
-	log "Wrote $OUTDIR/func_cpu.txt"
 }
 
 reset_p2p_summary()
@@ -298,7 +211,28 @@ reset_p2p_summary()
 
 save_p2p_summary()
 {
-	cp -a -- "$P2P_SUMMARY" "$OUTDIR/p2p_summary_after.txt"
+	local dest=$1
+	cp -a -- "$P2P_SUMMARY" "$dest"
+}
+
+# Extract RESULT cpu / bw fields from a bench log.
+parse_result_line()
+{
+	awk '
+		/^RESULT / {
+			for (i = 1; i <= NF; i++) {
+				if ($i ~ /^mib_s=/) { mib=$i; sub(/^mib_s=/,"",mib) }
+				if ($i ~ /^sec=/) { sec=$i; sub(/^sec=/,"",sec) }
+				if ($i ~ /^bytes=/) { bytes=$i; sub(/^bytes=/,"",bytes) }
+				if ($i ~ /^proc_cpu_pct=/) { proc=$i; sub(/^proc_cpu_pct=/,"",proc) }
+				if ($i ~ /^sys_cpu_pct=/) { sys=$i; sub(/^sys_cpu_pct=/,"",sys) }
+				if ($i ~ /^ios=/) { ios=$i; sub(/^ios=/,"",ios) }
+			}
+		}
+		END {
+			if (mib == "" || sec == "") exit 1
+			print mib "\t" sec "\t" bytes "\t" ios "\t" proc "\t" sys
+		}'
 }
 
 run_one_bench()
@@ -389,6 +323,36 @@ run_bench_cell()
 	fi
 }
 
+write_summary()
+{
+	local npu logf parsed mib sec bytes ios proc_cpu sys_cpu
+
+	{
+		printf 'npu_func_cpu (debugfs summary + nds_bw_bench CPU)\n'
+		printf 'topology=%s data_dir=%s npus=%s bs=%s qd=%s total=%s concurrent=%s\n\n' \
+			"$TOPOLOGY" "$DATA_DIR" "$NPU_DEVICES" "$BS" "$QD" "$TOTAL_SIZE" "$CONCURRENT"
+
+		printf '--- p2p_device/summary after (debugfs.c) ---\n'
+		cat "$OUTDIR/p2p_summary_after.txt"
+		printf '\n--- per-NPU nds_bw_bench RESULT ---\n'
+		for npu in $(split_csv "$NPU_DEVICES"); do
+			logf=$OUTDIR/logs/npu${npu}.log
+			parsed=$(parse_result_line <"$logf") || {
+				printf 'npu%s: (no RESULT in %s)\n' "$npu" "$logf"
+				continue
+			}
+			mib=$(printf '%s\n' "$parsed" | cut -f1)
+			sec=$(printf '%s\n' "$parsed" | cut -f2)
+			bytes=$(printf '%s\n' "$parsed" | cut -f3)
+			ios=$(printf '%s\n' "$parsed" | cut -f4)
+			proc_cpu=$(printf '%s\n' "$parsed" | cut -f5)
+			sys_cpu=$(printf '%s\n' "$parsed" | cut -f6)
+			printf 'npu%s: mib_s=%s sec=%s bytes=%s ios=%s proc_cpu=%s%% sys_cpu=%s%%\n' \
+				"$npu" "$mib" "$sec" "$bytes" "$ios" "$proc_cpu" "$sys_cpu"
+		done
+	} | tee "$OUTDIR/summary.txt"
+}
+
 main()
 {
 	while [[ $# -gt 0 ]]; do
@@ -428,28 +392,17 @@ main()
 	ensure_data_files
 
 	mount_debugfs
-	setup_ftrace_profiler
 	reset_p2p_summary
+	save_p2p_summary "$OUTDIR/p2p_summary_before.txt"
 
-	log "Running I/O under function_profiler"
+	log "Running nds_bw_bench (NDS API path); collecting p2p_device/summary"
 	run_bench_cell
 
-	disable_ftrace_profiler
-	dump_profiler
-	save_p2p_summary
-
-	{
-		printf 'npu_func_cpu summary\n'
-		printf 'topology=%s data_dir=%s npus=%s bs=%s qd=%s total=%s concurrent=%s\n' \
-			"$TOPOLOGY" "$DATA_DIR" "$NPU_DEVICES" "$BS" "$QD" "$TOTAL_SIZE" "$CONCURRENT"
-		printf '\n--- top functions (hit  time_us_sum  name) ---\n'
-		head -n 40 "$OUTDIR/func_cpu.txt"
-		printf '\n--- p2p_device/summary after ---\n'
-		cat "$OUTDIR/p2p_summary_after.txt"
-	} | tee "$OUTDIR/summary.txt"
+	save_p2p_summary "$OUTDIR/p2p_summary_after.txt"
+	write_summary
 
 	log "Results: $OUTDIR"
-	log "Function CPU: $OUTDIR/func_cpu.txt"
+	log "Summary: $OUTDIR/summary.txt"
 }
 
 main "$@"
