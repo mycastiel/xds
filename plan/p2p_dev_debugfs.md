@@ -23,7 +23,10 @@ is ignored.
 
 ## 2. Statistics and exact meanings
 
-All counters are module-global `atomic64_t` values.
+All counters are module-global per-CPU values (`DEFINE_PER_CPU`), following the
+block layer `disk_stats` / `part_stat` pattern: hot-path updates use
+`preempt_disable()` with `__this_cpu_*` (and `local_t` for `io_inflight`);
+readers sum across `for_each_possible_cpu`.
 
 | Output field | Meaning | Resettable |
 | --- | --- | --- |
@@ -64,11 +67,12 @@ io_failed: 1
 io_issue_failed: 4
 ```
 
-The show callback reads each atomic counter once into a local snapshot and
-then formats the values with `seq_file`.  Each value is individually coherent,
-but the five values are not a transaction: request submission, completion, or
-reset may occur between the individual reads.  This weakly consistent view is
-sufficient for diagnostics and avoids a global lock in the I/O hot path.
+The show callback sums each per-CPU counter into a local snapshot and then
+formats the values with `seq_file`.  Each field is an approximate cross-CPU
+sum, and the five values are not a transaction: request submission,
+completion, or reset may occur between the individual field sums.  This weakly
+consistent view is sufficient for diagnostics and avoids a global lock in the
+I/O hot path.
 
 Use `single_open()`, `seq_read()`, `seq_lseek()`, and `single_release()` for the
 read side of the file operations.
@@ -79,7 +83,7 @@ The write callback does not parse or copy the payload.  Any write with a
 nonzero byte count performs a reset and returns the supplied byte count.  A
 zero-length write returns zero without changing the counters.
 
-Reset uses `atomic64_xchg(counter, 0)` on these cumulative counters:
+Reset zeroes these cumulative counters on every possible CPU:
 
 - `io_issued`;
 - `io_bytes`;
@@ -88,10 +92,11 @@ Reset uses `atomic64_xchg(counter, 0)` on these cumulative counters:
 
 `io_inflight` is a live gauge and is never reset.  Clearing it while requests
 are active would make their later completions decrement the gauge below zero.
-If reset races an increment, that event may fall on either side of the reset,
-but the atomic update is not torn.  If a request issued before reset completes
-with an error after reset, its completion increments the new `io_failed`
-interval.
+Issue and complete may run on different CPUs, so a single CPU's `local_t`
+`io_inflight` may temporarily be negative; the cross-CPU sum remains the live
+count.  If reset races an increment, that event may fall on either side of
+the reset.  If a request issued before reset completes with an error after
+reset, its completion increments the new `io_failed` interval.
 
 Reset does not drain I/O, wait for completions, modify an I/O context, or alter
 the per-fd batch list.
@@ -104,11 +109,11 @@ Instrument `do_read_io()` after the request and NVMe command are completely
 initialized and after the I/O-context reference has been acquired, but before
 calling `blk_execute_rq_nowait()`.
 
-At that point, atomically:
+At that point, under `preempt_disable()`:
 
-1. increment `io_issued`;
-2. add `sector_nr << SECTOR_SHIFT` to `io_bytes`; and
-3. increment `io_inflight`.
+1. increment this CPU's `io_issued`;
+2. add `sector_nr << SECTOR_SHIFT` to this CPU's `io_bytes`; and
+3. `local_inc` this CPU's `io_inflight`.
 
 The accounting must precede `blk_execute_rq_nowait()` because the request may
 complete on another CPU before that function returns.  Accounting afterward
@@ -143,8 +148,9 @@ This accounting is per request even though `io_ctx->io_err` retains only the
 first error for the drain result.  It is independent of the existing
 `io_ctx->io_ref` decrement and completion signaling.
 
-The completion path must not take a mutex or spinlock.  Atomic updates keep it
-safe in softirq or other atomic completion contexts.
+The completion path must not take a mutex or spinlock.  Per-CPU updates under
+`preempt_disable()` (with `local_t` for `io_inflight`) keep it safe in softirq
+or other atomic completion contexts.
 
 ## 6. File organization and interfaces
 
@@ -170,9 +176,9 @@ The statistics object remains private to `debugfs.c`; `dev.c` does not access
 individual counters directly.  This keeps the accounting contract centralized
 and lets the debugfs presentation change without exposing storage details.
 
-The counters use static atomic initializers, so accounting is valid before the
-debugfs directory is created and no initialization step can erase an early
-request.
+The counters use `DEFINE_PER_CPU` static storage (zero-initialized), so
+accounting is valid before the debugfs directory is created and no
+initialization step can erase an early request.
 
 ## 7. Initialization and teardown
 
@@ -221,8 +227,11 @@ path is identical when debugfs was unavailable.
 - Submission, completion, summary reads, and resets may all run concurrently.
 - No debugfs operation takes `batch->io_lock`, the topology lock, or a block
   queue lock.
-- Counter overflow follows normal `atomic64_t` wraparound behavior.  Saturating
-  diagnostics would add hot-path branches without improving request safety.
+- Hot-path updates are lockless across CPUs: each CPU mutates only its own
+  counters under `preempt_disable()`.  Summary reads and resets sum or clear
+  across CPUs without excluding I/O; values are weakly consistent.
+- Counter overflow follows normal unsigned wraparound.  Saturating diagnostics
+  would add hot-path branches without improving request safety.
 - Concurrent drain behavior is unchanged.  A drain still snapshots only the
   I/O contexts already published on its batch list.
 - Module unload is already prevented while character-device or debugfs file
@@ -259,8 +268,8 @@ path is identical when debugfs was unavailable.
 7. Reset while I/O is active and verify `io_inflight` is unchanged and reaches
    zero when those requests complete.
 8. Race repeated reads and resets with submission and completion; values may be
-   weakly consistent, but the file remains readable and `io_inflight` does not
-   become negative.
+   weakly consistent, but the file remains readable and the summed
+   `io_inflight` does not become negative once all requests complete.
 9. Unload and reload the module and verify the debugfs directory is removed and
    the counters restart at zero.
 
