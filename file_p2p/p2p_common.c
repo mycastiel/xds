@@ -214,6 +214,7 @@ static int discover_nvme(const char *dev, dev_t top_dev,
 	cfg->nr_devs = 1;
 	cfg->top_dev = top_dev;
 	cfg->bdevs[0].dev_id = top_dev;
+	cfg->bdevs[0].reserved = 0;
 	cfg->bdevs[0].size_sector = size_sectors;
 	cfg->bdevs[0].start_sector = 0;
 	return 0;
@@ -358,6 +359,7 @@ static int discover_linear(const char *dev, dev_t top_dev,
 		if (err)
 			goto out;
 		entry->dev_id = component;
+		entry->reserved = 0;
 		entry->size_sector = spec->length;
 		entry->start_sector = start_sector;
 		if (__builtin_add_overflow(logical_end,
@@ -483,6 +485,7 @@ static int discover_raid0_members(dev_t top_dev, unsigned int raid_disks,
 	int dir_fd;
 	int err;
 
+	memset(members, 0, sizeof(members));
 	err = sysfs_path(md_path, sizeof(md_path), top_dev, "md");
 	if (err)
 		return err;

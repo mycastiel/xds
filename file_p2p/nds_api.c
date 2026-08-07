@@ -333,6 +333,8 @@ static int validate_nds_iov(const struct nds_io_cb *cb, unsigned long *io_size)
 	if (!cb->iov || !cb->iov_cnt || cb->iov_cnt > NDS_IO_MAX_IOV)
 		return -EINVAL;
 	for (i = 0; i < cb->iov_cnt; i++) {
+		if (!cb->iov[i].buf_len || cb->iov[i].reserved)
+			return -EINVAL;
 		if (__builtin_add_overflow(size, (unsigned long)cb->iov[i].buf_len, &size))
 			return -EINVAL;
 	}
