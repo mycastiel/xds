@@ -274,20 +274,6 @@ int nds_io_new_ctx(const struct nds_io_ctx_param *param, struct nds_io_ctx **ctx
 	return 0;
 }
 
-int nds_io_drain(struct nds_io_ctx *ctx)
-{
-	int ret;
-
-	if (!ctx || ctx->p2p_fd < 0)
-		return -EINVAL;
-	if (ioctl(ctx->p2p_fd, IOCTL_DRAIN_IO) < 0) {
-		ret = -errno;
-		fprintf(stderr, "nds: drain failed %d\n", ret);
-		return ret;
-	}
-	return 0;
-}
-
 int nds_io_destroy_ctx(struct nds_io_ctx *ctx)
 {
 	int close_err = 0;
@@ -302,9 +288,12 @@ int nds_io_destroy_ctx(struct nds_io_ctx *ctx)
 	if (ctx->p2p_fd < 0)
 		return -EINVAL;
 
-	drain_err = nds_io_drain(ctx);
-	if (drain_err)
-		fprintf(stderr, "nds: destroy_ctx drain failed %d\n", drain_err);
+	/* Full-fd quiesce before close; not exposed as a public NDS API. */
+	if (ioctl(ctx->p2p_fd, IOCTL_DRAIN_IO) < 0) {
+		drain_err = -errno;
+		fprintf(stderr, "nds: destroy_ctx drain failed %d\n",
+			drain_err);
+	}
 	if (close(ctx->p2p_fd) < 0) {
 		close_err = -errno;
 		fprintf(stderr, "nds: destroy_ctx close failed %d\n", close_err);
