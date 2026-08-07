@@ -13,8 +13,9 @@
 # with O_DIRECT urandom to displace NVMe controller read cache.
 #
 # With --concurrent, for each cell all NPUs run nds_bw_bench at once with a
-# start barrier. ALL primary metric is wall_mib_s = sum(bytes)/max(sec).
-# sum(mib_s) is retained only as an unreliable contrast row.
+# start barrier. Parent wall-clock starts before forking run_one_bench and
+# ends after the last wait; ALL = sum(bytes)/wall_sec. Per-card mib_s /
+# sum(mib_s) are contrast only.
 #
 # Usage:
 #   source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -312,7 +313,7 @@ run_cell_concurrent()
 	local bs=$1 qd=$2 mem=$3 pattern=$4
 	local npu logf parsed mib iops bytes sec pids=() fails=0
 	local sum_mib=0 sum_iops=0 sum_bytes=0 max_sec=0 n_ok=0 wall_mib
-	local n_npus barrier_dir
+	local n_npus barrier_dir wall_start wall_end wall_sec
 
 	n_npus=$(count_csv "$NPU_DEVICES")
 	barrier_dir=$OUTDIR/barrier.${pattern}.${bs}.qd${qd}.${mem}.$$
@@ -321,6 +322,8 @@ run_cell_concurrent()
 
 	log "CONCURRENT bs=$bs qd=$qd mem=$mem pattern=$pattern npus=$NPU_DEVICES drain=$DRAIN"
 
+	# Parent wall-clock covers launch → last child exit (includes init+barrier wait).
+	wall_start=$(date +%s.%N)
 	for npu in $(split_csv "$NPU_DEVICES"); do
 		logf=$OUTDIR/logs/npu${npu}.${pattern}.${bs}.qd${qd}.${mem}.log
 		(
@@ -332,13 +335,17 @@ run_cell_concurrent()
 
 	wait_barrier_ready "$barrier_dir" "$n_npus"
 	: >"$barrier_dir/go"
-	log "barrier released ($n_npus ranks)"
+	log "barrier released ($n_npus ranks) wall_start=$wall_start"
 
 	local pid
 	for pid in "${pids[@]}"; do
 		wait "$pid" || fails=$((fails + 1))
 	done
+	wall_end=$(date +%s.%N)
 	(( fails == 0 )) || die "concurrent cell had $fails failed bench(es); see $OUTDIR/logs"
+
+	wall_sec=$(awk -v a="$wall_start" -v b="$wall_end" \
+		'BEGIN { s=b-a; if (s<=0) s=1e-9; printf "%.6f", s }')
 
 	for npu in $(split_csv "$NPU_DEVICES"); do
 		logf=$OUTDIR/logs/npu${npu}.${pattern}.${bs}.qd${qd}.${mem}.log
@@ -348,7 +355,7 @@ run_cell_concurrent()
 		bytes=$(printf '%s\n' "$parsed" | cut -f3)
 		sec=$(printf '%s\n' "$parsed" | cut -f4)
 		append_row "$npu" "$pattern" "$bs" "$qd" "$mem" "$mib" "$iops" "$sec" "$bytes" "concurrent"
-		printf '  npu%s: %s MiB/s  %s IOPS  sec=%s bytes=%s\n' \
+		printf '  npu%s: %s MiB/s  %s IOPS  bench_sec=%s bytes=%s\n' \
 			"$npu" "$mib" "$iops" "$sec" "$bytes"
 		sum_mib=$(awk -v a="$sum_mib" -v b="$mib" 'BEGIN{printf "%.2f", a+b}')
 		sum_iops=$(awk -v a="$sum_iops" -v b="$iops" 'BEGIN{printf "%.0f", a+b}')
@@ -356,15 +363,16 @@ run_cell_concurrent()
 		max_sec=$(awk -v a="$max_sec" -v b="$sec" 'BEGIN{printf "%.6f", (b>a)?b:a}')
 		n_ok=$((n_ok + 1))
 	done
-	wall_mib=$(awk -v b="$sum_bytes" -v s="$max_sec" \
+	wall_mib=$(awk -v b="$sum_bytes" -v s="$wall_sec" \
 		'BEGIN{ if (s<=0) s=1e-9; printf "%.2f", (b/1048576.0)/s }')
 	append_row "ALL" "$pattern" "$bs" "$qd" "$mem" "$wall_mib" "$sum_iops" \
-		"$max_sec" "$sum_bytes" "wall_max_sec_${n_ok}_npus"
+		"$wall_sec" "$sum_bytes" "parent_wall_${n_ok}_npus"
 	append_row "ALL" "$pattern" "$bs" "$qd" "$mem" "$sum_mib" "$sum_iops" \
 		"-" "$sum_bytes" "sum_mib_unreliable"
-	printf '  WALL_AGGREGATE: %s MiB/s  (sum_bytes/max_sec=%.6f)  %s NPUs\n' \
-		"$wall_mib" "$max_sec" "$n_ok"
-	printf '  sum_mib (unreliable): %s MiB/s\n' "$sum_mib"
+	printf '  PARENT_WALL: %s MiB/s  (sum_bytes=%s / wall_sec=%s)  %s NPUs\n' \
+		"$wall_mib" "$sum_bytes" "$wall_sec" "$n_ok"
+	printf '  (contrast) max(bench_sec)=%s  sum_mib_unreliable=%s\n' \
+		"$max_sec" "$sum_mib"
 	rm -rf -- "$barrier_dir"
 	poison_data_files
 }
@@ -378,7 +386,7 @@ write_summary()
 			"${RUNTIME:-none}" "$DRAIN"
 		printf 'npus=%s bs=%s qd=%s mem=%s pattern=%s concurrent=%s\n' \
 			"$NPU_DEVICES" "$BS_LIST" "$QD_LIST" "$MEM_MODE" "$PATTERN" "$CONCURRENT"
-		printf 'Note: concurrent ALL wall_max_sec_* is the primary metric; sum_mib_unreliable is contrast only.\n\n'
+		printf 'Note: concurrent ALL parent_wall_* = sum(bytes)/(t_after_waits - t_before_fork); sum_mib_unreliable is contrast only.\n\n'
 		if command -v column >/dev/null 2>&1; then
 			column -t -s $'\t' "$OUTDIR/results.tsv"
 		else
