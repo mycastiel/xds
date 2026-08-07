@@ -169,6 +169,14 @@ int nds_io_new_ctx(const struct nds_io_ctx_param *param,
 int nds_io_destroy_ctx(struct nds_io_ctx *ctx);
 
 /*
+ * Wait until every accepted I/O on @ctx has completed and been retired from
+ * the CQ. No completion events are delivered to userspace. Returns 0, or
+ * -errno for the first failed I/O (same as IOCTL_DRAIN_IO).
+ * Must not run concurrently with nds_io_getevents / destroy on the same ctx.
+ */
+int nds_io_drain(struct nds_io_ctx *ctx);
+
+/*
  * Submit nr control blocks. Returns the number accepted, or -errno.
  *
  * Each iocb is one logical I/O: its iov[] is scatter-gather on a single

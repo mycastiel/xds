@@ -5,6 +5,10 @@
  * back to host with aclrtMemcpy, and compares CRC32 of the HBM payload
  * against CRC32 of the same range read with O_DIRECT pread.
  *
+ * Kernel P2P_MIN_PAGE_SIZE is 64KiB: HBM is allocated/registered in a
+ * ≥64KiB window. I/O may use a shorter prefix so small lengths work with
+ * register_mem. --no-register-mem requires --length >= 64K.
+ *
  * CRC32 contract matches crc32_verify.c / kernel crc32_le:
  *   poly 0xedb88320, init ~0, final XOR ~0.
  *
@@ -35,7 +39,16 @@
 #include "hbm_acl.h"
 
 #define SECTOR 512u
+/* Match kernel P2P_MIN_PAGE_SIZE in dev.c. */
+#define P2P_HBM_ALIGN (64u << 10)
 #define CRC32_POLY_LE 0xedb88320U
+
+static size_t hbm_alloc_size(uint32_t io_len)
+{
+	size_t n = io_len < P2P_HBM_ALIGN ? P2P_HBM_ALIGN : (size_t)io_len;
+
+	return (n + P2P_HBM_ALIGN - 1) & ~(size_t)(P2P_HBM_ALIGN - 1);
+}
 
 static void die(const char *what, int err)
 {
@@ -161,7 +174,8 @@ static void usage(const char *argv0)
 		"Usage: %s --topology DEV --target PATH --npu-device ID "
 		"--offset BYTES --length BYTES [options]\n"
 		"  --acl-policy N      aclrt malloc policy (default 0)\n"
-		"  --no-register-mem   one-shot VAs (default: register)\n",
+		"  --no-register-mem   one-shot VAs (default: register);\n"
+		"                      requires --length >= 64K\n",
 		argv0);
 }
 
@@ -204,6 +218,7 @@ int main(int argc, char **argv)
 	uint64_t target_bytes;
 	uint32_t file_crc;
 	uint32_t hbm_crc;
+	size_t alloc_size;
 	int err;
 	int n;
 	int ok;
@@ -256,6 +271,20 @@ int main(int argc, char **argv)
 	length = (uint32_t)length_u64;
 	if ((offset | length) & (SECTOR - 1))
 		die("offset/length must be 512B-aligned", -EINVAL);
+	/*
+	 * One-shot pin asks get_mem_page_size(iov); a <64KiB iov typically
+	 * reports 4K pages and is rejected by the kernel.
+	 */
+	if (!register_mem && length < P2P_HBM_ALIGN) {
+		fprintf(stderr,
+			"nds_crc_verify: --no-register-mem requires "
+			"--length >= %u (got %u); use register_mem for "
+			"smaller I/Os\n",
+			P2P_HBM_ALIGN, length);
+		return EXIT_FAILURE;
+	}
+
+	alloc_size = hbm_alloc_size(length);
 
 	topo_fd = open(topo_path, O_RDONLY | O_DIRECT | O_CLOEXEC);
 	if (topo_fd < 0)
@@ -273,7 +302,7 @@ int main(int argc, char **argv)
 	read_file_range(file_fd, offset, length, file_buf);
 	file_crc = crc32_buf(file_buf, length);
 
-	err = xds_hbm_alloc(&hbm, npu_device, length, acl_policy);
+	err = xds_hbm_alloc(&hbm, npu_device, alloc_size, acl_policy);
 	if (err)
 		die("xds_hbm_alloc", err);
 
@@ -283,7 +312,7 @@ int main(int argc, char **argv)
 		die("nds_init", err);
 
 	if (register_mem) {
-		err = nds_register_mem(hbm.addr, length, 0);
+		err = nds_register_mem(hbm.addr, alloc_size, 0);
 		if (err)
 			die("nds_register_mem", err);
 	}

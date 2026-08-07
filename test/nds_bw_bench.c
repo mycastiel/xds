@@ -1,21 +1,19 @@
 /*
  * nds_bw_bench — concurrent NDS PREAD bandwidth measurement.
  *
- * Issues a pipeline of sector-aligned reads (default 32–128 KiB) against a
- * block device or file into CMB/HBM VAs, reaping with nds_io_getevents.
+ * Issues a pipeline of sector-aligned reads against a block device or file
+ * into CMB/HBM VAs. Default reaps with nds_io_getevents; --drain uses
+ * nds_io_drain per batch instead.
  *
  * Build: make -C test nds_bw_bench
- * Example (VM / stub CMB):
- *   sudo ./test/nds_bw_bench --topology /dev/nvme0n1 --target /dev/nvme0n1 \
- *        --cmb-va 0 --total-size 1G --io-min 32K --io-max 128K --queue-depth 64
- *
  * Example (physical NPU HBM via aclrt):
- *   source /usr/local/Ascend/ascend-toolkit/set_env.sh   # or your CANN env
- *   sudo ./test/nds_bw_bench --topology /dev/nvme0n1 --target /mnt/data/f.bin \
- *        --npu-device 0 --total-size 256M --io-min 128K --io-max 128K --queue-depth 64
+ *   source /usr/local/Ascend/ascend-toolkit/set_env.sh
+ *   sudo -E ./test/nds_bw_bench --topology /dev/nvme0n1 --target /mnt/data/f.bin \
+ *        --npu-device 0 --total-size 256M --io-min 128K --io-max 128K \
+ *        --queue-depth 64 --drain
  *
  * --total-size is the aggregate bytes transferred (offsets wrap within the
- * target when the device/file is smaller).
+ * target when the device/file is smaller), unless --runtime is set.
  */
 
 #define _GNU_SOURCE
@@ -42,13 +40,16 @@
 #define DEFAULT_IO_MAX (128u << 10)
 #define DEFAULT_TOTAL (256ull << 20)
 #define DEFAULT_QD 64u
+#define CRC32_POLY_LE 0xedb88320U
 
 struct slot {
 	struct nds_io_cb cb;
 	struct nds_io_vec iov;
 	uint64_t buf_addr;
+	uint64_t offset;
 	uint32_t length;
 	bool busy;
+	bool used;
 };
 
 static void die(const char *what, int err)
@@ -105,6 +106,13 @@ static uint64_t timespec_ns(const struct timespec *t)
 	return (uint64_t)t->tv_sec * 1000000000ull + (uint64_t)t->tv_nsec;
 }
 
+static double elapsed_sec(const struct timespec *t0, const struct timespec *t1)
+{
+	double sec = (timespec_ns(t1) - timespec_ns(t0)) / 1e9;
+
+	return sec > 0 ? sec : 1e-9;
+}
+
 static uint64_t target_size_bytes(int fd)
 {
 	struct stat st;
@@ -143,6 +151,134 @@ static uint32_t pick_io_size(uint32_t io_min, uint32_t io_max, uint64_t remain,
 	return sz;
 }
 
+static void init_crc32_table(uint32_t table[256])
+{
+	unsigned int i;
+
+	for (i = 0; i < 256; i++) {
+		uint32_t crc = i;
+		unsigned int bit;
+
+		for (bit = 0; bit < 8; bit++)
+			crc = (crc >> 1) ^ ((crc & 1) ? CRC32_POLY_LE : 0);
+		table[i] = crc;
+	}
+}
+
+static uint32_t crc32_buf(const unsigned char *data, size_t length)
+{
+	uint32_t table[256];
+	uint32_t crc = ~0U;
+
+	init_crc32_table(table);
+	while (length--) {
+		crc = (crc >> 8) ^ table[(crc ^ *data) & 0xff];
+		data++;
+	}
+	return crc ^ ~0U;
+}
+
+static void *aligned_alloc_sector(size_t size)
+{
+	void *p = NULL;
+	int err;
+
+	err = posix_memalign(&p, SECTOR, size);
+	if (err || !p)
+		die("posix_memalign", err ? -err : -ENOMEM);
+	memset(p, 0, size);
+	return p;
+}
+
+static void read_file_range(int fd, uint64_t offset, uint32_t length,
+			    unsigned char *buf)
+{
+	uint32_t done = 0;
+
+	while (done < length) {
+		ssize_t n = pread(fd, buf + done, length - done,
+				  (off_t)(offset + done));
+
+		if (n < 0)
+			die("pread target", -errno);
+		if (n == 0)
+			die("pread short/EOF", -EIO);
+		done += (uint32_t)n;
+	}
+}
+
+static void barrier_wait(const char *barrier_dir, int npu_device,
+			 unsigned int world)
+{
+	char ready_path[512];
+	char go_path[512];
+	int fd;
+
+	if (!barrier_dir || !*barrier_dir)
+		return;
+	(void)world;
+
+	snprintf(ready_path, sizeof(ready_path), "%s/ready.%d", barrier_dir,
+		 npu_device >= 0 ? npu_device : getpid());
+	snprintf(go_path, sizeof(go_path), "%s/go", barrier_dir);
+
+	fd = open(ready_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (fd < 0)
+		die("barrier ready create", -errno);
+	if (write(fd, "1\n", 2) < 0)
+		die("barrier ready write", -errno);
+	close(fd);
+
+	/* Parent (matrix) creates go after all ranks are ready. */
+	while (access(go_path, F_OK) != 0)
+		usleep(1000);
+}
+
+static int verify_last_window_crc(int file_fd, struct slot *slots, uint32_t qd,
+				  int npu_device)
+{
+	unsigned char *host = NULL;
+	uint32_t i;
+	int mismatches = 0;
+
+	if (npu_device < 0) {
+		fprintf(stderr,
+			"verify-crc skipped: needs --npu-device for D2H\n");
+		return 0;
+	}
+
+	for (i = 0; i < qd; i++) {
+		uint32_t file_crc;
+		uint32_t hbm_crc;
+		int err;
+
+		if (!slots[i].used || !slots[i].length)
+			continue;
+		host = aligned_alloc_sector(slots[i].length);
+		read_file_range(file_fd, slots[i].offset, slots[i].length,
+				host);
+		file_crc = crc32_buf(host, slots[i].length);
+
+		err = xds_hbm_memcpy_d2h(host,
+					 (void *)(uintptr_t)slots[i].buf_addr,
+					 slots[i].length);
+		if (err)
+			die("xds_hbm_memcpy_d2h", err);
+		hbm_crc = crc32_buf(host, slots[i].length);
+		if (file_crc != hbm_crc) {
+			fprintf(stderr,
+				"CRC mismatch slot=%u offset=%" PRIu64
+				" length=%u file=0x%08x hbm=0x%08x\n",
+				i, slots[i].offset, slots[i].length, file_crc,
+				hbm_crc);
+			mismatches++;
+		}
+		free(host);
+		host = NULL;
+	}
+	return mismatches ? -EIO : 0;
+}
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
@@ -150,14 +286,21 @@ static void usage(const char *argv0)
 		"  --cmb-va ADDR       CMB/HBM VA base (default 0; VM stub only)\n"
 		"  --npu-device ID      physical: aclrtSetDevice + aclrtMalloc HBM\n"
 		"  --acl-policy N      aclrt malloc policy (default 0=HUGE_FIRST)\n"
-		"  --total-size BYTES  aggregate bytes to transfer (default 256M; K/M/G ok)\n"
+		"  --total-size BYTES  aggregate bytes (default 256M; ignored if --runtime)\n"
+		"  --runtime SEC       timed run; stop issuing after SEC seconds\n"
 		"  --io-min BYTES      min I/O size (default 32K)\n"
 		"  --io-max BYTES      max I/O size (default 128K)\n"
 		"  --queue-depth N     outstanding I/Os (default 64)\n"
 		"  --passes N          repeat total-size this many times (default 1)\n"
 		"  --sequential        sequential offsets, wrap at EOF (default)\n"
 		"  --random            random offsets within target\n"
-		"  --no-register-mem   one-shot VAs (default: register CMB/HBM window)\n",
+		"  --no-register-mem   one-shot VAs (default: register CMB/HBM window)\n"
+		"  --drain             submit batches then nds_io_drain (no getevents)\n"
+		"  --verify-crc        after timing, CRC last-window HBM vs file\n"
+		"                      (default on with --drain; needs --npu-device)\n"
+		"  --no-verify-crc     disable post-run CRC even with --drain\n"
+		"  --barrier-dir DIR   sync start: wait until DIR/go (ready.N files)\n"
+		"  --barrier-world N   expected ranks for barrier (default 1)\n",
 		argv0);
 }
 
@@ -170,6 +313,7 @@ int main(int argc, char **argv)
 		{ "npu-device", required_argument, NULL, 'd' },
 		{ "acl-policy", required_argument, NULL, 'A' },
 		{ "total-size", required_argument, NULL, 'T' },
+		{ "runtime", required_argument, NULL, 'U' },
 		{ "io-min", required_argument, NULL, 'i' },
 		{ "io-max", required_argument, NULL, 'I' },
 		{ "queue-depth", required_argument, NULL, 'q' },
@@ -177,21 +321,33 @@ int main(int argc, char **argv)
 		{ "sequential", no_argument, NULL, 'S' },
 		{ "random", no_argument, NULL, 'R' },
 		{ "no-register-mem", no_argument, NULL, 'N' },
+		{ "drain", no_argument, NULL, 'D' },
+		{ "verify-crc", no_argument, NULL, 'V' },
+		{ "no-verify-crc", no_argument, NULL, 'X' },
+		{ "barrier-dir", required_argument, NULL, 'B' },
+		{ "barrier-world", required_argument, NULL, 'W' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
 	const char *topo_path = NULL;
 	const char *target_path = NULL;
+	const char *barrier_dir = NULL;
 	uint64_t cmb_va = 0;
 	int npu_device = -1;
 	int acl_policy = XDS_ACL_MEM_MALLOC_HUGE_FIRST;
 	uint64_t total_size = DEFAULT_TOTAL;
+	double runtime_sec = 0;
+	bool use_runtime = false;
 	uint32_t io_min = DEFAULT_IO_MIN;
 	uint32_t io_max = DEFAULT_IO_MAX;
 	uint32_t qd = DEFAULT_QD;
 	unsigned int passes = 1;
+	unsigned int barrier_world = 1;
 	bool random_off = false;
 	bool register_mem = true;
+	bool drain_mode = false;
+	bool verify_crc = false;
+	bool verify_crc_set = false;
 	struct xds_hbm_buf hbm = { 0 };
 	int topo_fd = -1;
 	int file_fd = -1;
@@ -213,16 +369,18 @@ int main(int argc, char **argv)
 	uint64_t ios = 0;
 	uint64_t buf_span;
 	unsigned int rng = 1;
-	struct timespec t0, t1;
+	struct timespec t0, t1, now;
 	double sec;
 	double gib;
 	double mib_s;
 	int err;
 	int c;
 	uint32_t i;
+	int crc_ok = 1;
+	bool stop_issue = false;
 
-	while ((c = getopt_long(argc, argv, "t:f:a:d:A:T:i:I:q:p:SRNh", opts,
-				NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "t:f:a:d:A:T:U:i:I:q:p:SRNDVXB:W:h",
+				opts, NULL)) != -1) {
 		switch (c) {
 		case 't':
 			topo_path = optarg;
@@ -241,6 +399,10 @@ int main(int argc, char **argv)
 			break;
 		case 'T':
 			total_size = parse_size(optarg);
+			break;
+		case 'U':
+			runtime_sec = strtod(optarg, NULL);
+			use_runtime = true;
 			break;
 		case 'i':
 			io_min = (uint32_t)parse_size(optarg);
@@ -263,6 +425,23 @@ int main(int argc, char **argv)
 		case 'N':
 			register_mem = false;
 			break;
+		case 'D':
+			drain_mode = true;
+			break;
+		case 'V':
+			verify_crc = true;
+			verify_crc_set = true;
+			break;
+		case 'X':
+			verify_crc = false;
+			verify_crc_set = true;
+			break;
+		case 'B':
+			barrier_dir = optarg;
+			break;
+		case 'W':
+			barrier_world = (unsigned int)strtoul(optarg, NULL, 0);
+			break;
 		case 'h':
 			usage(argv[0]);
 			return 0;
@@ -281,10 +460,15 @@ int main(int argc, char **argv)
 	if (!io_min || !io_max || io_min > io_max ||
 	    (io_min | io_max) & (SECTOR - 1))
 		die("io-min/io-max must be non-zero 512B-aligned", -EINVAL);
-	if (!total_size || (total_size & (SECTOR - 1)))
-		die("total-size must be 512B-aligned", -EINVAL);
-	if (!passes)
-		die("passes", -EINVAL);
+	if (!use_runtime) {
+		if (!total_size || (total_size & (SECTOR - 1)))
+			die("total-size must be 512B-aligned", -EINVAL);
+		if (!passes)
+			die("passes", -EINVAL);
+	} else if (runtime_sec <= 0)
+		die("runtime must be > 0", -EINVAL);
+	if (!verify_crc_set)
+		verify_crc = drain_mode;
 
 	topo_fd = open(topo_path, O_RDONLY | O_DIRECT | O_CLOEXEC);
 	if (topo_fd < 0)
@@ -296,9 +480,13 @@ int main(int argc, char **argv)
 	target_bytes = align_down(target_size_bytes(file_fd), SECTOR);
 	if (target_bytes < io_min)
 		die("target too small", -ENOSPC);
-	if (total_size > UINT64_MAX / passes)
-		die("total-size * passes overflow", -EOVERFLOW);
-	goal = total_size * passes;
+	if (!use_runtime) {
+		if (total_size > UINT64_MAX / passes)
+			die("total-size * passes overflow", -EOVERFLOW);
+		goal = total_size * passes;
+	} else {
+		goal = UINT64_MAX;
+	}
 
 	buf_span = (uint64_t)qd * io_max;
 	if (npu_device >= 0) {
@@ -338,26 +526,53 @@ int main(int argc, char **argv)
 
 	printf("topology=%s target=%s cmb_va=0x%" PRIx64 " npu_device=%d\n",
 	       topo_path, target_path, cmb_va, npu_device);
-	printf("target_size=%" PRIu64 " (%.2f MiB) total_size=%" PRIu64
-	       " passes=%u goal=%" PRIu64 " (%.2f MiB)\n",
-	       target_bytes, target_bytes / (1024.0 * 1024.0), total_size,
-	       passes, goal, goal / (1024.0 * 1024.0));
-	printf("io_size=%u..%u queue_depth=%u register_mem=%d pattern=%s\n",
+	if (use_runtime)
+		printf("target_size=%" PRIu64 " (%.2f MiB) runtime=%.3f s\n",
+		       target_bytes, target_bytes / (1024.0 * 1024.0),
+		       runtime_sec);
+	else
+		printf("target_size=%" PRIu64 " (%.2f MiB) total_size=%" PRIu64
+		       " passes=%u goal=%" PRIu64 " (%.2f MiB)\n",
+		       target_bytes, target_bytes / (1024.0 * 1024.0),
+		       total_size, passes, goal, goal / (1024.0 * 1024.0));
+	printf("io_size=%u..%u queue_depth=%u register_mem=%d pattern=%s "
+	       "mode=%s verify_crc=%d\n",
 	       io_min, io_max, qd, register_mem,
-	       random_off ? "random" : "sequential");
+	       random_off ? "random" : "sequential",
+	       drain_mode ? "drain" : "getevents", verify_crc ? 1 : 0);
 	fflush(stdout);
+
+	barrier_wait(barrier_dir, npu_device, barrier_world);
 
 	if (clock_gettime(CLOCK_MONOTONIC, &t0))
 		die("clock_gettime", -errno);
 
-	while (completed < goal) {
+	while (!stop_issue || inflight > 0) {
 		uint32_t batch_nr = 0;
+		uint64_t round_bytes = 0;
 
-		while (inflight < qd && issued < goal) {
+		if (use_runtime && !stop_issue) {
+			if (clock_gettime(CLOCK_MONOTONIC, &now))
+				die("clock_gettime", -errno);
+			if (elapsed_sec(&t0, &now) >= runtime_sec)
+				stop_issue = true;
+		}
+		if (!use_runtime && completed >= goal && inflight == 0)
+			break;
+		if (!use_runtime && issued >= goal)
+			stop_issue = true;
+
+		while (!stop_issue && inflight < qd &&
+		       (use_runtime || issued < goal)) {
 			uint32_t slot;
 			uint32_t len;
 			uint64_t off;
-			uint64_t remain = goal - issued;
+			uint64_t remain;
+
+			if (use_runtime)
+				remain = io_max;
+			else
+				remain = goal - issued;
 
 			for (slot = 0; slot < qd; slot++) {
 				if (!slots[slot].busy)
@@ -394,6 +609,7 @@ int main(int argc, char **argv)
 			slots[slot].iov.buf_addr = slots[slot].buf_addr;
 			slots[slot].iov.buf_len = len;
 			slots[slot].length = len;
+			slots[slot].offset = off;
 			slots[slot].cb.opcode = NDS_IO_OP_PREAD;
 			slots[slot].cb.rw_flags =
 				register_mem ? NDS_IO_F_REGISTERED_MEM : 0;
@@ -408,15 +624,16 @@ int main(int argc, char **argv)
 			batch_slots[batch_nr] = slot;
 			batch_nr++;
 			slots[slot].busy = true;
+			slots[slot].used = true;
 			inflight++;
 			issued += len;
+			round_bytes += len;
 		}
 
 		if (batch_nr) {
 			int n = nds_io_submit(ctx, (int)batch_nr, batch_cbs);
 
 			if (n != (int)batch_nr) {
-				/* Roll back bookkeeping for unsubmitted tail. */
 				uint32_t k;
 
 				for (k = (uint32_t)(n < 0 ? 0 : n); k < batch_nr;
@@ -424,12 +641,33 @@ int main(int argc, char **argv)
 					slots[batch_slots[k]].busy = false;
 					inflight--;
 					issued -= slots[batch_slots[k]].length;
+					round_bytes -=
+						slots[batch_slots[k]].length;
 				}
 				die("nds_io_submit", n < 0 ? n : -EIO);
 			}
 		}
 
-		if (inflight) {
+		if (drain_mode) {
+			if (inflight) {
+				err = nds_io_drain(ctx);
+				if (err)
+					die("nds_io_drain", err);
+				for (i = 0; i < qd; i++) {
+					if (!slots[i].busy)
+						continue;
+					completed += slots[i].length;
+					ios++;
+					slots[i].busy = false;
+					inflight--;
+				}
+				if (inflight)
+					die("drain left inflight", -EIO);
+			} else if (!stop_issue &&
+				   (use_runtime || completed < goal)) {
+				die("stalled with no inflight I/O", -EIO);
+			}
+		} else if (inflight) {
 			int got = nds_io_getevents(ctx, 1, (int)inflight,
 						   events, NULL);
 			int j;
@@ -453,17 +691,22 @@ int main(int argc, char **argv)
 				slots[slot].busy = false;
 				inflight--;
 			}
-		} else if (completed < goal) {
+		} else if (!stop_issue && (use_runtime || completed < goal)) {
 			die("stalled with no inflight I/O", -EIO);
 		}
+
+		if (!use_runtime && completed >= goal && inflight == 0)
+			break;
+		(void)round_bytes;
 	}
 
 	if (clock_gettime(CLOCK_MONOTONIC, &t1))
 		die("clock_gettime", -errno);
 
-	sec = (timespec_ns(&t1) - timespec_ns(&t0)) / 1e9;
-	if (sec <= 0)
-		sec = 1e-9;
+	if (use_runtime)
+		sec = runtime_sec > 0 ? runtime_sec : elapsed_sec(&t0, &t1);
+	else
+		sec = elapsed_sec(&t0, &t1);
 	gib = completed / (1024.0 * 1024.0 * 1024.0);
 	mib_s = (completed / (1024.0 * 1024.0)) / sec;
 
@@ -473,11 +716,21 @@ int main(int argc, char **argv)
 	printf("bandwidth=%.2f MiB/s (%.3f GiB/s) iops=%.0f avg_io=%.1f KiB\n",
 	       mib_s, mib_s / 1024.0, ios / sec,
 	       ios ? (completed / (double)ios) / 1024.0 : 0.0);
-	/* Machine-parseable one-liner for matrix scripts. */
+
+	if (verify_crc) {
+		err = verify_last_window_crc(file_fd, slots, qd, npu_device);
+		crc_ok = (err == 0);
+		printf("verify_crc last-window %s\n",
+		       crc_ok ? "PASS" : "FAIL");
+	}
+
 	printf("RESULT pattern=%s register_mem=%d io_min=%u io_max=%u qd=%u "
-	       "bytes=%" PRIu64 " ios=%" PRIu64 " sec=%.6f mib_s=%.2f iops=%.0f\n",
+	       "mode=%s verify_crc=%d crc_ok=%d bytes=%" PRIu64 " ios=%" PRIu64
+	       " sec=%.6f mib_s=%.2f iops=%.0f\n",
 	       random_off ? "random" : "sequential", register_mem ? 1 : 0,
-	       io_min, io_max, qd, completed, ios, sec, mib_s, ios / sec);
+	       io_min, io_max, qd, drain_mode ? "drain" : "getevents",
+	       verify_crc ? 1 : 0, crc_ok, completed, ios, sec, mib_s,
+	       ios / sec);
 
 	nds_io_destroy_ctx(ctx);
 	if (register_mem)
@@ -490,5 +743,5 @@ int main(int argc, char **argv)
 	free(batch_cbs);
 	free(events);
 	free(slots);
-	return 0;
+	return crc_ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -12,8 +12,9 @@
 # LBAs. After every (bs,qd,mem,pattern) cell, those files are fully rewritten
 # with O_DIRECT urandom to displace NVMe controller read cache.
 #
-# With --concurrent, for each cell all NPUs run nds_bw_bench at once.
-# Note: AGGREGATE is still a sum of per-NPU rates (not wall-clock aggregate).
+# With --concurrent, for each cell all NPUs run nds_bw_bench at once with a
+# start barrier. ALL primary metric is wall_mib_s = sum(bytes)/max(sec).
+# sum(mib_s) is retained only as an unreliable contrast row.
 #
 # Usage:
 #   source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -22,7 +23,7 @@
 #     --npu-devices 0,1,2,3 \
 #     --bs-list 32K,128K,1M --qd-list 16,32,64 \
 #     --mem-mode register,noregister \
-#     --total-size 1G --concurrent
+#     --total-size 1G --concurrent --drain
 #
 # Outputs:
 #   <outdir>/results.tsv   raw rows
@@ -44,6 +45,8 @@ TOTAL_SIZE=1G
 PASSES=1
 ACL_POLICY=0
 CONCURRENT=0
+DRAIN=0
+RUNTIME=
 OUTDIR=
 SKIP_BUILD=0
 
@@ -68,8 +71,10 @@ Sweep options:
 
 Bench options (forwarded to nds_bw_bench):
   --total-size SIZE       bytes per run / per-NPU file size (default: 1G)
+  --runtime SEC           timed mode (overrides total-size budget for bench)
   --passes N              (default: 1)
   --acl-policy N          aclrt malloc policy (default: 0)
+  --drain                 use nds_io_drain batches (no getevents)
 
 Run mode:
   --concurrent            for each (bs,qd,mem), start one bench per NPU in parallel
@@ -89,6 +94,16 @@ split_csv()
 		[[ -n $part ]] || continue
 		printf '%s\n' "$part"
 	done
+}
+
+count_csv()
+{
+	local n=0
+	local x
+	for x in $(split_csv "$1"); do
+		n=$((n + 1))
+	done
+	printf '%s\n' "$n"
 }
 
 parse_size_bytes()
@@ -112,13 +127,13 @@ build_bench()
 {
 	[[ $SKIP_BUILD == 1 ]] && return 0
 	[[ -x $BENCH ]] && [[ $BENCH -nt $SCRIPT_DIR/nds_bw_bench.c ]] && \
-		[[ $BENCH -nt $SCRIPT_DIR/hbm_acl.c ]] && return 0
+		[[ $BENCH -nt $SCRIPT_DIR/hbm_acl.c ]] && \
+		[[ $BENCH -nt $SCRIPT_DIR/../file_p2p/nds_api.c ]] && return 0
 	log "Building nds_bw_bench"
 	make -C "$SCRIPT_DIR" nds_bw_bench
 	BENCH=$SCRIPT_DIR/nds_bw_bench
 }
 
-# Full-file O_DIRECT urandom rewrite to displace NVMe read cache.
 poison_one_file()
 {
 	local path=$1 bytes=$2
@@ -133,7 +148,6 @@ poison_one_file()
 			conv=notrunc,fsync status=none
 	fi
 	if (( rem > 0 )); then
-		# rem must be sector-aligned for oflag=direct on many FS.
 		dd if=/dev/urandom of="$path" bs="$rem" count=1 \
 			seek="$count" oflag=direct conv=notrunc status=none 2>/dev/null || \
 		dd if=/dev/urandom of="$path" bs="$rem" count=1 \
@@ -191,26 +205,30 @@ poison_data_files()
 	sync
 }
 
+# Print: mib_s TAB iops TAB bytes TAB sec
 parse_result_line()
 {
-	# stdin: full bench stdout/stderr → print "mib_s<TAB>iops" from last RESULT line
 	awk '
 		/^RESULT / {
-			mib=""; iops="";
+			mib=""; iops=""; bytes=""; sec="";
 			for (i = 1; i <= NF; i++) {
 				if ($i ~ /^mib_s=/) { mib=$i; sub(/^mib_s=/,"",mib) }
 				if ($i ~ /^iops=/) { iops=$i; sub(/^iops=/,"",iops) }
+				if ($i ~ /^bytes=/) { bytes=$i; sub(/^bytes=/,"",bytes) }
+				if ($i ~ /^sec=/) { sec=$i; sub(/^sec=/,"",sec) }
 			}
 		}
 		END {
-			if (mib == "" || iops == "") exit 1
-			print mib "\t" iops
+			if (mib == "" || iops == "" || bytes == "" || sec == "") exit 1
+			print mib "\t" iops "\t" bytes "\t" sec
 		}'
 }
 
 run_one_bench()
 {
 	local npu=$1 bs=$2 qd=$3 mem=$4 pattern=$5 logfile=$6
+	local barrier_dir=${7:-}
+	local barrier_world=${8:-1}
 	local target args=()
 
 	target=$(npu_file "$npu")
@@ -219,12 +237,16 @@ run_one_bench()
 		--target "$target"
 		--npu-device "$npu"
 		--acl-policy "$ACL_POLICY"
-		--total-size "$TOTAL_SIZE"
 		--io-min "$bs"
 		--io-max "$bs"
 		--queue-depth "$qd"
 		--passes "$PASSES"
 	)
+	if [[ -n $RUNTIME ]]; then
+		args+=(--runtime "$RUNTIME")
+	else
+		args+=(--total-size "$TOTAL_SIZE")
+	fi
 	case $pattern in
 		sequential) args+=(--sequential) ;;
 		random) args+=(--random) ;;
@@ -235,21 +257,24 @@ run_one_bench()
 		noregister) args+=(--no-register-mem) ;;
 		*) die "bad mem $mem" ;;
 	esac
+	[[ $DRAIN == 1 ]] && args+=(--drain)
+	if [[ -n $barrier_dir ]]; then
+		args+=(--barrier-dir "$barrier_dir" --barrier-world "$barrier_world")
+	fi
 
-	# Keep full log for debugging; RESULT is parsed from it.
 	"$BENCH" "${args[@]}" >"$logfile" 2>&1
 }
 
 append_row()
 {
-	# npu pattern bs qd mem mib_s iops note
-	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$OUTDIR/results.tsv"
+	# npu pattern bs qd mem mib_s iops sec bytes note
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$OUTDIR/results.tsv"
 }
 
 run_cell_sequential()
 {
 	local bs=$1 qd=$2 mem=$3 pattern=$4
-	local npu logf parsed mib iops
+	local npu logf parsed mib iops bytes sec
 
 	for npu in $(split_csv "$NPU_DEVICES"); do
 		logf=$OUTDIR/logs/npu${npu}.${pattern}.${bs}.qd${qd}.${mem}.log
@@ -257,29 +282,57 @@ run_cell_sequential()
 		run_one_bench "$npu" "$bs" "$qd" "$mem" "$pattern" "$logf" || \
 			die "bench failed; see $logf"
 		parsed=$(parse_result_line <"$logf") || die "no RESULT in $logf"
-		mib=${parsed%%$'\t'*}
-		iops=${parsed#*$'\t'}
-		append_row "$npu" "$pattern" "$bs" "$qd" "$mem" "$mib" "$iops" "solo"
-		printf '  npu%s: %s MiB/s  %s IOPS\n' "$npu" "$mib" "$iops"
+		mib=$(printf '%s\n' "$parsed" | cut -f1)
+		iops=$(printf '%s\n' "$parsed" | cut -f2)
+		bytes=$(printf '%s\n' "$parsed" | cut -f3)
+		sec=$(printf '%s\n' "$parsed" | cut -f4)
+		append_row "$npu" "$pattern" "$bs" "$qd" "$mem" "$mib" "$iops" "$sec" "$bytes" "solo"
+		printf '  npu%s: %s MiB/s  %s IOPS  sec=%s\n' "$npu" "$mib" "$iops" "$sec"
 	done
 	poison_data_files
+}
+
+wait_barrier_ready()
+{
+	local dir=$1
+	local expect=$2
+	local ready=0
+	local deadline=$((SECONDS + 300))
+
+	while (( SECONDS < deadline )); do
+		ready=$(find "$dir" -maxdepth 1 -name 'ready.*' 2>/dev/null | wc -l)
+		(( ready >= expect )) && return 0
+		sleep 0.05
+	done
+	die "barrier timeout: only $ready/$expect ready under $dir"
 }
 
 run_cell_concurrent()
 {
 	local bs=$1 qd=$2 mem=$3 pattern=$4
-	local npu logf parsed mib iops pids=() fails=0
-	local sum_mib=0 sum_iops=0 n_ok=0
+	local npu logf parsed mib iops bytes sec pids=() fails=0
+	local sum_mib=0 sum_iops=0 sum_bytes=0 max_sec=0 n_ok=0 wall_mib
+	local n_npus barrier_dir
 
-	log "CONCURRENT bs=$bs qd=$qd mem=$mem pattern=$pattern npus=$NPU_DEVICES"
+	n_npus=$(count_csv "$NPU_DEVICES")
+	barrier_dir=$OUTDIR/barrier.${pattern}.${bs}.qd${qd}.${mem}.$$
+	rm -rf -- "$barrier_dir"
+	mkdir -p "$barrier_dir"
+
+	log "CONCURRENT bs=$bs qd=$qd mem=$mem pattern=$pattern npus=$NPU_DEVICES drain=$DRAIN"
 
 	for npu in $(split_csv "$NPU_DEVICES"); do
 		logf=$OUTDIR/logs/npu${npu}.${pattern}.${bs}.qd${qd}.${mem}.log
 		(
-			run_one_bench "$npu" "$bs" "$qd" "$mem" "$pattern" "$logf"
+			run_one_bench "$npu" "$bs" "$qd" "$mem" "$pattern" "$logf" \
+				"$barrier_dir" "$n_npus"
 		) &
 		pids+=($!)
 	done
+
+	wait_barrier_ready "$barrier_dir" "$n_npus"
+	: >"$barrier_dir/go"
+	log "barrier released ($n_npus ranks)"
 
 	local pid
 	for pid in "${pids[@]}"; do
@@ -290,17 +343,29 @@ run_cell_concurrent()
 	for npu in $(split_csv "$NPU_DEVICES"); do
 		logf=$OUTDIR/logs/npu${npu}.${pattern}.${bs}.qd${qd}.${mem}.log
 		parsed=$(parse_result_line <"$logf") || die "no RESULT in $logf"
-		mib=${parsed%%$'\t'*}
-		iops=${parsed#*$'\t'}
-		append_row "$npu" "$pattern" "$bs" "$qd" "$mem" "$mib" "$iops" "concurrent"
-		printf '  npu%s: %s MiB/s  %s IOPS\n' "$npu" "$mib" "$iops"
-		# bash float via awk for aggregate
+		mib=$(printf '%s\n' "$parsed" | cut -f1)
+		iops=$(printf '%s\n' "$parsed" | cut -f2)
+		bytes=$(printf '%s\n' "$parsed" | cut -f3)
+		sec=$(printf '%s\n' "$parsed" | cut -f4)
+		append_row "$npu" "$pattern" "$bs" "$qd" "$mem" "$mib" "$iops" "$sec" "$bytes" "concurrent"
+		printf '  npu%s: %s MiB/s  %s IOPS  sec=%s bytes=%s\n' \
+			"$npu" "$mib" "$iops" "$sec" "$bytes"
 		sum_mib=$(awk -v a="$sum_mib" -v b="$mib" 'BEGIN{printf "%.2f", a+b}')
 		sum_iops=$(awk -v a="$sum_iops" -v b="$iops" 'BEGIN{printf "%.0f", a+b}')
+		sum_bytes=$(awk -v a="$sum_bytes" -v b="$bytes" 'BEGIN{printf "%.0f", a+b}')
+		max_sec=$(awk -v a="$max_sec" -v b="$sec" 'BEGIN{printf "%.6f", (b>a)?b:a}')
 		n_ok=$((n_ok + 1))
 	done
-	append_row "ALL" "$pattern" "$bs" "$qd" "$mem" "$sum_mib" "$sum_iops" "sum_of_${n_ok}_npus"
-	printf '  AGGREGATE: %s MiB/s  %s IOPS (%s NPUs)\n' "$sum_mib" "$sum_iops" "$n_ok"
+	wall_mib=$(awk -v b="$sum_bytes" -v s="$max_sec" \
+		'BEGIN{ if (s<=0) s=1e-9; printf "%.2f", (b/1048576.0)/s }')
+	append_row "ALL" "$pattern" "$bs" "$qd" "$mem" "$wall_mib" "$sum_iops" \
+		"$max_sec" "$sum_bytes" "wall_max_sec_${n_ok}_npus"
+	append_row "ALL" "$pattern" "$bs" "$qd" "$mem" "$sum_mib" "$sum_iops" \
+		"-" "$sum_bytes" "sum_mib_unreliable"
+	printf '  WALL_AGGREGATE: %s MiB/s  (sum_bytes/max_sec=%.6f)  %s NPUs\n' \
+		"$wall_mib" "$max_sec" "$n_ok"
+	printf '  sum_mib (unreliable): %s MiB/s\n' "$sum_mib"
+	rm -rf -- "$barrier_dir"
 	poison_data_files
 }
 
@@ -308,10 +373,12 @@ write_summary()
 {
 	{
 		printf 'Physical NPU NDS bandwidth matrix (nds_bw_bench)\n'
-		printf 'topology=%s data_dir=%s total=%s passes=%s\n' \
-			"$TOPOLOGY" "$DATA_DIR" "$TOTAL_SIZE" "$PASSES"
-		printf 'npus=%s bs=%s qd=%s mem=%s pattern=%s concurrent=%s\n\n' \
+		printf 'topology=%s data_dir=%s total=%s passes=%s runtime=%s drain=%s\n' \
+			"$TOPOLOGY" "$DATA_DIR" "$TOTAL_SIZE" "$PASSES" \
+			"${RUNTIME:-none}" "$DRAIN"
+		printf 'npus=%s bs=%s qd=%s mem=%s pattern=%s concurrent=%s\n' \
 			"$NPU_DEVICES" "$BS_LIST" "$QD_LIST" "$MEM_MODE" "$PATTERN" "$CONCURRENT"
+		printf 'Note: concurrent ALL wall_max_sec_* is the primary metric; sum_mib_unreliable is contrast only.\n\n'
 		if command -v column >/dev/null 2>&1; then
 			column -t -s $'\t' "$OUTDIR/results.tsv"
 		else
@@ -335,10 +402,12 @@ main()
 			--mem-mode) MEM_MODE=$2; shift 2 ;;
 			--pattern) PATTERN=$2; shift 2 ;;
 			--total-size) TOTAL_SIZE=$2; shift 2 ;;
+			--runtime) RUNTIME=$2; shift 2 ;;
 			--passes) PASSES=$2; shift 2 ;;
 			--acl-policy) ACL_POLICY=$2; shift 2 ;;
 			--outdir) OUTDIR=$2; shift 2 ;;
 			--concurrent) CONCURRENT=1; shift ;;
+			--drain) DRAIN=1; shift ;;
 			--skip-build) SKIP_BUILD=1; shift ;;
 			-h|--help) usage; exit 0 ;;
 			*) die "unknown arg: $1 (try --help)" ;;
@@ -358,7 +427,8 @@ main()
 		OUTDIR=$(pwd)/npu-bw-results-$(date +%Y%m%d-%H%M%S)
 	fi
 	mkdir -p "$OUTDIR/logs"
-	printf 'npu\tpattern\tbs\tqd\tmem\tmib_s\tiops\tnote\n' >"$OUTDIR/results.tsv"
+	printf 'npu\tpattern\tbs\tqd\tmem\tmib_s\tiops\tsec\tbytes\tnote\n' \
+		>"$OUTDIR/results.tsv"
 
 	build_bench
 	[[ -x $BENCH ]] || die "nds_bw_bench not found at $BENCH (make -C test nds_bw_bench)"
