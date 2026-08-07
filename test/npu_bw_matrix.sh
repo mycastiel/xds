@@ -13,9 +13,9 @@
 # with O_DIRECT urandom to displace NVMe controller read cache.
 #
 # With --concurrent, for each cell all NPUs run nds_bw_bench at once with a
-# start barrier. Parent wall-clock starts before forking run_one_bench and
-# ends after the last wait; ALL = sum(bytes)/wall_sec. Per-card mib_s /
-# sum(mib_s) are contrast only.
+# start barrier. Primary ALL = sum(bytes)/max(bench_sec): same I/O window each
+# card times after the barrier (excludes ACL init / CRC teardown). Parent
+# go→last-exit wall and sum(mib_s) are contrast only.
 #
 # Usage:
 #   source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -312,8 +312,9 @@ run_cell_concurrent()
 {
 	local bs=$1 qd=$2 mem=$3 pattern=$4
 	local npu logf parsed mib iops bytes sec pids=() fails=0
-	local sum_mib=0 sum_iops=0 sum_bytes=0 max_sec=0 n_ok=0 wall_mib
-	local n_npus barrier_dir wall_start wall_end wall_sec
+	local sum_mib=0 sum_iops=0 sum_bytes=0 max_sec=0 n_ok=0
+	local overlap_mib go_wall_mib
+	local n_npus barrier_dir go_start go_end go_sec
 
 	n_npus=$(count_csv "$NPU_DEVICES")
 	barrier_dir=$OUTDIR/barrier.${pattern}.${bs}.qd${qd}.${mem}.$$
@@ -322,8 +323,6 @@ run_cell_concurrent()
 
 	log "CONCURRENT bs=$bs qd=$qd mem=$mem pattern=$pattern npus=$NPU_DEVICES drain=$DRAIN"
 
-	# Parent wall-clock covers launch → last child exit (includes init+barrier wait).
-	wall_start=$(date +%s.%N)
 	for npu in $(split_csv "$NPU_DEVICES"); do
 		logf=$OUTDIR/logs/npu${npu}.${pattern}.${bs}.qd${qd}.${mem}.log
 		(
@@ -334,17 +333,19 @@ run_cell_concurrent()
 	done
 
 	wait_barrier_ready "$barrier_dir" "$n_npus"
+	# I/O window starts when go appears (bench timers start right after).
+	go_start=$(date +%s.%N)
 	: >"$barrier_dir/go"
-	log "barrier released ($n_npus ranks) wall_start=$wall_start"
+	log "barrier released ($n_npus ranks) go_start=$go_start"
 
 	local pid
 	for pid in "${pids[@]}"; do
 		wait "$pid" || fails=$((fails + 1))
 	done
-	wall_end=$(date +%s.%N)
+	go_end=$(date +%s.%N)
 	(( fails == 0 )) || die "concurrent cell had $fails failed bench(es); see $OUTDIR/logs"
 
-	wall_sec=$(awk -v a="$wall_start" -v b="$wall_end" \
+	go_sec=$(awk -v a="$go_start" -v b="$go_end" \
 		'BEGIN { s=b-a; if (s<=0) s=1e-9; printf "%.6f", s }')
 
 	for npu in $(split_csv "$NPU_DEVICES"); do
@@ -363,16 +364,24 @@ run_cell_concurrent()
 		max_sec=$(awk -v a="$max_sec" -v b="$sec" 'BEGIN{printf "%.6f", (b>a)?b:a}')
 		n_ok=$((n_ok + 1))
 	done
-	wall_mib=$(awk -v b="$sum_bytes" -v s="$wall_sec" \
+
+	# Primary: overlapped I/O window = max of per-card timed intervals.
+	overlap_mib=$(awk -v b="$sum_bytes" -v s="$max_sec" \
 		'BEGIN{ if (s<=0) s=1e-9; printf "%.2f", (b/1048576.0)/s }')
-	append_row "ALL" "$pattern" "$bs" "$qd" "$mem" "$wall_mib" "$sum_iops" \
-		"$wall_sec" "$sum_bytes" "parent_wall_${n_ok}_npus"
+	# Contrast: parent go → last exit (still includes CRC/teardown after t1).
+	go_wall_mib=$(awk -v b="$sum_bytes" -v s="$go_sec" \
+		'BEGIN{ if (s<=0) s=1e-9; printf "%.2f", (b/1048576.0)/s }')
+
+	append_row "ALL" "$pattern" "$bs" "$qd" "$mem" "$overlap_mib" "$sum_iops" \
+		"$max_sec" "$sum_bytes" "io_overlap_${n_ok}_npus"
+	append_row "ALL" "$pattern" "$bs" "$qd" "$mem" "$go_wall_mib" "$sum_iops" \
+		"$go_sec" "$sum_bytes" "parent_go_wall_incl_teardown"
 	append_row "ALL" "$pattern" "$bs" "$qd" "$mem" "$sum_mib" "$sum_iops" \
 		"-" "$sum_bytes" "sum_mib_unreliable"
-	printf '  PARENT_WALL: %s MiB/s  (sum_bytes=%s / wall_sec=%s)  %s NPUs\n' \
-		"$wall_mib" "$sum_bytes" "$wall_sec" "$n_ok"
-	printf '  (contrast) max(bench_sec)=%s  sum_mib_unreliable=%s\n' \
-		"$max_sec" "$sum_mib"
+	printf '  IO_OVERLAP: %s MiB/s  (sum_bytes=%s / max(bench_sec)=%s)  %s NPUs\n' \
+		"$overlap_mib" "$sum_bytes" "$max_sec" "$n_ok"
+	printf '  (contrast) parent_go_wall=%s MiB/s go_sec=%s  sum_mib_unreliable=%s\n' \
+		"$go_wall_mib" "$go_sec" "$sum_mib"
 	rm -rf -- "$barrier_dir"
 	poison_data_files
 }
@@ -386,7 +395,7 @@ write_summary()
 			"${RUNTIME:-none}" "$DRAIN"
 		printf 'npus=%s bs=%s qd=%s mem=%s pattern=%s concurrent=%s\n' \
 			"$NPU_DEVICES" "$BS_LIST" "$QD_LIST" "$MEM_MODE" "$PATTERN" "$CONCURRENT"
-		printf 'Note: concurrent ALL parent_wall_* = sum(bytes)/(t_after_waits - t_before_fork); sum_mib_unreliable is contrast only.\n\n'
+		printf 'Note: concurrent ALL io_overlap_* = sum(bytes)/max(bench_sec); parent_go_wall includes teardown; sum_mib_unreliable is contrast only.\n\n'
 		if command -v column >/dev/null 2>&1; then
 			column -t -s $'\t' "$OUTDIR/results.tsv"
 		else

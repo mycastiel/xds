@@ -11,8 +11,9 @@
 # offset × mem-mode, solo then concurrent. After each case group the files are
 # regenerated with a new seed to avoid NVMe read-cache reuse.
 #
-# Kernel P2P_MIN_PAGE_SIZE is 64KiB: register_mem can still test 4K I/Os via a
-# larger HBM window; noregister skips lengths < 64K (one-shot pin would fail).
+# Kernel P2P_MIN_PAGE_SIZE is 64KiB, but Ascend needs a ≥2MiB P2P-huge HBM
+# window (acl policy HUGE_FIRST_P2P=3). register_mem can still test short I/Os
+# (e.g. 4K) inside that window; noregister skips lengths < 2M.
 #
 # Usage:
 #   source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -34,15 +35,16 @@ TOPOLOGY=
 DATA_DIR=
 NPU_DEVICES=
 FILE_SIZE=64M
-LENGTH_LIST=4K,64K,128K,1M
+LENGTH_LIST=64K,128K,1M,2M
 MEM_MODE=register,noregister
-ACL_POLICY=0
+# Default matches nds_crc_verify HUGE_FIRST_P2P
+ACL_POLICY=3
 OUTDIR=
 SKIP_BUILD=0
 SEED_BASE=1000
 FAILS=0
-# Match kernel P2P_MIN_PAGE_SIZE / nds_crc_verify P2P_HBM_ALIGN
-MIN_NOREG_BYTES=$((64 << 10))
+# One-shot pin queries iov length; need ≥2MiB for Ascend huge pages
+MIN_NOREG_BYTES=$((2 << 20))
 
 die() { printf 'npu_crc_verify: %s\n' "$*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*" >&2; }
@@ -59,10 +61,10 @@ Required:
 
 Options:
   --file-size SIZE        per-NPU file size (default: 64M)
-  --length-list LIST      transfer lengths (default: 4K,64K,128K,1M)
+  --length-list LIST      transfer lengths (default: 64K,128K,1M,2M)
   --mem-mode LIST         register,noregister (default: both)
-                          note: noregister skips lengths < 64K (kernel page min)
-  --acl-policy N          aclrt malloc policy (default: 0)
+                          note: noregister skips lengths < 2M (Ascend huge pages)
+  --acl-policy N          aclrt malloc policy (default: 3 = HUGE_FIRST_P2P)
   --outdir DIR            results directory (default: ./npu-crc-results-<timestamp>)
   --skip-build            do not rebuild nds_crc_verify
   -h, --help              show this help
@@ -101,8 +103,8 @@ npu_file()
 build_verify()
 {
 	[[ $SKIP_BUILD == 1 ]] && return 0
-	[[ -x $VERIFY ]] && [[ $VERIFY -nt $SCRIPT_DIR/nds_crc_verify.c ]] && \
-		[[ $VERIFY -nt $SCRIPT_DIR/hbm_acl.c ]] && return 0
+	# Always rebuild so machines do not keep an old binary that still
+	# registers 4K windows (invalid page size 4096).
 	log "Building nds_crc_verify"
 	make -C "$SCRIPT_DIR" nds_crc_verify
 	VERIFY=$SCRIPT_DIR/nds_crc_verify
@@ -320,9 +322,9 @@ main()
 		for mem in $(split_csv "$MEM_MODE"); do
 			case $mem in register|noregister) ;; *) die "bad --mem-mode entry: $mem" ;; esac
 			if [[ $mem == noregister && $len_bytes -lt $MIN_NOREG_BYTES ]]; then
-				log "skip noregister length=$length (<64K kernel HBM page min)"
-				append_row "solo" "-" "$mem" "$length" "-" "-" "skipped_lt_64k"
-				append_row "concurrent" "-" "$mem" "$length" "-" "-" "skipped_lt_64k"
+				log "skip noregister length=$length (<2M Ascend huge-page min)"
+				append_row "solo" "-" "$mem" "$length" "-" "-" "skipped_lt_2m"
+				append_row "concurrent" "-" "$mem" "$length" "-" "-" "skipped_lt_2m"
 				continue
 			fi
 			run_solo_cases "$length" "$mem"

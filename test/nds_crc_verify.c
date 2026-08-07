@@ -5,9 +5,10 @@
  * back to host with aclrtMemcpy, and compares CRC32 of the HBM payload
  * against CRC32 of the same range read with O_DIRECT pread.
  *
- * Kernel P2P_MIN_PAGE_SIZE is 64KiB: HBM is allocated/registered in a
- * ≥64KiB window. I/O may use a shorter prefix so small lengths work with
- * register_mem. --no-register-mem requires --length >= 64K.
+ * Kernel P2P_MIN_PAGE_SIZE is 64KiB. Physical Ascend needs a P2P-huge HBM
+ * window (default ≥2MiB, acl policy HUGE_FIRST_P2P) so get_mem_page_size is
+ * not 4K. I/O may use a shorter prefix (e.g. 4K) inside that window with
+ * register_mem. --no-register-mem requires --length >= 2M (one-shot pins iov).
  *
  * CRC32 contract matches crc32_verify.c / kernel crc32_le:
  *   poly 0xedb88320, init ~0, final XOR ~0.
@@ -39,15 +40,16 @@
 #include "hbm_acl.h"
 
 #define SECTOR 512u
-/* Match kernel P2P_MIN_PAGE_SIZE in dev.c. */
-#define P2P_HBM_ALIGN (64u << 10)
+/* Practical min window so device huge / P2P pages are used. */
+#define P2P_HBM_ALLOC_MIN (2u << 20)
 #define CRC32_POLY_LE 0xedb88320U
 
 static size_t hbm_alloc_size(uint32_t io_len)
 {
-	size_t n = io_len < P2P_HBM_ALIGN ? P2P_HBM_ALIGN : (size_t)io_len;
+	size_t n = io_len < P2P_HBM_ALLOC_MIN ? P2P_HBM_ALLOC_MIN :
+						 (size_t)io_len;
 
-	return (n + P2P_HBM_ALIGN - 1) & ~(size_t)(P2P_HBM_ALIGN - 1);
+	return (n + P2P_HBM_ALLOC_MIN - 1) & ~(size_t)(P2P_HBM_ALLOC_MIN - 1);
 }
 
 static void die(const char *what, int err)
@@ -173,9 +175,10 @@ static void usage(const char *argv0)
 	fprintf(stderr,
 		"Usage: %s --topology DEV --target PATH --npu-device ID "
 		"--offset BYTES --length BYTES [options]\n"
-		"  --acl-policy N      aclrt malloc policy (default 0)\n"
+		"  --acl-policy N      aclrt malloc policy "
+		"(default 3=HUGE_FIRST_P2P)\n"
 		"  --no-register-mem   one-shot VAs (default: register);\n"
-		"                      requires --length >= 64K\n",
+		"                      requires --length >= 2M\n",
 		argv0);
 }
 
@@ -195,7 +198,7 @@ int main(int argc, char **argv)
 	const char *topo_path = NULL;
 	const char *target_path = NULL;
 	int npu_device = -1;
-	int acl_policy = XDS_ACL_MEM_MALLOC_HUGE_FIRST;
+	int acl_policy = XDS_ACL_MEM_MALLOC_HUGE_FIRST_P2P;
 	uint64_t offset = 0;
 	uint64_t length_u64 = 0;
 	uint32_t length = 0;
@@ -272,15 +275,15 @@ int main(int argc, char **argv)
 	if ((offset | length) & (SECTOR - 1))
 		die("offset/length must be 512B-aligned", -EINVAL);
 	/*
-	 * One-shot pin asks get_mem_page_size(iov); a <64KiB iov typically
-	 * reports 4K pages and is rejected by the kernel.
+	 * One-shot pin asks get_mem_page_size(iov). Require ≥2MiB so Ascend
+	 * reports a device huge page, not 4K.
 	 */
-	if (!register_mem && length < P2P_HBM_ALIGN) {
+	if (!register_mem && length < P2P_HBM_ALLOC_MIN) {
 		fprintf(stderr,
 			"nds_crc_verify: --no-register-mem requires "
 			"--length >= %u (got %u); use register_mem for "
 			"smaller I/Os\n",
-			P2P_HBM_ALIGN, length);
+			P2P_HBM_ALLOC_MIN, length);
 		return EXIT_FAILURE;
 	}
 
@@ -302,6 +305,11 @@ int main(int argc, char **argv)
 	read_file_range(file_fd, offset, length, file_buf);
 	file_crc = crc32_buf(file_buf, length);
 
+	fprintf(stderr,
+		"nds_crc_verify: alloc_size=%zu acl_policy=%d register_mem=%d "
+		"io_length=%u\n",
+		alloc_size, acl_policy, register_mem ? 1 : 0, length);
+
 	err = xds_hbm_alloc(&hbm, npu_device, alloc_size, acl_policy);
 	if (err)
 		die("xds_hbm_alloc", err);
@@ -313,8 +321,14 @@ int main(int argc, char **argv)
 
 	if (register_mem) {
 		err = nds_register_mem(hbm.addr, alloc_size, 0);
-		if (err)
+		if (err) {
+			fprintf(stderr,
+				"nds_register_mem failed (%d): need device "
+				"huge/P2P pages (try --acl-policy 3 or 4, "
+				"alloc_size=%zu)\n",
+				err, alloc_size);
 			die("nds_register_mem", err);
+		}
 	}
 
 	err = nds_io_new_ctx(&(struct nds_io_ctx_param){ .max_io_cnt = 1 },
@@ -352,10 +366,11 @@ int main(int argc, char **argv)
 	hbm_crc = crc32_buf(hbm_buf, length);
 	ok = (file_crc == hbm_crc);
 
-	printf("RESULT npu=%d offset=%" PRIu64 " length=%u register_mem=%d "
-	       "file_crc=0x%08x hbm_crc=0x%08x ok=%d\n",
-	       npu_device, offset, length, register_mem ? 1 : 0, file_crc,
-	       hbm_crc, ok);
+	printf("RESULT npu=%d offset=%" PRIu64 " length=%u alloc_size=%zu "
+	       "acl_policy=%d register_mem=%d file_crc=0x%08x hbm_crc=0x%08x "
+	       "ok=%d\n",
+	       npu_device, offset, length, alloc_size, acl_policy,
+	       register_mem ? 1 : 0, file_crc, hbm_crc, ok);
 
 	nds_io_destroy_ctx(ctx);
 	if (register_mem)
