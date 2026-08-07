@@ -13,6 +13,12 @@ typedef int (*aclrt_set_device_fn)(int);
 typedef int (*aclrt_reset_device_fn)(int);
 typedef int (*aclrt_malloc_fn)(void **, size_t, int);
 typedef int (*aclrt_free_fn)(void *);
+/* aclrtMemcpy(dst, destMax, src, count, kind) — kind 2 = DEVICE_TO_HOST */
+typedef int (*aclrt_memcpy_fn)(void *, size_t, const void *, size_t, int);
+
+enum {
+	XDS_ACL_MEMCPY_DEVICE_TO_HOST = 2,
+};
 
 struct acl_api {
 	void *handle;
@@ -22,6 +28,7 @@ struct acl_api {
 	aclrt_reset_device_fn reset_device;
 	aclrt_malloc_fn malloc;
 	aclrt_free_fn free;
+	aclrt_memcpy_fn memcpy;
 	int refcnt;
 };
 
@@ -57,8 +64,10 @@ static int acl_load(void)
 		(aclrt_reset_device_fn)dlsym(g_acl.handle, "aclrtResetDevice");
 	g_acl.malloc = (aclrt_malloc_fn)dlsym(g_acl.handle, "aclrtMalloc");
 	g_acl.free = (aclrt_free_fn)dlsym(g_acl.handle, "aclrtFree");
+	g_acl.memcpy = (aclrt_memcpy_fn)dlsym(g_acl.handle, "aclrtMemcpy");
 	if (!g_acl.init || !g_acl.finalize || !g_acl.set_device ||
-	    !g_acl.reset_device || !g_acl.malloc || !g_acl.free) {
+	    !g_acl.reset_device || !g_acl.malloc || !g_acl.free ||
+	    !g_acl.memcpy) {
 		fprintf(stderr, "hbm_acl: missing Ascend symbols in %s\n", path);
 		dlclose(g_acl.handle);
 		memset(&g_acl, 0, sizeof(g_acl));
@@ -144,4 +153,22 @@ void xds_hbm_free(struct xds_hbm_buf *buf)
 		g_acl.finalize();
 	acl_unload();
 	memset(buf, 0, sizeof(*buf));
+}
+
+int xds_hbm_memcpy_d2h(void *host, const void *device, size_t n)
+{
+	int ret;
+
+	if (!host || !device || !n)
+		return -EINVAL;
+	if (!g_acl.handle || !g_acl.memcpy)
+		return -ENODEV;
+
+	ret = g_acl.memcpy(host, n, device, n, XDS_ACL_MEMCPY_DEVICE_TO_HOST);
+	if (ret != 0) {
+		fprintf(stderr,
+			"hbm_acl: aclrtMemcpy D2H (n=%zu) failed: %d\n", n, ret);
+		return ret > 0 ? -EIO : ret;
+	}
+	return 0;
 }

@@ -5,15 +5,20 @@
 # No VM helpers / common.sh / stub CMB. Requires:
 #   - p2p_dev already loaded on the machine
 #   - Ascend ACL env sourced (set_env.sh)
-#   - topology block device + readable target file
+#   - topology block device + writable data directory on the target FS
 #
 # Sweeps BS × QD × register_mem, optionally across multiple NPU cards.
-# With --concurrent, for each (bs,qd,mem) all NPUs run nds_bw_bench at once.
+# Each NPU reads its own file under --data-dir (npu${id}.bin) to avoid sharing
+# LBAs. After every (bs,qd,mem,pattern) cell, those files are fully rewritten
+# with O_DIRECT urandom to displace NVMe controller read cache.
+#
+# With --concurrent, for each cell all NPUs run nds_bw_bench at once.
+# Note: AGGREGATE is still a sum of per-NPU rates (not wall-clock aggregate).
 #
 # Usage:
 #   source /usr/local/Ascend/ascend-toolkit/set_env.sh
 #   sudo -E ./test/npu_bw_matrix.sh \
-#     --topology /dev/nvme0n1 --target /mnt/data/f.bin \
+#     --topology /dev/nvme0n1 --data-dir /mnt/data/xds-bw \
 #     --npu-devices 0,1,2,3 \
 #     --bs-list 32K,128K,1M --qd-list 16,32,64 \
 #     --mem-mode register,noregister \
@@ -29,7 +34,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BENCH=${NPU_BW_BENCH:-$SCRIPT_DIR/nds_bw_bench}
 
 TOPOLOGY=
-TARGET=
+DATA_DIR=
 NPU_DEVICES=
 BS_LIST=32K,128K,1M
 QD_LIST=16,32,64,128
@@ -48,11 +53,11 @@ log() { printf '==> %s\n' "$*" >&2; }
 usage()
 {
 	cat <<'EOF'
-Usage: npu_bw_matrix.sh --topology DEV --target FILE --npu-devices IDS [options]
+Usage: npu_bw_matrix.sh --topology DEV --data-dir DIR --npu-devices IDS [options]
 
 Required:
   --topology DEV          NDS topology block device (passed to nds_bw_bench)
-  --target FILE           file / block device to read
+  --data-dir DIR          directory for per-NPU files (npu${id}.bin)
   --npu-devices LIST      comma list of NPU ids (e.g. 0,1,2,3)
 
 Sweep options:
@@ -62,7 +67,7 @@ Sweep options:
   --pattern LIST          sequential,random (default: sequential)
 
 Bench options (forwarded to nds_bw_bench):
-  --total-size SIZE       bytes per run (default: 1G)
+  --total-size SIZE       bytes per run / per-NPU file size (default: 1G)
   --passes N              (default: 1)
   --acl-policy N          aclrt malloc policy (default: 0)
 
@@ -86,6 +91,23 @@ split_csv()
 	done
 }
 
+parse_size_bytes()
+{
+	local s=$1
+	local n=${s%[KkMmGg]}
+	case $s in
+		*[Kk]) printf '%s\n' $((n << 10)) ;;
+		*[Mm]) printf '%s\n' $((n << 20)) ;;
+		*[Gg]) printf '%s\n' $((n << 30)) ;;
+		*) printf '%s\n' "$s" ;;
+	esac
+}
+
+npu_file()
+{
+	printf '%s/npu%s.bin' "$DATA_DIR" "$1"
+}
+
 build_bench()
 {
 	[[ $SKIP_BUILD == 1 ]] && return 0
@@ -94,6 +116,79 @@ build_bench()
 	log "Building nds_bw_bench"
 	make -C "$SCRIPT_DIR" nds_bw_bench
 	BENCH=$SCRIPT_DIR/nds_bw_bench
+}
+
+# Full-file O_DIRECT urandom rewrite to displace NVMe read cache.
+poison_one_file()
+{
+	local path=$1 bytes=$2
+	local bs=$((1 << 20))
+	local count=$((bytes / bs))
+	local rem=$((bytes % bs))
+
+	if (( count > 0 )); then
+		dd if=/dev/urandom of="$path" bs="$bs" count="$count" \
+			oflag=direct conv=notrunc status=none 2>/dev/null || \
+		dd if=/dev/urandom of="$path" bs="$bs" count="$count" \
+			conv=notrunc,fsync status=none
+	fi
+	if (( rem > 0 )); then
+		# rem must be sector-aligned for oflag=direct on many FS.
+		dd if=/dev/urandom of="$path" bs="$rem" count=1 \
+			seek="$count" oflag=direct conv=notrunc status=none 2>/dev/null || \
+		dd if=/dev/urandom of="$path" bs="$rem" count=1 \
+			seek="$count" conv=notrunc,fsync status=none
+	fi
+}
+
+ensure_data_files()
+{
+	local bytes npu path actual
+
+	bytes=$(parse_size_bytes "$TOTAL_SIZE")
+	(( bytes > 0 && (bytes % 512) == 0 )) || \
+		die "--total-size must be positive and 512B-aligned (got $TOTAL_SIZE → $bytes)"
+
+	mkdir -p "$DATA_DIR"
+	for npu in $(split_csv "$NPU_DEVICES"); do
+		path=$(npu_file "$npu")
+		if [[ -f $path ]]; then
+			actual=$(stat -c %s -- "$path")
+			if (( actual != bytes )); then
+				log "Resizing $path to $TOTAL_SIZE ($bytes bytes)"
+				rm -f -- "$path"
+			fi
+		fi
+		if [[ ! -f $path ]]; then
+			log "Creating $path ($TOTAL_SIZE)"
+			if ! fallocate -l "$bytes" "$path" 2>/dev/null; then
+				dd if=/dev/zero of="$path" bs=1M \
+					count=$((bytes >> 20)) status=none
+				local rem=$((bytes & ((1 << 20) - 1)))
+				if (( rem )); then
+					dd if=/dev/zero of="$path" bs="$rem" count=1 \
+						seek=$((bytes >> 20)) conv=notrunc status=none
+				fi
+			fi
+		fi
+		log "Initial fill $path (O_DIRECT urandom)"
+		poison_one_file "$path" "$bytes"
+	done
+	sync
+}
+
+poison_data_files()
+{
+	local bytes npu path
+
+	bytes=$(parse_size_bytes "$TOTAL_SIZE")
+	log "Poisoning data files under $DATA_DIR (displace NVMe read cache)"
+	for npu in $(split_csv "$NPU_DEVICES"); do
+		path=$(npu_file "$npu")
+		[[ -f $path ]] || die "missing data file $path"
+		poison_one_file "$path" "$bytes"
+	done
+	sync
 }
 
 parse_result_line()
@@ -116,11 +211,12 @@ parse_result_line()
 run_one_bench()
 {
 	local npu=$1 bs=$2 qd=$3 mem=$4 pattern=$5 logfile=$6
-	local args=()
+	local target args=()
 
+	target=$(npu_file "$npu")
 	args=(
 		--topology "$TOPOLOGY"
-		--target "$TARGET"
+		--target "$target"
 		--npu-device "$npu"
 		--acl-policy "$ACL_POLICY"
 		--total-size "$TOTAL_SIZE"
@@ -157,7 +253,7 @@ run_cell_sequential()
 
 	for npu in $(split_csv "$NPU_DEVICES"); do
 		logf=$OUTDIR/logs/npu${npu}.${pattern}.${bs}.qd${qd}.${mem}.log
-		log "npu=$npu bs=$bs qd=$qd mem=$mem pattern=$pattern"
+		log "npu=$npu bs=$bs qd=$qd mem=$mem pattern=$pattern target=$(npu_file "$npu")"
 		run_one_bench "$npu" "$bs" "$qd" "$mem" "$pattern" "$logf" || \
 			die "bench failed; see $logf"
 		parsed=$(parse_result_line <"$logf") || die "no RESULT in $logf"
@@ -166,6 +262,7 @@ run_cell_sequential()
 		append_row "$npu" "$pattern" "$bs" "$qd" "$mem" "$mib" "$iops" "solo"
 		printf '  npu%s: %s MiB/s  %s IOPS\n' "$npu" "$mib" "$iops"
 	done
+	poison_data_files
 }
 
 run_cell_concurrent()
@@ -204,14 +301,15 @@ run_cell_concurrent()
 	done
 	append_row "ALL" "$pattern" "$bs" "$qd" "$mem" "$sum_mib" "$sum_iops" "sum_of_${n_ok}_npus"
 	printf '  AGGREGATE: %s MiB/s  %s IOPS (%s NPUs)\n' "$sum_mib" "$sum_iops" "$n_ok"
+	poison_data_files
 }
 
 write_summary()
 {
 	{
 		printf 'Physical NPU NDS bandwidth matrix (nds_bw_bench)\n'
-		printf 'topology=%s target=%s total=%s passes=%s\n' \
-			"$TOPOLOGY" "$TARGET" "$TOTAL_SIZE" "$PASSES"
+		printf 'topology=%s data_dir=%s total=%s passes=%s\n' \
+			"$TOPOLOGY" "$DATA_DIR" "$TOTAL_SIZE" "$PASSES"
 		printf 'npus=%s bs=%s qd=%s mem=%s pattern=%s concurrent=%s\n\n' \
 			"$NPU_DEVICES" "$BS_LIST" "$QD_LIST" "$MEM_MODE" "$PATTERN" "$CONCURRENT"
 		if command -v column >/dev/null 2>&1; then
@@ -229,7 +327,8 @@ main()
 	while [[ $# -gt 0 ]]; do
 		case $1 in
 			--topology) TOPOLOGY=$2; shift 2 ;;
-			--target) TARGET=$2; shift 2 ;;
+			--data-dir) DATA_DIR=$2; shift 2 ;;
+			--target) die "--target removed; use --data-dir DIR (per-NPU npu\${id}.bin)" ;;
 			--npu-devices) NPU_DEVICES=$2; shift 2 ;;
 			--bs-list) BS_LIST=$2; shift 2 ;;
 			--qd-list) QD_LIST=$2; shift 2 ;;
@@ -247,11 +346,10 @@ main()
 	done
 
 	[[ -n $TOPOLOGY ]] || die "missing --topology"
-	[[ -n $TARGET ]] || die "missing --target"
+	[[ -n $DATA_DIR ]] || die "missing --data-dir"
 	[[ -n $NPU_DEVICES ]] || die "missing --npu-devices"
 	[[ -b $TOPOLOGY || -c $TOPOLOGY ]] || \
 		die "topology $TOPOLOGY is not a block/char device"
-	[[ -e $TARGET ]] || die "target $TARGET does not exist"
 	[[ -c /dev/p2p_device ]] || die "/dev/p2p_device missing; load p2p_dev first"
 	[[ -n ${ASCEND_ACL_LIB:-} || -n ${ASCEND_HOME:-} || -n ${ASCEND_AICPU_PATH:-} || -n ${LD_LIBRARY_PATH:-} ]] || \
 		log "warning: Ascend env vars not obvious; source set_env.sh and use sudo -E"
@@ -264,6 +362,8 @@ main()
 
 	build_bench
 	[[ -x $BENCH ]] || die "nds_bw_bench not found at $BENCH (make -C test nds_bw_bench)"
+
+	ensure_data_files
 
 	for bs in $(split_csv "$BS_LIST"); do
 		for qd in $(split_csv "$QD_LIST"); do

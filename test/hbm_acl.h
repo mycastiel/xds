@@ -31,4 +31,10 @@ int xds_hbm_alloc(struct xds_hbm_buf *buf, int device_id, size_t size,
 		  int malloc_policy);
 void xds_hbm_free(struct xds_hbm_buf *buf);
 
+/*
+ * Copy @n bytes from device HBM (@device) into host (@host).
+ * Requires an active xds_hbm_alloc on the same device (set_device still in effect).
+ */
+int xds_hbm_memcpy_d2h(void *host, const void *device, size_t n);
+
 #endif /* XDS_HBM_ACL_H */
