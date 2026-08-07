@@ -206,13 +206,15 @@ poison_data_files()
 	sync
 }
 
-# Print: mib_s TAB iops TAB bytes TAB sec TAB verify_each TAB crc_checked TAB crc_ok
+# Print: mib_s TAB iops TAB bytes TAB sec TAB verify_each TAB crc_checked TAB
+#         crc_ok TAB proc_cpu_pct TAB sys_cpu_pct
 parse_result_line()
 {
 	awk '
 		/^RESULT / {
 			mib=""; iops=""; bytes=""; sec="";
 			ve="0"; checked="0"; ok="1";
+			proc="0"; sys="0";
 			for (i = 1; i <= NF; i++) {
 				if ($i ~ /^mib_s=/) { mib=$i; sub(/^mib_s=/,"",mib) }
 				if ($i ~ /^iops=/) { iops=$i; sub(/^iops=/,"",iops) }
@@ -221,11 +223,14 @@ parse_result_line()
 				if ($i ~ /^verify_each=/) { ve=$i; sub(/^verify_each=/,"",ve) }
 				if ($i ~ /^crc_checked=/) { checked=$i; sub(/^crc_checked=/,"",checked) }
 				if ($i ~ /^crc_ok=/) { ok=$i; sub(/^crc_ok=/,"",ok) }
+				if ($i ~ /^proc_cpu_pct=/) { proc=$i; sub(/^proc_cpu_pct=/,"",proc) }
+				if ($i ~ /^sys_cpu_pct=/) { sys=$i; sub(/^sys_cpu_pct=/,"",sys) }
 			}
 		}
 		END {
 			if (mib == "" || iops == "" || bytes == "" || sec == "") exit 1
-			print mib "\t" iops "\t" bytes "\t" sec "\t" ve "\t" checked "\t" ok
+			print mib "\t" iops "\t" bytes "\t" sec "\t" ve "\t" checked "\t" ok \
+				"\t" proc "\t" sys
 		}'
 }
 
@@ -272,14 +277,14 @@ run_one_bench()
 
 append_row()
 {
-	# npu pattern bs qd mem mib_s iops sec bytes note
-	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$OUTDIR/results.tsv"
+	# npu pattern bs qd mem mib_s iops sec bytes proc_cpu sys_cpu note
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$OUTDIR/results.tsv"
 }
 
 run_cell_sequential()
 {
 	local bs=$1 qd=$2 mem=$3 pattern=$4
-	local npu logf parsed mib iops bytes sec ve checked ok
+	local npu logf parsed mib iops bytes sec ve checked ok proc_cpu sys_cpu
 
 	for npu in $(split_csv "$NPU_DEVICES"); do
 		logf=$OUTDIR/logs/npu${npu}.${pattern}.${bs}.qd${qd}.${mem}.log
@@ -294,18 +299,22 @@ run_cell_sequential()
 		ve=$(printf '%s\n' "$parsed" | cut -f5)
 		checked=$(printf '%s\n' "$parsed" | cut -f6)
 		ok=$(printf '%s\n' "$parsed" | cut -f7)
+		proc_cpu=$(printf '%s\n' "$parsed" | cut -f8)
+		sys_cpu=$(printf '%s\n' "$parsed" | cut -f9)
 		if [[ $VERIFY_EACH == 1 && $ve != 1 ]]; then
 			die "expected verify_each=1 in $logf (old binary?); RESULT missing flag"
 		fi
 		if [[ $ve == 1 && $ok != 1 ]]; then
 			die "CRC failed npu=$npu; see $logf"
 		fi
-		append_row "$npu" "$pattern" "$bs" "$qd" "$mem" "$mib" "$iops" "$sec" "$bytes" "solo"
+		append_row "$npu" "$pattern" "$bs" "$qd" "$mem" "$mib" "$iops" "$sec" "$bytes" \
+			"$proc_cpu" "$sys_cpu" "solo"
 		if [[ $ve == 1 ]]; then
-			printf '  npu%s: %s MiB/s  %s IOPS  sec=%s  crc_checked=%s crc_ok=%s\n' \
-				"$npu" "$mib" "$iops" "$sec" "$checked" "$ok"
+			printf '  npu%s: %s MiB/s  %s IOPS  sec=%s  crc_checked=%s crc_ok=%s  proc_cpu=%s%% sys_cpu=%s%%\n' \
+				"$npu" "$mib" "$iops" "$sec" "$checked" "$ok" "$proc_cpu" "$sys_cpu"
 		else
-			printf '  npu%s: %s MiB/s  %s IOPS  sec=%s\n' "$npu" "$mib" "$iops" "$sec"
+			printf '  npu%s: %s MiB/s  %s IOPS  sec=%s  proc_cpu=%s%% sys_cpu=%s%%\n' \
+				"$npu" "$mib" "$iops" "$sec" "$proc_cpu" "$sys_cpu"
 		fi
 	done
 	poison_data_files
@@ -331,7 +340,8 @@ run_cell_concurrent()
 	local bs=$1 qd=$2 mem=$3 pattern=$4
 	local npu logf parsed mib iops bytes sec pids=() fails=0
 	local sum_mib=0 sum_iops=0 sum_bytes=0 max_sec=0 n_ok=0
-	local overlap_mib go_wall_mib ve checked ok
+	local sum_proc_cpu=0 max_sys_cpu=0
+	local overlap_mib go_wall_mib ve checked ok proc_cpu sys_cpu
 	local n_npus barrier_dir go_start go_end go_sec
 
 	n_npus=$(count_csv "$NPU_DEVICES")
@@ -376,24 +386,29 @@ run_cell_concurrent()
 		ve=$(printf '%s\n' "$parsed" | cut -f5)
 		checked=$(printf '%s\n' "$parsed" | cut -f6)
 		ok=$(printf '%s\n' "$parsed" | cut -f7)
+		proc_cpu=$(printf '%s\n' "$parsed" | cut -f8)
+		sys_cpu=$(printf '%s\n' "$parsed" | cut -f9)
 		if [[ $VERIFY_EACH == 1 && $ve != 1 ]]; then
 			die "expected verify_each=1 in $logf (old binary?); RESULT missing flag"
 		fi
 		if [[ $ve == 1 && $ok != 1 ]]; then
 			die "CRC failed npu=$npu; see $logf"
 		fi
-		append_row "$npu" "$pattern" "$bs" "$qd" "$mem" "$mib" "$iops" "$sec" "$bytes" "concurrent"
+		append_row "$npu" "$pattern" "$bs" "$qd" "$mem" "$mib" "$iops" "$sec" "$bytes" \
+			"$proc_cpu" "$sys_cpu" "concurrent"
 		if [[ $ve == 1 ]]; then
-			printf '  npu%s: %s MiB/s  %s IOPS  bench_sec=%s bytes=%s  crc_checked=%s crc_ok=%s\n' \
-				"$npu" "$mib" "$iops" "$sec" "$bytes" "$checked" "$ok"
+			printf '  npu%s: %s MiB/s  %s IOPS  bench_sec=%s bytes=%s  crc_checked=%s crc_ok=%s  proc_cpu=%s%% sys_cpu=%s%%\n' \
+				"$npu" "$mib" "$iops" "$sec" "$bytes" "$checked" "$ok" "$proc_cpu" "$sys_cpu"
 		else
-			printf '  npu%s: %s MiB/s  %s IOPS  bench_sec=%s bytes=%s\n' \
-				"$npu" "$mib" "$iops" "$sec" "$bytes"
+			printf '  npu%s: %s MiB/s  %s IOPS  bench_sec=%s bytes=%s  proc_cpu=%s%% sys_cpu=%s%%\n' \
+				"$npu" "$mib" "$iops" "$sec" "$bytes" "$proc_cpu" "$sys_cpu"
 		fi
 		sum_mib=$(awk -v a="$sum_mib" -v b="$mib" 'BEGIN{printf "%.2f", a+b}')
 		sum_iops=$(awk -v a="$sum_iops" -v b="$iops" 'BEGIN{printf "%.0f", a+b}')
 		sum_bytes=$(awk -v a="$sum_bytes" -v b="$bytes" 'BEGIN{printf "%.0f", a+b}')
 		max_sec=$(awk -v a="$max_sec" -v b="$sec" 'BEGIN{printf "%.6f", (b>a)?b:a}')
+		sum_proc_cpu=$(awk -v a="$sum_proc_cpu" -v b="$proc_cpu" 'BEGIN{printf "%.2f", a+b}')
+		max_sys_cpu=$(awk -v a="$max_sys_cpu" -v b="$sys_cpu" 'BEGIN{printf "%.2f", (b>a)?b:a}')
 		n_ok=$((n_ok + 1))
 	done
 
@@ -405,15 +420,17 @@ run_cell_concurrent()
 		'BEGIN{ if (s<=0) s=1e-9; printf "%.2f", (b/1048576.0)/s }')
 
 	append_row "ALL" "$pattern" "$bs" "$qd" "$mem" "$overlap_mib" "$sum_iops" \
-		"$max_sec" "$sum_bytes" "io_overlap_${n_ok}_npus"
+		"$max_sec" "$sum_bytes" "$sum_proc_cpu" "$max_sys_cpu" "io_overlap_${n_ok}_npus"
 	append_row "ALL" "$pattern" "$bs" "$qd" "$mem" "$go_wall_mib" "$sum_iops" \
-		"$go_sec" "$sum_bytes" "parent_go_wall_incl_teardown"
+		"$go_sec" "$sum_bytes" "$sum_proc_cpu" "$max_sys_cpu" "parent_go_wall_incl_teardown"
 	append_row "ALL" "$pattern" "$bs" "$qd" "$mem" "$sum_mib" "$sum_iops" \
-		"-" "$sum_bytes" "sum_mib_unreliable"
+		"-" "$sum_bytes" "$sum_proc_cpu" "$max_sys_cpu" "sum_mib_unreliable"
 	printf '  IO_OVERLAP: %s MiB/s  (sum_bytes=%s / max(bench_sec)=%s)  %s NPUs\n' \
 		"$overlap_mib" "$sum_bytes" "$max_sec" "$n_ok"
 	printf '  (contrast) parent_go_wall=%s MiB/s go_sec=%s  sum_mib_unreliable=%s\n' \
 		"$go_wall_mib" "$go_sec" "$sum_mib"
+	printf '  CPU: sum(proc_cpu)=%s%%  max(sys_cpu)=%s%%\n' \
+		"$sum_proc_cpu" "$max_sys_cpu"
 	rm -rf -- "$barrier_dir"
 	poison_data_files
 }
@@ -477,7 +494,7 @@ main()
 		OUTDIR=$(pwd)/npu-bw-results-$(date +%Y%m%d-%H%M%S)
 	fi
 	mkdir -p "$OUTDIR/logs"
-	printf 'npu\tpattern\tbs\tqd\tmem\tmib_s\tiops\tsec\tbytes\tnote\n' \
+	printf 'npu\tpattern\tbs\tqd\tmem\tmib_s\tiops\tsec\tbytes\tproc_cpu_pct\tsys_cpu_pct\tnote\n' \
 		>"$OUTDIR/results.tsv"
 
 	build_bench

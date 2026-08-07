@@ -29,6 +29,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -111,6 +112,69 @@ static double elapsed_sec(const struct timespec *t0, const struct timespec *t1)
 	double sec = (timespec_ns(t1) - timespec_ns(t0)) / 1e9;
 
 	return sec > 0 ? sec : 1e-9;
+}
+
+/* /proc/self/stat utime+stime (jiffies). Returns 0 on success. */
+static int read_proc_self_jiffies(uint64_t *jiffies_out)
+{
+	char buf[1024];
+	char *rp;
+	unsigned long utime = 0;
+	unsigned long stime = 0;
+	FILE *f;
+	size_t n;
+
+	f = fopen("/proc/self/stat", "r");
+	if (!f)
+		return -errno;
+	n = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	if (!n)
+		return -EIO;
+	buf[n] = '\0';
+	rp = strrchr(buf, ')');
+	if (!rp)
+		return -EINVAL;
+	/*
+	 * After ") ": state ppid pgrp session tty tpgid flags
+	 * minflt cminflt majflt cmajflt utime stime ...
+	 */
+	if (sscanf(rp + 2,
+		   "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu",
+		   &utime, &stime) != 2)
+		return -EINVAL;
+	*jiffies_out = (uint64_t)utime + (uint64_t)stime;
+	return 0;
+}
+
+/* Aggregate /proc/stat "cpu " line: busy and total jiffies. */
+static int read_proc_stat_cpu(uint64_t *busy_out, uint64_t *total_out)
+{
+	char line[512];
+	unsigned long long user, nice, system, idle, iowait, irq, softirq;
+	unsigned long long steal = 0;
+	FILE *f;
+	uint64_t busy;
+	uint64_t total;
+
+	f = fopen("/proc/stat", "r");
+	if (!f)
+		return -errno;
+	if (!fgets(line, sizeof(line), f)) {
+		fclose(f);
+		return -EIO;
+	}
+	fclose(f);
+	if (sscanf(line, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &user,
+		   &nice, &system, &idle, &iowait, &irq, &softirq,
+		   &steal) < 7)
+		return -EINVAL;
+	busy = (uint64_t)user + (uint64_t)nice + (uint64_t)system +
+	       (uint64_t)irq + (uint64_t)softirq;
+	total = busy + (uint64_t)idle + (uint64_t)iowait + (uint64_t)steal;
+	*busy_out = busy;
+	*total_out = total;
+	return 0;
 }
 
 static uint64_t target_size_bytes(int fd)
@@ -386,6 +450,15 @@ int main(int argc, char **argv)
 	double sec;
 	double gib;
 	double mib_s;
+	double proc_cpu_pct = 0;
+	double sys_cpu_pct = 0;
+	uint64_t self_j0 = 0;
+	uint64_t self_j1 = 0;
+	uint64_t sys_busy0 = 0;
+	uint64_t sys_total0 = 0;
+	uint64_t sys_busy1 = 0;
+	uint64_t sys_total1 = 0;
+	long clk_tck;
 	int err;
 	int c;
 	uint32_t i;
@@ -506,6 +579,8 @@ int main(int argc, char **argv)
 	}
 
 	buf_span = (uint64_t)qd * io_max;
+	if (buf_span < 1048576)
+		buf_span = 1048576;
 	if (npu_device >= 0) {
 		err = xds_hbm_alloc(&hbm, npu_device, (size_t)buf_span,
 				    acl_policy);
@@ -562,6 +637,12 @@ int main(int argc, char **argv)
 	fflush(stdout);
 
 	barrier_wait(barrier_dir, npu_device, barrier_world);
+
+	clk_tck = sysconf(_SC_CLK_TCK);
+	if (clk_tck <= 0)
+		clk_tck = 100;
+	(void)read_proc_self_jiffies(&self_j0);
+	(void)read_proc_stat_cpu(&sys_busy0, &sys_total0);
 
 	if (clock_gettime(CLOCK_MONOTONIC, &t0))
 		die("clock_gettime", -errno);
@@ -711,6 +792,8 @@ int main(int argc, char **argv)
 
 	if (clock_gettime(CLOCK_MONOTONIC, &t1))
 		die("clock_gettime", -errno);
+	(void)read_proc_self_jiffies(&self_j1);
+	(void)read_proc_stat_cpu(&sys_busy1, &sys_total1);
 
 	if (use_runtime)
 		sec = runtime_sec > 0 ? runtime_sec : elapsed_sec(&t0, &t1);
@@ -718,6 +801,15 @@ int main(int argc, char **argv)
 		sec = elapsed_sec(&t0, &t1);
 	gib = completed / (1024.0 * 1024.0 * 1024.0);
 	mib_s = (completed / (1024.0 * 1024.0)) / sec;
+	if (self_j1 >= self_j0 && sec > 0)
+		proc_cpu_pct = 100.0 * (double)(self_j1 - self_j0) /
+			       ((double)clk_tck * sec);
+	if (sys_total1 > sys_total0) {
+		uint64_t db = sys_busy1 - sys_busy0;
+		uint64_t dt = sys_total1 - sys_total0;
+
+		sys_cpu_pct = 100.0 * (double)db / (double)dt;
+	}
 
 	printf("transferred=%" PRIu64 " bytes (%.3f GiB) ios=%" PRIu64
 	       " time=%.6f s\n",
@@ -725,6 +817,8 @@ int main(int argc, char **argv)
 	printf("bandwidth=%.2f MiB/s (%.3f GiB/s) iops=%.0f avg_io=%.1f KiB\n",
 	       mib_s, mib_s / 1024.0, ios / sec,
 	       ios ? (completed / (double)ios) / 1024.0 : 0.0);
+	printf("cpu proc=%.2f%% (1-core) sys=%.2f%% (machine)\n", proc_cpu_pct,
+	       sys_cpu_pct);
 
 	if (verify_crc) {
 		err = verify_last_window_crc(file_fd, slots, qd, npu_device);
@@ -739,10 +833,12 @@ int main(int argc, char **argv)
 	printf("RESULT pattern=%s register_mem=%d io_min=%u io_max=%u qd=%u "
 	       "verify_crc=%d verify_each=%d crc_checked=%" PRIu64
 	       " crc_ok=%d bytes=%" PRIu64 " ios=%" PRIu64
-	       " sec=%.6f mib_s=%.2f iops=%.0f\n",
+	       " sec=%.6f mib_s=%.2f iops=%.0f proc_cpu_pct=%.2f "
+	       "sys_cpu_pct=%.2f\n",
 	       random_off ? "random" : "sequential", register_mem ? 1 : 0,
 	       io_min, io_max, qd, verify_crc ? 1 : 0, verify_each ? 1 : 0,
-	       crc_checked, crc_ok, completed, ios, sec, mib_s, ios / sec);
+	       crc_checked, crc_ok, completed, ios, sec, mib_s, ios / sec,
+	       proc_cpu_pct, sys_cpu_pct);
 
 	nds_io_destroy_ctx(ctx);
 	if (register_mem)
