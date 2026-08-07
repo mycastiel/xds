@@ -418,8 +418,8 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 }
 
 /*
- * One iocb → one IOCTL_RW_FILE (nr_ios == 0). Multiple iovs in the iocb are
- * scatter-gather for a single logical completion, not multiple events.
+ * One iocb → one IOCTL_RW_FILE (one logical completion). Multiple iovs in the
+ * iocb are scatter-gather for that single event, not multiple events.
  */
 static int nds_submit_one_iocb(struct nds_io_ctx *ctx,
 			       const struct nds_io_cb *cb)

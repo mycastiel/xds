@@ -1657,6 +1657,7 @@ static void *cq_race_reaper(void *argument)
 						context->matrix[index];
 					int release_err;
 
+					/* Keep cmb_va for result manifest / CRC. */
 					release_err = va_release(
 						&context->allocator,
 						test->cmb_va, test->length);
@@ -1667,7 +1668,6 @@ static void *cq_race_reaper(void *argument)
 							     worker);
 						break;
 					}
-					test->cmb_va = ULONG_MAX;
 				}
 			}
 			__atomic_fetch_add(&context->completed, 1,

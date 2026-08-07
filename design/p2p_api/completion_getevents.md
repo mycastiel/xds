@@ -251,14 +251,11 @@ Matches current UAPI and AIO-shaped wait rules:
 | `min_nr > 0`, no outstanding | Returns immediately with `0` events (does not block like AIO on an empty ctx); see [fix4.md](fix4.md) |
 
 Harvest copies **directly** into the user `events` array with per-event
-`copy_to_user` *before* consuming (advancing the cursor / head). On fault or
-when `max_nr` stops mid-slot, the consumer-owned cursor (`cq_head_consumed`)
-simply stays where it is and the next call resumes — no requeue path needed.
-
-With optional UAPI `nr_ios > 0` (one CQ slot expands into `nr_ios` events),
-`min_nr` / `max_nr` and the wait condition are counted in logical I/Os via
-`ready_events` / `outstanding_events`, not CQ slots. NDS submit uses
-`nr_ios == 0` (one iocb → one slot → one event); see [fix5.md](fix5.md).
+`copy_to_user` *before* retiring the CQ head. On fault the head slot is left
+in place and the next call retries — no requeue path needed. Each CQ slot is
+exactly one logical I/O / one event (`p2p_sub_io` / `nr_ios` batch UAPI removed;
+see [fix5.md](fix5.md)). `min_nr` / `max_nr` and the wait condition use
+`ready_events` / `outstanding_events`.
 
 ### 6.4 Public API boundary
 
@@ -313,7 +310,7 @@ cross-iocb merge.
 
 ```text
 for each iocb:
-  validate / FIEMAP / build p2p_io_param   # nr_ios == 0
+  validate / FIEMAP / build p2p_io_param
   ioctl(IOCTL_RW_FILE)                     # one syscall per iocb
   on failure: return accepted count or -errno   # AIO fail-stop
 return nr
@@ -326,9 +323,8 @@ return nr
 | One syscall per batch | **No** — N × `IOCTL_RW_FILE` by design |
 | Per-request FIEMAP | XDS-specific cost (extent prep per iocb) |
 
-Kernel UAPI may still accept `nr_ios > 0` + `sub_ios[]` for a merged
-submission (one CQ slot → many logical events). **NDS does not use that
-path**; see [fix5.md](fix5.md).
+Batch UAPI (`sub_ios` / `nr_ios`) was removed; each ioctl is one CQ event.
+See [fix5.md](fix5.md).
 
 ### 8.4 Intentional non-goals for NDS submit
 
@@ -338,7 +334,7 @@ path**; see [fix5.md](fix5.md).
 
 ```text
 nds_io_submit(nr)
-  for each iocb → IOCTL_RW_FILE (nr_ios == 0)
+  for each iocb → IOCTL_RW_FILE
   return accepted count or -errno
         │
         ▼
@@ -383,5 +379,5 @@ nds_io_getevents (one event per accepted iocb)
    after destroy/exit in existing tests.
 6. Existing NDS and `file_p2p` basic/stress suites still pass.
 7. For `nds_io_submit` with `nr > 1`, the library issues **one**
-   `IOCTL_RW_FILE` **per iocb** (`nr_ios == 0`). Partial failure returns an
+   `IOCTL_RW_FILE` **per iocb**. Partial failure returns an
    accepted count or a negative errno consistent with `io_submit` (fix5).

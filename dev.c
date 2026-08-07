@@ -111,7 +111,7 @@ struct p2p_io_context;
 struct p2p_batch {
 	/*
 	 * Accepted CQ slots not yet retired; limited to P2P_CQ_SIZE.
-	 * Independent of outstanding_events (logical I/Os / sub_ios).
+	 * Independent of outstanding_events (logical I/Os).
 	 */
 	atomic_t io_cnt;
 
@@ -124,8 +124,6 @@ struct p2p_batch {
 	struct p2p_io_context **cq;
 	unsigned int cq_head;
 	unsigned int cq_tail;
-	/* Events already delivered from the head slot (consumer-owned). */
-	unsigned int cq_head_consumed;
 	/* Published logical I/Os not yet harvested. */
 	atomic_t ready_events;
 	/* Accepted logical I/Os not yet harvested (>= ready_events). */
@@ -153,7 +151,7 @@ struct p2p_io_context {
 	unsigned int pa_iov_nr;
 	struct p2p_pinned_io_mem pinned_mem;
 	u64 data_size;
-	/* Logical I/Os merged in this submission; each is one CQ event. */
+	/* Logical I/Os in this submission; always 1 after UAPI batch removal. */
 	struct p2p_sub_io_ctx *subs;
 	unsigned int nr_subs;
 	struct completion io_done;
@@ -224,7 +222,6 @@ static int p2p_open(struct inode *inode, struct file *file)
 	atomic_set(&batch->io_cnt, 0);
 	batch->cq_head = 0;
 	batch->cq_tail = 0;
-	batch->cq_head_consumed = 0;
 	atomic_set(&batch->ready_events, 0);
 	atomic_set(&batch->outstanding_events, 0);
 	file->private_data = batch;
@@ -1087,9 +1084,12 @@ static void p2p_tp_hook_exit(void)
 static void p2p_wake_batch_waiters(struct p2p_batch *batch)
 {
 	/*
-	 * A waiter that races this lockless check reevaluates the condition
-	 * (ready_events / outstanding_events) before sleeping.
+	 * Pair condition stores (ready_events / cq_tail under completion_lock,
+	 * then unlock) with waitqueue_active: without this full barrier a
+	 * waiter can observe !active, then miss the published condition and
+	 * sleep. wait_event* still re-checks after prepare_to_wait.
 	 */
+	smp_mb();
 	if (waitqueue_active(&batch->wait))
 		wake_up(&batch->wait);
 }
@@ -1432,13 +1432,6 @@ static int validate_io_param(const struct p2p_io_param *param)
 		return -EINVAL;
 	if (param->reserved)
 		return -EINVAL;
-	if (param->nr_ios) {
-		/* Every sub-I/O owns at least one iov. */
-		if (!param->sub_ios || param->nr_ios > param->iov_nr)
-			return -EINVAL;
-	} else if (param->sub_ios) {
-		return -EINVAL;
-	}
 	if (param->flags & P2P_IO_F_REGISTERED_MEM)
 		return !param->mem_handle || param->host_pid ? -EINVAL : 0;
 
@@ -1446,10 +1439,9 @@ static int validate_io_param(const struct p2p_io_param *param)
 }
 
 /*
- * Copy the optional sub-I/O table and validate each sub-I/O's iov/extent
- * slice. nr_ios == 0 is a single logical I/O covering everything. On success
- * *subs_out is a kvmalloc'd table the caller owns until it hands the array to
- * new_io_ctx.
+ * Build the single logical-I/O descriptor covering the full iov/extent
+ * arrays. On success *subs_out is a kvmalloc'd table (length 1) the caller
+ * owns until it hands the array to new_io_ctx.
  */
 static int p2p_prepare_sub_ios(const struct p2p_io_param *param,
 			       const struct p2p_iov *iov,
@@ -1457,69 +1449,28 @@ static int p2p_prepare_sub_ios(const struct p2p_io_param *param,
 			       struct p2p_sub_io_ctx **subs_out,
 			       unsigned int *nr_subs_out, u64 *data_size)
 {
-	struct p2p_sub_io *usubs = NULL;
 	struct p2p_sub_io_ctx *subs;
-	unsigned int nr = param->nr_ios ? param->nr_ios : 1;
-	unsigned int iov_off = 0;
-	unsigned int ext_off = 0;
-	unsigned int i;
-	u64 total = 0;
-	int err = 0;
+	u64 bytes;
+	int err;
 
-	subs = kvmalloc_array(nr, sizeof(*subs), GFP_KERNEL);
+	subs = kvmalloc(sizeof(*subs), GFP_KERNEL);
 	if (!subs)
 		return -ENOMEM;
 
-	if (param->nr_ios) {
-		usubs = kvmalloc_array(nr, sizeof(*usubs), GFP_KERNEL);
-		if (!usubs) {
-			err = -ENOMEM;
-			goto out;
-		}
-		if (copy_from_user(usubs, u64_to_user_ptr(param->sub_ios),
-				   array_size(nr, sizeof(*usubs)))) {
-			err = -EFAULT;
-			goto out;
-		}
-	}
-
-	for (i = 0; i < nr; i++) {
-		unsigned int iov_cnt = usubs ? usubs[i].iov_cnt : param->iov_nr;
-		unsigned int ext_cnt = usubs ? usubs[i].ext_cnt : param->ext_nr;
-		u64 bytes;
-
-		if (!iov_cnt || iov_cnt > param->iov_nr - iov_off ||
-		    !ext_cnt || ext_cnt > param->ext_nr - ext_off) {
-			err = -EINVAL;
-			goto out;
-		}
-		err = validate_io_data(iov + iov_off, iov_cnt,
-				       extents + ext_off, ext_cnt, &bytes);
-		if (err)
-			goto out;
-
-		subs[i].user_data = usubs ? usubs[i].user_data :
-					    param->user_data;
-		subs[i].bytes = bytes;
-		subs[i].ext_cnt = ext_cnt;
-		iov_off += iov_cnt;
-		ext_off += ext_cnt;
-		total += bytes;
-	}
-	/* The sub-I/O table must consume the iov/extent arrays exactly. */
-	if (iov_off != param->iov_nr || ext_off != param->ext_nr) {
-		err = -EINVAL;
-		goto out;
-	}
-
-	*subs_out = subs;
-	*nr_subs_out = nr;
-	*data_size = total;
-out:
-	kvfree(usubs);
-	if (err)
+	err = validate_io_data(iov, param->iov_nr, extents, param->ext_nr,
+			       &bytes);
+	if (err) {
 		kvfree(subs);
-	return err;
+		return err;
+	}
+
+	subs->user_data = param->user_data;
+	subs->bytes = bytes;
+	subs->ext_cnt = param->ext_nr;
+	*subs_out = subs;
+	*nr_subs_out = 1;
+	*data_size = bytes;
+	return 0;
 }
 
 static int validate_write_range(const struct p2p_io_param *param,
@@ -1554,7 +1505,7 @@ static int validate_write_range(const struct p2p_io_param *param,
 }
 
 /*
- * Issue one prepared submission (nr_subs logical I/Os in one io_ctx).
+ * Issue one prepared submission (one logical I/O in one io_ctx).
  * @reg_file's reference and @subs are consumed by the io_ctx on success
  * (both stay with the caller on failure). @topo is only borrowed for do_ios.
  * Caller must already have validated iov/extents/sub table and write range.
@@ -1732,9 +1683,8 @@ free_bufs:
 
 /*
  * Pop the CQ head slot and free its io_ctx. Caller holds ring_lock and must
- * have finished delivering (or discarding) every logical event in the slot
- * (cq_head_consumed == nr_subs). Counts for remaining events were already
- * adjusted by the caller.
+ * have finished delivering (or discarding) the slot's single logical event.
+ * Counts for remaining events were already adjusted by the caller.
  */
 static void p2p_retire_cq_head(struct p2p_batch *batch, int *first_err)
 {
@@ -1745,7 +1695,6 @@ static void p2p_retire_cq_head(struct p2p_batch *batch, int *first_err)
 	smp_rmb();
 	io_ctx = batch->cq[batch->cq_head & P2P_CQ_MASK];
 	WRITE_ONCE(batch->cq_head, batch->cq_head + 1);
-	batch->cq_head_consumed = 0;
 
 	err = p2p_io_ctx_errno(io_ctx);
 	if (first_err && err && !*first_err)
@@ -1784,16 +1733,12 @@ static int p2p_drain_io(struct p2p_batch *batch)
 
 		while (batch->cq_head != READ_ONCE(batch->cq_tail)) {
 			struct p2p_io_context *io_ctx;
-			unsigned int left;
 
 			smp_rmb();
 			io_ctx = batch->cq[batch->cq_head & P2P_CQ_MASK];
-			left = io_ctx->nr_subs - batch->cq_head_consumed;
-			if (left) {
-				atomic_sub(left, &batch->ready_events);
-				atomic_sub(left, &batch->outstanding_events);
-				batch->cq_head_consumed = io_ctx->nr_subs;
-			}
+			WARN_ON_ONCE(io_ctx->nr_subs != 1);
+			atomic_sub(io_ctx->nr_subs, &batch->ready_events);
+			atomic_sub(io_ctx->nr_subs, &batch->outstanding_events);
 			p2p_retire_cq_head(batch, &first_err);
 		}
 	}
@@ -1815,8 +1760,8 @@ static void p2p_fill_io_event(struct p2p_io_context *io_ctx, unsigned int sub,
 }
 
 /*
- * min_nr is counted in logical I/Os (sub-I/Os), not CQ slots, so a merged
- * submission still satisfies waiters expecting one event per logical I/O.
+ * min_nr is counted in logical I/Os (one per CQ slot), so waiters expecting
+ * one event per accepted I/O still see the right count via ready_events.
  */
 static bool p2p_cq_ready(struct p2p_batch *batch, unsigned int min_nr)
 {
@@ -1829,8 +1774,8 @@ static bool p2p_cq_ready(struct p2p_batch *batch, unsigned int min_nr)
 /*
  * AIO-style getevents: wait on ready logical I/Os, harvest under the
  * ring_lock mutex only, copy one event at a time (no kvmalloc intermediate).
- * A slot expands into io_ctx->nr_subs events; cq_head_consumed remembers the
- * position when max_nr (or a copy fault) stops the expansion mid-slot.
+ * Each CQ slot is one logical I/O / one event. On copy_to_user fault the slot
+ * stays at head for the next call.
  */
 static int p2p_get_io_events(struct p2p_batch *batch, void __user *arg)
 {
@@ -1865,36 +1810,22 @@ static int p2p_get_io_events(struct p2p_batch *batch, void __user *arg)
 
 	mutex_lock(&batch->ring_lock);
 	while (total < (unsigned int)param.max_nr) {
-		unsigned int consumed;
-
 		if (batch->cq_head == READ_ONCE(batch->cq_tail))
 			break;
 		/* Pairs with the producer's smp_wmb() before cq_tail. */
 		smp_rmb();
 		io_ctx = batch->cq[batch->cq_head & P2P_CQ_MASK];
+		WARN_ON_ONCE(io_ctx->nr_subs != 1);
 
-		consumed = batch->cq_head_consumed;
-		while (consumed < io_ctx->nr_subs &&
-		       total < (unsigned int)param.max_nr) {
-			p2p_fill_io_event(io_ctx, consumed, &event);
-			if (copy_to_user(&user_events[total], &event,
-					 sizeof(event))) {
-				/* Nothing is lost: resume from here next call. */
-				batch->cq_head_consumed = consumed;
-				copy_fault = true;
-				goto out_unlock;
-			}
-			consumed++;
-			total++;
+		p2p_fill_io_event(io_ctx, 0, &event);
+		if (copy_to_user(&user_events[total], &event, sizeof(event))) {
+			copy_fault = true;
+			break;
 		}
-		batch->cq_head_consumed = consumed;
-		if (consumed < io_ctx->nr_subs)
-			break; /* max_nr hit inside this slot */
-
+		total++;
 		p2p_retire_cq_head(batch, NULL);
 	}
 
-out_unlock:
 	/*
 	 * Single consumer under ring_lock: one atomic_sub for all successfully
 	 * copied events instead of a per-event atomic_dec.

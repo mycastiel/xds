@@ -7,12 +7,12 @@ Status: implement the corrected NDS submit model. Depends on
 ## Problem
 
 An earlier direction treated `nds_io_submit(nr, iocb)` as “merge same-file
-iocbs into one `IOCTL_RW_FILE` with `sub_ios[]`”. That mismatches the API
+iocbs into one `IOCTL_RW_FILE`”. That mismatches the API
 boundary:
 
 | Layer | Meaning | Ioctls |
 | --- | --- | --- |
-| One `nds_io_cb` | One `obj.fd`, one `offset`, many `iov` (SG), one `user_data` | **One** `IOCTL_RW_FILE` with `nr_ios=0` |
+| One `nds_io_cb` | One `obj.fd`, one `offset`, many `iov` (SG), one `user_data` | **One** `IOCTL_RW_FILE` |
 | `nds_io_submit(nr)` | Independent control blocks; often **different** files | **N** ioctls, one per iocb |
 
 Cross-iocb merge, same-file API enforcement, and batch FIEMAP are **out of
@@ -34,18 +34,19 @@ Accepted I/Os are not rolled back and complete normally via getevents.
 ## Kernel counters / locks (audit only)
 
 - Keep `ready_events` / `outstanding_events`: they count **logical** events;
-  `cq_tail - cq_head` / `io_cnt` count **CQ slots**. Needed while UAPI allows
-  one slot → `nr_subs` events.
+  with the batch UAPI removed, each CQ slot is exactly one logical event
+  (`nr_subs == 1`), so slot count and logical count stay aligned on the hot path.
 - Keep `completion_lock` / `ring_lock`. Do not move `ready_events` bump outside
   `completion_lock` after `cq_tail` (drain / non-blocking getevents harvest on
   `cq_tail` and would race).
 - Micro-opt in `p2p_get_io_events`: one `atomic_sub(total, …)` at unlock
   instead of per-event `atomic_dec` (single consumer under `ring_lock`).
 
-## UAPI `sub_ios` / `nr_ios`
+## UAPI batch fields removed
 
-Remain in the kernel for optional merged submissions. **NDS does not use
-cross-iocb merge**; each iocb uses `nr_ios=0`.
+`struct p2p_sub_io`, `p2p_io_param.sub_ios`, and `nr_ios` were deleted. Each
+`IOCTL_RW_FILE` is one logical I/O / one CQ event. Cross-iocb merge remains
+out of scope.
 
 ## Checklist
 

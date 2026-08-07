@@ -16,7 +16,7 @@ scheduling fix4 work.
   updates in [`completion_getevents.md`](completion_getevents.md) and
   [`nds_api.h`](../../file_p2p/nds_api.h).
 - **Out of scope:** Phase 2 (`completion_getevents.md` §7) CAS/sharded publish,
-  UAPI changes, NDS merge/`sub_ios` semantics, `nds_init` mutex (already
+  UAPI changes, NDS submit packaging, `nds_init` mutex (already
   documented in fix3).
 
 ## Verdict summary
@@ -72,7 +72,7 @@ io_lock:             completion_lock:              ring_lock (mutex):
 `io_list` on `p2p_batch` and `p2p_io_context` is never walked — only
 `INIT_LIST_HEAD`, `list_add_tail`, and `list_del_init` appear in
 [`dev.c`](../../dev.c). `io_cnt` caps accepted CQ slots (`P2P_CQ_SIZE`);
-`outstanding_events` counts logical I/Os (sub_ios) separately.
+`outstanding_events` counts logical I/Os separately.
 
 ---
 
@@ -225,8 +225,8 @@ if (io_err && !err) {
 }
 ```
 
-For a merged `io_ctx` with `nr_subs > 1`, getevents logs the same line once per
-expanded event; drain logs again in retire.
+For an `io_ctx` (`nr_subs == 1`), getevents logs one line per harvested
+event; drain logs again in retire.
 
 ### Target
 
@@ -277,7 +277,7 @@ change required unless product later demands AIO-identical blocking.
 
 - Phase 2: CAS or sharded `completion_lock`, mmap CQ.
 - Changing `completion_lock` irqsave or producer barrier rules.
-- UAPI or `p2p_io_param` / `sub_ios` layout changes.
+- UAPI or `p2p_io_param` layout changes.
 - Process-wide `nds_init` mutex (documented in fix3).
 - Removing `WARN_ON_ONCE` on CQ ring fullness.
 
