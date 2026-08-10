@@ -628,9 +628,9 @@ static void p2p_iov_iter_advance(struct p2p_iov_iter *iter, u64 bytes)
 	iter->iov_offset = 0;
 }
 
-static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
-		      unsigned int iov_nr, struct p2p_pa_iov **pa_iov,
-		      unsigned int *pa_iov_nr, struct p2p_pinned_pa **pinned_pa_out)
+static int get_pa_iov(int host_pid, const struct p2p_iov *iov, unsigned int iov_nr,
+		      struct p2p_pa_iov **pa_iov, unsigned int *pa_iov_nr,
+		      struct p2p_pinned_io_mem *pinned_mem)
 {
 	struct p2p_pinned_pa *pinned_pa;
 	struct p2p_pa_iov *new_pa_iov;
@@ -740,7 +740,10 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
 
 	*pa_iov = new_pa_iov;
 	*pa_iov_nr = new_pa_iov_nr;
-	*pinned_pa_out = pinned_pa;
+	*pinned_mem = (struct p2p_pinned_io_mem) {
+		.pinned = true,
+		.pinned_pa = pinned_pa,
+	};
 	return 0;
 
 free_pa_iov:
@@ -779,11 +782,9 @@ unlock:
 	return err;
 }
 
-static int get_registered_pa_iov(u64 handle, const struct p2p_iov *iov,
-				 unsigned int iov_nr,
-				 struct p2p_pa_iov **pa_iov_out,
-				 unsigned int *pa_iov_nr_out,
-				 struct p2p_registered_mem **mem_out)
+static int get_registered_pa_iov(u64 handle, const struct p2p_iov *iov, unsigned int iov_nr,
+				 struct p2p_pa_iov **pa_iov_out, unsigned int *pa_iov_nr_out,
+				 struct p2p_pinned_io_mem *pinned_mem)
 {
 	struct p2p_registered_mem *mem;
 	const struct p2p_iov_map *map;
@@ -853,7 +854,11 @@ static int get_registered_pa_iov(u64 handle, const struct p2p_iov *iov,
 
 	*pa_iov_out = pa_iov;
 	*pa_iov_nr_out = pa_iov_nr;
-	*mem_out = mem;
+	*pinned_mem = (struct p2p_pinned_io_mem) {
+		.pinned = true,
+		.reg_mem = true,
+		.registered_mem = mem,
+	};
 	return 0;
 
 free_pa_iov:
@@ -917,6 +922,7 @@ static struct p2p_io_context *new_io_ctx(u32 op, struct file *file, struct p2p_p
 	INIT_WORK(&io_ctx->finalize_work, p2p_finalize_io_work);
 #endif
 
+	pinned_mem->pinned = false;
 	return io_ctx;
 }
 
@@ -1467,7 +1473,7 @@ static int p2p_rw_file(struct p2p_batch *batch, void __user *arg)
 	struct file *reg_file = NULL;
 	struct block_device *bdev;
 	struct p2p_io_context *io_ctx;
-	struct p2p_pinned_io_mem pinned_mem = { };
+	struct p2p_pinned_io_mem pinned_mem;
 	struct topo *topo = NULL;
 	u64 data_size;
 	unsigned int pa_iov_nr;
@@ -1514,18 +1520,14 @@ static int p2p_rw_file(struct p2p_batch *batch, void __user *arg)
 		goto put_reg_file;
 	}
 
-	if (param.flags & P2P_IO_F_REGISTERED_MEM) {
-		pinned_mem.reg_mem = true;
-		err = get_registered_pa_iov(param.mem_handle, iov, param.iov_nr,
-					    &pa_iov, &pa_iov_nr,
-					    &pinned_mem.registered_mem);
-	} else {
-		err = get_pa_iov(param.host_pid, iov, param.iov_nr, &pa_iov,
-				 &pa_iov_nr, &pinned_mem.pinned_pa);
-	}
+	if (param.flags & P2P_IO_F_REGISTERED_MEM)
+		err = get_registered_pa_iov(param.mem_handle, iov, param.iov_nr, &pa_iov,
+					    &pa_iov_nr, &pinned_mem);
+	else
+		err = get_pa_iov(param.host_pid, iov, param.iov_nr, &pa_iov, &pa_iov_nr,
+				 &pinned_mem);
 	if (err)
 		goto put_topo;
-	pinned_mem.pinned = true;
 
 	io_ctx = new_io_ctx(param.op, reg_file, pa_iov, pa_iov_nr, &pinned_mem,
 			    data_size, param.user_data);
@@ -1535,7 +1537,6 @@ static int p2p_rw_file(struct p2p_batch *batch, void __user *arg)
 	}
 	reg_file = NULL;
 	pa_iov = NULL;
-	pinned_mem.pinned = false;
 
 	io_ctx->batch = batch;
 	if (atomic_inc_return(&batch->io_cnt) > P2P_CQ_SIZE) {
@@ -1543,7 +1544,7 @@ static int p2p_rw_file(struct p2p_batch *batch, void __user *arg)
 			p2p_wake_batch_waiters(batch);
 		free_io_ctx(io_ctx);
 		err = -EAGAIN;
-		goto put_topo;
+		goto free_pa_iov;
 	}
 	atomic_inc(&batch->outstanding_events);
 
@@ -1557,8 +1558,7 @@ free_pa_iov:
 	p2p_unpin_io_mem(&pinned_mem);
 	kvfree(pa_iov);
 put_topo:
-	if (topo)
-		topo_put(topo);
+	topo_put(topo);
 put_reg_file:
 	if (reg_file)
 		fput(reg_file);
