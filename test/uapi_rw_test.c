@@ -15,6 +15,7 @@
 #include "file_p2p_api.h"
 
 #define TEST_TOO_LARGE_IOV_SIZE ((2U << 30) + 512U)
+#define TEST_TOO_LARGE_EXTENT_SIZE (1ULL << 41)
 
 _Static_assert(sizeof(struct p2p_iov) == 16,
 	       "p2p_iov must remain a 16-byte UAPI record");
@@ -146,6 +147,11 @@ int main(int argc, char **argv)
 	if (err)
 		goto out;
 	iov.size = 512;
+	extent.fe_length = TEST_TOO_LARGE_EXTENT_SIZE;
+	err = expect("extent reaches 2 TiB", issue(dev_fd, param), -EINVAL);
+	if (err)
+		goto out;
+	extent.fe_length = 512;
 
 	param->file_fd = regular_fd;
 	err = expect("regular file write", issue(dev_fd, param),
