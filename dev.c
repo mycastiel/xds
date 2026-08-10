@@ -1708,6 +1708,8 @@ static void p2p_retire_cq_head(struct p2p_batch *batch, int *first_err)
 	 */
 	if (!io_ctx->pinned_mem.reg_mem)
 		p2p_unpin_io_mem(&io_ctx->pinned_mem);
+	/* Publish cq_head before returning its CQ slot to submitters. */
+	smp_mb__before_atomic();
 	atomic_dec(&batch->io_cnt);
 	free_io_ctx(io_ctx);
 }
