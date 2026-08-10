@@ -47,6 +47,7 @@
 #define P2P_MAX_IOV 65536U
 #define P2P_MAX_EXTENTS 1048576U
 #define P2P_MAX_IOV_SIZE (2U << 30)
+#define P2P_MAX_EXTENT_SIZE ((u64)U32_MAX << SECTOR_SHIFT)
 #define P2P_MIN_PAGE_SIZE (64U << 10)
 #define P2P_MEM_COOKIE_SHIFT 48
 #define P2P_MEM_ID_MASK GENMASK_ULL(P2P_MEM_COOKIE_SHIFT - 1, 0)
@@ -1334,7 +1335,7 @@ static int validate_io_data(const struct p2p_iov *iov, unsigned int iov_nr,
 	for (i = 0; i < ext_nr; i++) {
 		u64 end;
 
-		if (!extents[i].fe_length ||
+		if (!extents[i].fe_length || extents[i].fe_length > P2P_MAX_EXTENT_SIZE ||
 		    ((extents[i].fe_physical | extents[i].fe_length) & (SECTOR_SIZE - 1)) ||
 		    check_add_overflow(extents[i].fe_physical, extents[i].fe_length, &end) ||
 		    check_add_overflow(extent_size, extents[i].fe_length, &extent_size))
