@@ -24,7 +24,7 @@
 
 #include <linux/fiemap.h>
 
-#include "nds_api.h"
+#include "nds_api_internal.h"
 #include "p2p_dev_uapi.h"
 #include "p2p_common.h"
 
@@ -56,10 +56,6 @@ struct nds_reg_entry {
 	void *addr;
 	uint64_t size;
 	uint64_t handle;
-};
-
-struct nds_io_ctx {
-	int p2p_fd;
 };
 
 struct nds_state {

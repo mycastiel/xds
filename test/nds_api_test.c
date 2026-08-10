@@ -17,6 +17,8 @@
 #include <sys/ioctl.h>
 
 #include "nds_api.h"
+#include "nds_api_internal.h"
+#include "p2p_dev_uapi.h"
 
 #define STRESS_KIB (1UL << 10)
 #define STRESS_MIN_LENGTH (4UL << 10)
@@ -1300,6 +1302,7 @@ struct cq_race_context {
 	pthread_mutex_t error_lock;
 	struct va_allocator allocator;
 	struct nds_io_ctx *ctx;
+	int drain_fd;
 	unsigned int workers;
 	unsigned int iterations;
 	unsigned int expected;
@@ -1315,7 +1318,7 @@ struct cq_race_context {
 	bool allocator_initialized;
 	int stop_submit;
 	int submitters_done;
-	int destroy_done;
+	int drain_done;
 	unsigned int submitted;
 	unsigned int completed;
 	unsigned char *seen;
@@ -1326,7 +1329,7 @@ struct cq_race_context {
 	} *live_slots;
 	unsigned int live_slot_count;
 	int error;
-	int destroy_err;
+	int drain_err;
 };
 
 static bool cq_race_failed(struct cq_race_context *context)
@@ -1405,15 +1408,6 @@ static int cq_race_submit_one(struct cq_race_context *context,
 			return 0;
 		}
 		if (ret != -EAGAIN) {
-			if (__atomic_load_n(&context->stop_submit,
-					    __ATOMIC_ACQUIRE) ||
-			    __atomic_load_n(&context->destroy_done,
-					    __ATOMIC_ACQUIRE)) {
-				if (ret == -EBADF || ret == -EINVAL ||
-				    ret == -ENODEV || ret == -EIO ||
-				    ret == -ENXIO)
-					return -ECANCELED;
-			}
 			test->result = ret;
 			printf("api=nds-c case=%s va=0x%lx ret=%d expected=0\n",
 			       test->id, test->cmb_va, test->result);
@@ -1587,20 +1581,15 @@ static void *cq_race_reaper(void *argument)
 		if (__atomic_load_n(&context->submitters_done, __ATOMIC_ACQUIRE) &&
 		    completed >= submitted &&
 		    (!context->with_drain ||
-		     __atomic_load_n(&context->destroy_done, __ATOMIC_ACQUIRE) ||
+		     __atomic_load_n(&context->drain_done, __ATOMIC_ACQUIRE) ||
 		     completed >= expected))
 			break;
-		if (__atomic_load_n(&context->destroy_done, __ATOMIC_ACQUIRE) &&
+		if (__atomic_load_n(&context->drain_done, __ATOMIC_ACQUIRE) &&
 		    completed >= submitted)
 			break;
 
 		n = nds_io_getevents(context->ctx, 0, 64, events, &timeout);
 		if (n < 0) {
-			if (__atomic_load_n(&context->destroy_done,
-					    __ATOMIC_ACQUIRE) &&
-			    (n == -EBADF || n == -EINVAL || n == -ENODEV ||
-			     n == -EIO))
-				break;
 			cq_race_fail(context, n, "getevents", UINT_MAX);
 			break;
 		}
@@ -1700,7 +1689,7 @@ static void *cq_race_drainer(void *argument)
 		}
 		/*
 		 * Keep submit∥getevents∥drain racing for drain_overlap_ms
-		 * before stopping new submits and destroying.
+		 * before stopping new submits and issuing the drain.
 		 */
 		if (!cq_race_failed(context) && context->drain_overlap_ms) {
 			unsigned int left = context->drain_overlap_ms;
@@ -1718,7 +1707,7 @@ static void *cq_race_drainer(void *argument)
 	} else {
 		/*
 		 * Wait until every submit has been accepted so check_stress still
-		 * sees a full result set, then destroy while reaper may still
+		 * sees a full result set, then drain while the reaper may still
 		 * harvest.
 		 */
 		while (!cq_race_failed(context)) {
@@ -1735,18 +1724,17 @@ static void *cq_race_drainer(void *argument)
 
 	/* Widen the getevents∥drain race window slightly. */
 	usleep(1000);
-	context->destroy_err = nds_io_destroy_ctx(context->ctx);
-	context->ctx = NULL;
-	__atomic_store_n(&context->destroy_done, 1, __ATOMIC_RELEASE);
-	if (context->destroy_err)
-		cq_race_fail(context, context->destroy_err, "destroy/drain",
-			     UINT_MAX);
+	if (ioctl(context->drain_fd, IOCTL_DRAIN_IO) < 0)
+		context->drain_err = -errno;
+	__atomic_store_n(&context->drain_done, 1, __ATOMIC_RELEASE);
+	if (context->drain_err)
+		cq_race_fail(context, context->drain_err, "drain", UINT_MAX);
 	return NULL;
 }
 
 /*
  * Shared-ctx race: many submitters + one getevents reaper.
- * cq-race-drain also destroys (IOCTL_DRAIN_IO + close) while reaping.
+ * cq-race-drain issues IOCTL_DRAIN_IO on a duplicate fd while reaping.
  */
 static int run_cq_race(struct stress_case *tests, size_t count,
 		       unsigned int workers, unsigned int iterations,
@@ -1758,6 +1746,7 @@ static int run_cq_race(struct stress_case *tests, size_t count,
 		       unsigned int drain_overlap_ms)
 {
 	struct cq_race_context context = {
+		.drain_fd = -1,
 		.workers = workers,
 		.iterations = iterations,
 		.expected = workers * iterations,
@@ -1840,6 +1829,14 @@ static int run_cq_race(struct stress_case *tests, size_t count,
 		&(struct nds_io_ctx_param){ .max_io_cnt = 1024 }, &context.ctx);
 	if (err)
 		goto out;
+	if (with_drain) {
+		context.drain_fd = fcntl(context.ctx->p2p_fd,
+					 F_DUPFD_CLOEXEC, 0);
+		if (context.drain_fd < 0) {
+			err = -errno;
+			goto out;
+		}
+	}
 
 	err = pthread_create(&reaper_thread, NULL, cq_race_reaper, &context);
 	if (err) {
@@ -1852,7 +1849,18 @@ static int run_cq_race(struct stress_case *tests, size_t count,
 		err = pthread_create(&drain_thread, NULL, cq_race_drainer,
 				     &context);
 		if (err) {
+			int join_err;
+
 			err = -err;
+			pthread_mutex_lock(&context.gate.lock);
+			context.gate.abort = true;
+			pthread_cond_broadcast(&context.gate.cond);
+			pthread_mutex_unlock(&context.gate.lock);
+			join_err = pthread_join(reaper_thread, NULL);
+			if (join_err)
+				fprintf(stderr, "cq-race reaper join failed: %d\n",
+					join_err);
+			reaper_started = false;
 			goto out;
 		}
 		drain_started = true;
@@ -1956,6 +1964,8 @@ static int run_cq_race(struct stress_case *tests, size_t count,
 	       context.drain_overlap_ms);
 
 out:
+	if (context.drain_fd >= 0)
+		close(context.drain_fd);
 	if (context.ctx)
 		nds_io_destroy_ctx(context.ctx);
 	if (registered) {

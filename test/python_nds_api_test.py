@@ -3,6 +3,7 @@
 import argparse
 import csv
 import errno
+import fcntl
 import os
 import sys
 import threading
@@ -708,7 +709,7 @@ class CqRaceContext:
         self.error_lock = threading.Lock()
         self.error: Optional[BaseException] = None
         self.submitters_done = False
-        self.destroy_done = False
+        self.drain_done = False
         self.stop_submit = False
         self.submitted = 0
         self.completed = 0
@@ -720,7 +721,8 @@ class CqRaceContext:
         )
         self.live_slots_lock = threading.Lock()
         self.ctx: Optional[object] = None
-        self.destroy_err = 0
+        self.drain_fd: Optional[int] = None
+        self.drain_err = 0
 
     def failed(self) -> bool:
         with self.error_lock:
@@ -749,12 +751,19 @@ def join_cq_race_thread(thread: threading.Thread, role: str) -> None:
         )
 
 
+def close_cq_race_context(context: CqRaceContext) -> None:
+    if context.drain_fd is not None:
+        os.close(context.drain_fd)
+        context.drain_fd = None
+    if context.ctx is not None:
+        destroy_ctx(context.ctx)
+        context.ctx = None
+
+
 def cq_race_submit_one(
     context: CqRaceContext, test: StressCase, user_data: int
 ) -> None:
     if context.ctx is None:
-        if context.stop_submit or context.destroy_done:
-            raise InterruptedError(f"{test.case_id}: stop_submit")
         raise RuntimeError(f"{test.case_id}: ctx not open")
     tries = 0
     while True:
@@ -785,15 +794,6 @@ def cq_race_submit_one(
             )
             return
         if ret != -errno.EAGAIN:
-            if context.stop_submit or context.destroy_done:
-                if ret in (
-                    -errno.EBADF,
-                    -errno.EINVAL,
-                    -errno.ENODEV,
-                    -errno.EIO,
-                    -errno.ENXIO,
-                ):
-                    raise InterruptedError(f"{test.case_id}: stop_submit")
             test.result = ret
             print(
                 f"api=nds-python case={test.case_id} va=0x{test.cmb_va:x} "
@@ -921,35 +921,21 @@ def cq_race_reaper(context: CqRaceContext) -> None:
             and completed >= submitted
             and (
                 not context.with_drain
-                or context.destroy_done
+                or context.drain_done
                 or completed >= context.expected
             )
         ):
             break
-        if context.destroy_done and completed >= submitted:
+        if context.drain_done and completed >= submitted:
             break
 
-        ctx = context.ctx
-        if ctx is None:
-            if context.destroy_done:
-                break
-            time.sleep(0.0001)
-            continue
-
         events = nds.io_getevents(
-            ctx,
+            context.ctx,
             0,
             64,
             CQ_RACE_GETEVENTS_TIMEOUT_SEC,
         )
         if isinstance(events, int):
-            if context.destroy_done and events in (
-                -errno.EBADF,
-                -errno.EINVAL,
-                -errno.ENODEV,
-                -errno.EIO,
-            ):
-                break
             context.fail(RuntimeError(f"nds.io_getevents returned {events}"))
             break
         for user_data, res in events:
@@ -1040,15 +1026,17 @@ def cq_race_drainer(context: CqRaceContext) -> None:
     if context.failed():
         return
     time.sleep(0.001)
-    if context.ctx is None:
-        context.fail(RuntimeError("drainer: ctx already closed"))
+    if context.drain_fd is None:
+        context.fail(RuntimeError("drainer: drain fd not open"))
         return
-    context.destroy_err = nds.io_destroy_ctx(context.ctx)
-    context.ctx = None
-    context.destroy_done = True
-    if context.destroy_err:
+    try:
+        fcntl.ioctl(context.drain_fd, nds._IOCTL_DRAIN_IO)
+    except OSError as error:
+        context.drain_err = -error.errno
+    context.drain_done = True
+    if context.drain_err:
         context.fail(
-            RuntimeError(f"nds.io_destroy_ctx returned {context.destroy_err}")
+            RuntimeError(f"IOCTL_DRAIN_IO returned {context.drain_err}")
         )
 
 
@@ -1095,6 +1083,15 @@ def run_cq_race(
     )
 
     context.ctx = new_ctx(1024)
+    if with_drain:
+        context.drain_fd = nds._io_dup_fd_for_test(context.ctx)
+        if context.drain_fd < 0:
+            error = RuntimeError(
+                f"duplicate context fd returned {context.drain_fd}"
+            )
+            close_cq_race_context(context)
+            raise error
+
     reaper = threading.Thread(target=cq_race_reaper, args=(context,))
     drainer: Optional[threading.Thread] = None
     submitters = [
@@ -1123,28 +1120,33 @@ def run_cq_race(
         context.start_workers(0)
         for thread in started:
             thread.join()
+        close_cq_race_context(context)
         raise
 
-    if context.error is not None:
-        raise context.error
-
+    error = context.error
     with context.counter_lock:
         submitted = context.submitted
         completed = context.completed
-    if completed > submitted:
-        raise RuntimeError(f"completed ({completed}) exceeds submitted ({submitted})")
-    if not with_drain and completed != submitted:
-        raise RuntimeError(
+    if error is None and completed > submitted:
+        error = RuntimeError(
+            f"completed ({completed}) exceeds submitted ({submitted})"
+        )
+    if error is None and not with_drain and completed != submitted:
+        error = RuntimeError(
             f"cq-race incomplete: completed={completed} submitted={submitted}"
         )
-    if context.require_full_results and submitted != context.expected:
-        raise RuntimeError(
+    if (
+        error is None
+        and context.require_full_results
+        and submitted != context.expected
+    ):
+        error = RuntimeError(
             f"cq-race incomplete submits: {submitted}/{context.expected}"
         )
 
-    if context.ctx is not None:
-        destroy_ctx(context.ctx)
-        context.ctx = None
+    close_cq_race_context(context)
+    if error is not None:
+        raise error
 
     if context.require_full_results:
         write_stress_results(result_manifest, tests)
