@@ -367,6 +367,8 @@ static void usage(const char *argv0)
 		"  --io-max BYTES      max I/O size (default 128K)\n"
 		"  --queue-depth N     outstanding I/Os (default 64)\n"
 		"  --passes N          repeat total-size this many times (default 1)\n"
+		"  --start-offset N    first target byte (default 0)\n"
+		"  --region-size N     sequential/random region size (default: to EOF)\n"
 		"  --sequential        sequential offsets, wrap at EOF (default)\n"
 		"  --random            random offsets within target\n"
 		"  --no-register-mem   one-shot VAs (default: register CMB/HBM window)\n"
@@ -394,6 +396,8 @@ int main(int argc, char **argv)
 		{ "io-max", required_argument, NULL, 'I' },
 		{ "queue-depth", required_argument, NULL, 'q' },
 		{ "passes", required_argument, NULL, 'p' },
+		{ "start-offset", required_argument, NULL, 'O' },
+		{ "region-size", required_argument, NULL, 'L' },
 		{ "sequential", no_argument, NULL, 'S' },
 		{ "random", no_argument, NULL, 'R' },
 		{ "no-register-mem", no_argument, NULL, 'N' },
@@ -418,6 +422,9 @@ int main(int argc, char **argv)
 	uint32_t io_max = DEFAULT_IO_MAX;
 	uint32_t qd = DEFAULT_QD;
 	unsigned int passes = 1;
+	uint64_t region_start = 0;
+	uint64_t region_size = 0;
+	uint64_t region_end;
 	unsigned int barrier_world = 1;
 	bool random_off = false;
 	bool register_mem = true;
@@ -465,7 +472,8 @@ int main(int argc, char **argv)
 	int crc_ok = 1;
 	bool stop_issue = false;
 
-	while ((c = getopt_long(argc, argv, "t:f:a:d:A:T:U:i:I:q:p:SRNVXEB:W:h",
+	while ((c = getopt_long(argc, argv,
+				"t:f:a:d:A:T:U:i:I:q:p:O:L:SRNVXEB:W:h",
 				opts, NULL)) != -1) {
 		switch (c) {
 		case 't':
@@ -501,6 +509,12 @@ int main(int argc, char **argv)
 			break;
 		case 'p':
 			passes = (unsigned int)strtoul(optarg, NULL, 0);
+			break;
+		case 'O':
+			region_start = parse_size(optarg);
+			break;
+		case 'L':
+			region_size = parse_size(optarg);
 			break;
 		case 'S':
 			random_off = false;
@@ -570,6 +584,18 @@ int main(int argc, char **argv)
 	target_bytes = align_down(target_size_bytes(file_fd), SECTOR);
 	if (target_bytes < io_min)
 		die("target too small", -ENOSPC);
+	if ((region_start & (SECTOR - 1)) || region_start >= target_bytes)
+		die("start-offset must be 512B-aligned and within target",
+		    -EINVAL);
+	if (!region_size)
+		region_size = target_bytes - region_start;
+	if ((region_size & (SECTOR - 1)) || region_size > target_bytes ||
+	    region_start > target_bytes - region_size)
+		die("region-size must be 512B-aligned and within target", -EINVAL);
+	if (region_size < io_max)
+		die("region-size smaller than io-max", -ENOSPC);
+	region_end = region_start + region_size;
+	next_off = region_start;
 	if (!use_runtime) {
 		if (total_size > UINT64_MAX / passes)
 			die("total-size * passes overflow", -EOVERFLOW);
@@ -630,9 +656,11 @@ int main(int argc, char **argv)
 		       target_bytes, target_bytes / (1024.0 * 1024.0),
 		       total_size, passes, goal, goal / (1024.0 * 1024.0));
 	printf("io_size=%u..%u queue_depth=%u register_mem=%d pattern=%s "
+	       "region=%" PRIu64 "..%" PRIu64 " "
 	       "verify_crc=%d verify_each=%d\n",
 	       io_min, io_max, qd, register_mem,
-	       random_off ? "random" : "sequential", verify_crc ? 1 : 0,
+	       random_off ? "random" : "sequential", region_start, region_end,
+	       verify_crc ? 1 : 0,
 	       verify_each ? 1 : 0);
 	fflush(stdout);
 
@@ -687,22 +715,23 @@ int main(int argc, char **argv)
 
 			if (random_off) {
 				uint64_t max_off =
-					align_down(target_bytes - len, SECTOR);
+					align_down(region_size - len, SECTOR);
 
 				rng = rng * 1103515245u + 12345u;
 				if (max_off)
-					off = ((uint64_t)rng * SECTOR) %
+					off = region_start +
+					      ((uint64_t)rng * SECTOR) %
 					      (max_off + SECTOR);
 				else
-					off = 0;
+					off = region_start;
 				off = align_down(off, SECTOR);
 			} else {
-				if (next_off + len > target_bytes)
-					next_off = 0;
+				if (next_off + len > region_end)
+					next_off = region_start;
 				off = next_off;
 				next_off += len;
-				if (next_off >= target_bytes)
-					next_off = 0;
+				if (next_off >= region_end)
+					next_off = region_start;
 			}
 
 			memset(&slots[slot].cb, 0, sizeof(slots[slot].cb));
@@ -831,12 +860,14 @@ int main(int argc, char **argv)
 	}
 
 	printf("RESULT pattern=%s register_mem=%d io_min=%u io_max=%u qd=%u "
+	       "region_start=%" PRIu64 " region_size=%" PRIu64 " "
 	       "verify_crc=%d verify_each=%d crc_checked=%" PRIu64
 	       " crc_ok=%d bytes=%" PRIu64 " ios=%" PRIu64
 	       " sec=%.6f mib_s=%.2f iops=%.0f proc_cpu_pct=%.2f "
 	       "sys_cpu_pct=%.2f\n",
 	       random_off ? "random" : "sequential", register_mem ? 1 : 0,
-	       io_min, io_max, qd, verify_crc ? 1 : 0, verify_each ? 1 : 0,
+	       io_min, io_max, qd, region_start, region_size,
+	       verify_crc ? 1 : 0, verify_each ? 1 : 0,
 	       crc_checked, crc_ok, completed, ios, sec, mib_s, ios / sec,
 	       proc_cpu_pct, sys_cpu_pct);
 

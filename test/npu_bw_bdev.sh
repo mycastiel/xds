@@ -7,7 +7,8 @@
 # this script:
 #   - reads a block/char device directly (--target /dev/md0)
 #   - does NOT create or overwrite any files (read-only traffic)
-#   - all NPUs share the same target (concurrent = multi-job on one bdev)
+#   - divides the device into one disjoint contiguous region per NPU
+#   - each NPU reads sequentially and wraps only inside its own region
 #
 # nds_bw_bench already accepts block devices (BLKGETSIZE64 + O_DIRECT pread).
 #
@@ -53,6 +54,8 @@ VERIFY_EACH=0
 RUNTIME=
 OUTDIR=
 SKIP_BUILD=0
+TARGET_BYTES=0
+REGION_BYTES=0
 
 die() { printf 'npu_bw_bdev: %s\n' "$*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*" >&2; }
@@ -63,7 +66,9 @@ usage()
 Usage: npu_bw_bdev.sh --target DEV --npu-devices IDS [options]
 
 Read bandwidth matrix against a shared block device (fio-like). No file
-create/poison. Old per-file workflow remains in npu_bw_matrix.sh.
+create/poison. The device is split into equal per-NPU regions so sequential
+readers do not all start at LBA 0. Old per-file workflow remains in
+npu_bw_matrix.sh.
 
 Required:
   --target DEV            block device to read (e.g. /dev/md0, /dev/nvme0n1)
@@ -115,6 +120,37 @@ count_csv()
 	printf '%s\n' "$n"
 }
 
+npu_rank()
+{
+	local wanted=$1
+	local n=0 x
+
+	for x in $(split_csv "$NPU_DEVICES"); do
+		if [[ $x == "$wanted" ]]; then
+			printf '%s\n' "$n"
+			return 0
+		fi
+		n=$((n + 1))
+	done
+	die "NPU $wanted is not in --npu-devices"
+}
+
+setup_regions()
+{
+	local n_npus
+	local align=$((1 << 20))
+
+	n_npus=$(count_csv "$NPU_DEVICES")
+	(( n_npus > 0 )) || die "empty --npu-devices"
+	TARGET_BYTES=$(blockdev --getsize64 "$TARGET") ||
+		die "cannot get target size via blockdev: $TARGET"
+	# Align each equal region down to 1 MiB. Any small tail is unused.
+	REGION_BYTES=$(( (TARGET_BYTES / n_npus / align) * align ))
+	(( REGION_BYTES > 0 )) ||
+		die "target too small for $n_npus per-NPU regions"
+	log "target_bytes=$TARGET_BYTES npus=$n_npus region_bytes=$REGION_BYTES"
+}
+
 build_bench()
 {
 	[[ $SKIP_BUILD == 1 ]] && return 0
@@ -159,8 +195,11 @@ run_one_bench()
 	local npu=$1 bs=$2 qd=$3 mem=$4 pattern=$5 logfile=$6
 	local barrier_dir=${7:-}
 	local barrier_world=${8:-1}
+	local rank start
 	local args=()
 
+	rank=$(npu_rank "$npu")
+	start=$((rank * REGION_BYTES))
 	args=(
 		--topology "$TOPOLOGY"
 		--target "$TARGET"
@@ -170,6 +209,8 @@ run_one_bench()
 		--io-max "$bs"
 		--queue-depth "$qd"
 		--passes "$PASSES"
+		--start-offset "$start"
+		--region-size "$REGION_BYTES"
 	)
 	if [[ -n $RUNTIME ]]; then
 		args+=(--runtime "$RUNTIME")
@@ -207,7 +248,7 @@ run_cell_sequential()
 
 	for npu in $(split_csv "$NPU_DEVICES"); do
 		logf=$OUTDIR/logs/npu${npu}.${pattern}.${bs}.qd${qd}.${mem}.log
-		log "npu=$npu bs=$bs qd=$qd mem=$mem pattern=$pattern target=$TARGET verify_each=$VERIFY_EACH"
+		log "npu=$npu region_rank=$(npu_rank "$npu") bs=$bs qd=$qd mem=$mem pattern=$pattern target=$TARGET verify_each=$VERIFY_EACH"
 		run_one_bench "$npu" "$bs" "$qd" "$mem" "$pattern" "$logf" || \
 			die "bench failed; see $logf"
 		parsed=$(parse_result_line <"$logf") || die "no RESULT in $logf"
@@ -267,7 +308,7 @@ run_cell_concurrent()
 	rm -rf -- "$barrier_dir"
 	mkdir -p "$barrier_dir"
 
-	log "CONCURRENT bs=$bs qd=$qd mem=$mem pattern=$pattern npus=$NPU_DEVICES target=$TARGET verify_each=$VERIFY_EACH"
+	log "CONCURRENT bs=$bs qd=$qd mem=$mem pattern=$pattern npus=$NPU_DEVICES target=$TARGET region_bytes=$REGION_BYTES verify_each=$VERIFY_EACH"
 
 	for npu in $(split_csv "$NPU_DEVICES"); do
 		logf=$OUTDIR/logs/npu${npu}.${pattern}.${bs}.qd${qd}.${mem}.log
@@ -356,6 +397,8 @@ write_summary()
 		printf 'topology=%s target=%s total=%s passes=%s runtime=%s verify_each=%s\n' \
 			"$TOPOLOGY" "$TARGET" "$TOTAL_SIZE" "$PASSES" \
 			"${RUNTIME:-none}" "$VERIFY_EACH"
+		printf 'target_bytes=%s per_npu_region_bytes=%s (disjoint sequential regions)\n' \
+			"$TARGET_BYTES" "$REGION_BYTES"
 		printf 'npus=%s bs=%s qd=%s mem=%s pattern=%s concurrent=%s\n' \
 			"$NPU_DEVICES" "$BS_LIST" "$QD_LIST" "$MEM_MODE" "$PATTERN" "$CONCURRENT"
 		printf 'Note: shared --target (no poison); concurrent ALL io_overlap_* = sum(bytes)/max(bench_sec).\n\n'
@@ -402,8 +445,7 @@ main()
 	fi
 	[[ -b $TOPOLOGY || -c $TOPOLOGY ]] || \
 		die "topology $TOPOLOGY is not a block/char device"
-	[[ -b $TARGET || -c $TARGET ]] || \
-		die "target $TARGET is not a block/char device"
+	[[ -b $TARGET ]] || die "target $TARGET is not a block device"
 	[[ -r $TARGET ]] || die "target $TARGET is not readable"
 	[[ -c /dev/p2p_device ]] || die "/dev/p2p_device missing; load p2p_dev first"
 	[[ -n ${ASCEND_ACL_LIB:-} || -n ${ASCEND_HOME:-} || -n ${ASCEND_AICPU_PATH:-} || -n ${LD_LIBRARY_PATH:-} ]] || \
@@ -418,6 +460,7 @@ main()
 
 	build_bench
 	[[ -x $BENCH ]] || die "nds_bw_bench not found at $BENCH (make -C test nds_bw_bench)"
+	setup_regions
 
 	for bs in $(split_csv "$BS_LIST"); do
 		for qd in $(split_csv "$QD_LIST"); do
