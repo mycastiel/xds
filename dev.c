@@ -1550,7 +1550,8 @@ static int p2p_issue_prepared(struct p2p_batch *batch,
 
 	io_ctx->batch = batch;
 	if (atomic_inc_return(&batch->io_cnt) > P2P_CQ_SIZE) {
-		atomic_dec(&batch->io_cnt);
+		if (atomic_dec_and_test(&batch->io_cnt))
+			p2p_wake_batch_waiters(batch);
 		/* Leave @reg_file and @subs ownership with the caller. */
 		io_ctx->file = NULL;
 		io_ctx->subs = NULL;
