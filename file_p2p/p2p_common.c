@@ -22,7 +22,6 @@
 
 #define P2P_SECTOR_SIZE 512U
 #define P2P_SECTORS_PER_KB (1024U / P2P_SECTOR_SIZE)
-#define P2P_DEFAULT_BLOCK_SIZE 4096U
 #define P2P_DM_CONTROL "/dev/mapper/control"
 #define P2P_DM_BUFFER_SIZE (16U << 10)
 #define P2P_UNSUPPORTED_FIEMAP_FLAGS \
@@ -658,23 +657,6 @@ out:
 	return err;
 }
 
-static int is_power_of_two(unsigned int value)
-{
-	return value && !(value & (value - 1));
-}
-
-static unsigned int get_fiemap_block_size(int file_fd)
-{
-	int block_size = 0;
-
-	if (!ioctl(file_fd, FIGETBSZ, &block_size) &&
-	    block_size >= (int)P2P_SECTOR_SIZE &&
-	    is_power_of_two((unsigned int)block_size))
-		return block_size;
-
-	return P2P_DEFAULT_BLOCK_SIZE;
-}
-
 static unsigned long long align_down_u64(unsigned long long value,
 					 unsigned int alignment)
 {
@@ -793,7 +775,7 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat,
 	if (!S_ISREG(file_stat->st_mode))
 		return -EINVAL;
 
-	block_size = get_fiemap_block_size(file_fd);
+	block_size = file_stat->st_blksize;
 	err = calc_fiemap_extent_count(offset, size, block_size, &max_num);
 	if (err)
 		return err;
