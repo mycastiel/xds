@@ -74,6 +74,7 @@ struct stress_case {
 	char *id;
 	char *path;
 	int fd;
+	bool owns_fd;
 	unsigned long file_size;
 	unsigned long file_offset;
 	unsigned long length;
@@ -314,7 +315,7 @@ static void free_stress_cases(struct stress_case *tests, size_t count)
 	for (i = 0; i < count; i++) {
 		free(tests[i].id);
 		free(tests[i].path);
-		if (tests[i].fd >= 0)
+		if (tests[i].owns_fd && tests[i].fd >= 0)
 			close(tests[i].fd);
 	}
 	free(tests);
@@ -327,6 +328,7 @@ static int append_stress_case(struct stress_case **tests, size_t *count,
 	struct stress_case *test;
 	struct stress_case *new_tests;
 	size_t new_capacity;
+	size_t i;
 	int err;
 
 	if (*count == *capacity) {
@@ -355,12 +357,21 @@ static int append_stress_case(struct stress_case **tests, size_t *count,
 		free(test->path);
 		return -ENOMEM;
 	}
-	test->fd = open(test->path, O_RDONLY | O_DIRECT);
-	if (test->fd < 0) {
-		err = -errno;
-		free(test->id);
-		free(test->path);
-		return err;
+	for (i = 0; i < *count; i++) {
+		if (!strcmp((*tests)[i].path, test->path)) {
+			test->fd = (*tests)[i].fd;
+			break;
+		}
+	}
+	if (i == *count) {
+		test->fd = open(test->path, O_RDONLY | O_DIRECT);
+		if (test->fd < 0) {
+			err = -errno;
+			free(test->id);
+			free(test->path);
+			return err;
+		}
+		test->owns_fd = true;
 	}
 	if (!err)
 		err = parse_ulong(fields[4], &test->file_size);
@@ -374,7 +385,8 @@ static int append_stress_case(struct stress_case **tests, size_t *count,
 			line_nr);
 		free(test->id);
 		free(test->path);
-		close(test->fd);
+		if (test->owns_fd)
+			close(test->fd);
 		return err ? err : -EINVAL;
 	}
 
@@ -1584,8 +1596,7 @@ static void *cq_race_reaper(void *argument)
 		     __atomic_load_n(&context->drain_done, __ATOMIC_ACQUIRE) ||
 		     completed >= expected))
 			break;
-		if (__atomic_load_n(&context->drain_done, __ATOMIC_ACQUIRE) &&
-		    completed >= submitted)
+		if (__atomic_load_n(&context->drain_done, __ATOMIC_ACQUIRE))
 			break;
 
 		n = nds_io_getevents(context->ctx, 0, 64, events, &timeout);
@@ -1894,22 +1905,46 @@ static int run_cq_race(struct stress_case *tests, size_t count,
 	for (i = 0; i < created; i++) {
 		int join_err = cq_race_timedjoin(submit_threads[i], "submitter");
 
-		if (join_err && !err)
-			err = join_err;
+		if (join_err) {
+			int wait_err;
+
+			cq_race_fail(&context, join_err, "submitter join", i);
+			wait_err = pthread_join(submit_threads[i], NULL);
+			if (wait_err && !err)
+				err = -wait_err;
+			else if (!err)
+				err = join_err;
+		}
 	}
 	__atomic_store_n(&context.submitters_done, 1, __ATOMIC_RELEASE);
 
 	if (drain_started) {
 		int join_err = cq_race_timedjoin(drain_thread, "drainer");
 
-		if (join_err && !err)
-			err = join_err;
+		if (join_err) {
+			int wait_err;
+
+			cq_race_fail(&context, join_err, "drainer join", UINT_MAX);
+			wait_err = pthread_join(drain_thread, NULL);
+			if (wait_err && !err)
+				err = -wait_err;
+			else if (!err)
+				err = join_err;
+		}
 	}
 	if (reaper_started) {
 		int join_err = cq_race_timedjoin(reaper_thread, "reaper");
 
-		if (join_err && !err)
-			err = join_err;
+		if (join_err) {
+			int wait_err;
+
+			cq_race_fail(&context, join_err, "reaper join", UINT_MAX);
+			wait_err = pthread_join(reaper_thread, NULL);
+			if (wait_err && !err)
+				err = -wait_err;
+			else if (!err)
+				err = join_err;
+		}
 	}
 
 	if (created != workers) {
@@ -1919,7 +1954,8 @@ static int run_cq_race(struct stress_case *tests, size_t count,
 	}
 
 	pthread_mutex_lock(&context.error_lock);
-	err = context.error;
+	if (!err)
+		err = context.error;
 	pthread_mutex_unlock(&context.error_lock);
 	if (err)
 		goto out;

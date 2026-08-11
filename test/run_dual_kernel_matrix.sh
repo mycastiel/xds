@@ -26,10 +26,12 @@ GUEST_DEV_2=${XDS_GUEST_DEV_2:?set XDS_GUEST_DEV_2 in "$CONFIG_FILE"}
 KERNEL_BASE_VERSION=${XDS_KERNEL_BASE_VERSION:-6.6.0}
 BUILD_KERNELS=${XDS_MATRIX_BUILD_KERNELS:-0}
 MATRIX_STRESS_ITERATIONS=16
+SSH_CONFIG=${XDS_SSH_CONFIG:-/dev/null}
 
 readonly REMOTE_TARGET=$REMOTE_USER@$REMOTE_HOST
 readonly -a REMOTE_SSH=(
 	ssh
+	-F "$SSH_CONFIG"
 	-p "$REMOTE_PORT"
 	-o BatchMode=yes
 	-o ConnectTimeout=20
@@ -69,8 +71,8 @@ sync_repo()
 	log "syncing $REPO_ROOT to the guest"
 	"${REMOTE_SSH[@]}" mkdir -p /tmp/xds-sync
 	printf -v ssh_transport \
-		'ssh -p %q -o BatchMode=yes -o ConnectTimeout=20 ' \
-		"$REMOTE_PORT"
+		'ssh -F %q -p %q -o BatchMode=yes -o ConnectTimeout=20 ' \
+		"$SSH_CONFIG" "$REMOTE_PORT"
 	ssh_transport+='-o StrictHostKeyChecking=accept-new'
 	rsync -az --delete \
 		--exclude=.git \
@@ -196,16 +198,12 @@ variant=$2
 kasan_config=$(
 	grep -E '^#?[[:space:]]*CONFIG_KASAN=' "$ksrc/.config" || true
 )
-kasan_dmesg=$(
-	dmesg 2>/dev/null |
-		grep -i 'KernelAddressSanitizer initialized' || true
-)
 
 printf 'UNAME=%s\n' "$(uname -a)"
 printf 'VERSION=%s\n' "$(uname -r)"
 printf 'VARIANT=%s\n' "$variant"
 printf 'CMDLINE=%s\n' "$(tr '\n' ' ' </proc/cmdline)"
-if [[ -n $kasan_dmesg ]]; then
+if [[ $kasan_config == CONFIG_KASAN=y ]]; then
 	printf 'KASAN_ENABLED=true\n'
 	printf 'KASAN_MODE=generic\n'
 else

@@ -20,6 +20,7 @@ export XDS_GUEST_KSRC=/home/xds/oe_knl
 export XDS_GUEST_DEV_1=/dev/nvme0n1
 export XDS_GUEST_DEV_2=/dev/nvme0n2
 export XDS_RESULT_DIR=$WORK_DIR/results
+export XDS_SSH_CONFIG=/tmp/xds-ssh-config
 
 # shellcheck source=run_dual_kernel_matrix.sh
 source "$SCRIPT_DIR/run_dual_kernel_matrix.sh"
@@ -76,8 +77,17 @@ test_running_config_is_restored()
 		"$SCRIPT_DIR/run_dual_kernel_matrix.sh"
 }
 
+test_ssh_config_is_honored()
+{
+	[[ ${REMOTE_SSH[1]} == -F ]]
+	[[ ${REMOTE_SSH[2]} == "$XDS_SSH_CONFIG" ]]
+	grep -Fq "'ssh -F %q -p %q" \
+		"$SCRIPT_DIR/run_dual_kernel_matrix.sh"
+}
+
 test_copy_artifacts
 test_copy_collision
 test_suite_failure_propagation
 test_running_config_is_restored
+test_ssh_config_is_honored
 printf 'dual-kernel runner tests passed\n'

@@ -244,10 +244,6 @@ main()
 		--directory "$data_dir" --manifest "$workload" \
 		--workers "$STRESS_WORKERS" --iterations "$STRESS_ITERATIONS" \
 		--seed "$STRESS_SEED" --mode "$STRESS_MODE" --topology "$TARGET"
-	python3 "$SCRIPT_DIR/generate_stress_workload.py" \
-		--directory "$data_dir/cq-race" --manifest "$cq_workload" \
-		--workers "$CQ_RACE_WORKERS" --iterations "$CQ_RACE_ITERATIONS" \
-		--seed "$STRESS_SEED" --mode "$STRESS_MODE" --topology "$TARGET"
 	sync
 
 	for api in c python nds-c nds-python; do
@@ -255,6 +251,12 @@ main()
 			run_stress_api "$api" "$workload" "$memory_mode"
 		done
 	done
+	rm -rf "$data_dir"
+	python3 "$SCRIPT_DIR/generate_stress_workload.py" \
+		--directory "$data_dir" --manifest "$cq_workload" \
+		--workers "$CQ_RACE_WORKERS" --iterations "$CQ_RACE_ITERATIONS" \
+		--seed "$STRESS_SEED" --mode "$STRESS_MODE" --topology "$TARGET"
+	sync
 	for mode in cq-race cq-race-drain; do
 		for api in nds-c nds-python; do
 			for memory_mode in normal registered; do

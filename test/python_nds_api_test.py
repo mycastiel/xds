@@ -110,16 +110,22 @@ def load_stress_manifest(path: Path) -> List[StressCase]:
 
 
 def open_case_fds(tests: Sequence) -> None:
+    opened = {}
     for test in tests:
         if test.fd is None:
-            test.fd = os.open(test.path, os.O_RDONLY | os.O_DIRECT)
+            if test.path not in opened:
+                opened[test.path] = os.open(
+                    test.path, os.O_RDONLY | os.O_DIRECT
+                )
+            test.fd = opened[test.path]
 
 
 def close_case_fds(tests: Sequence) -> None:
+    opened = {test.fd for test in tests if test.fd is not None}
     for test in tests:
-        if test.fd is not None:
-            os.close(test.fd)
-            test.fd = None
+        test.fd = None
+    for fd in opened:
+        os.close(fd)
 
 
 def new_ctx(max_io_cnt: int):
@@ -926,7 +932,7 @@ def cq_race_reaper(context: CqRaceContext) -> None:
             )
         ):
             break
-        if context.drain_done and completed >= submitted:
+        if context.drain_done:
             break
 
         events = nds.io_getevents(
@@ -1116,7 +1122,9 @@ def run_cq_race(
         if drainer is not None:
             join_cq_race_thread(drainer, "drainer")
         join_cq_race_thread(reaper, "reaper")
-    except BaseException:
+    except BaseException as error:
+        context.fail(error)
+        context.stop_submit = True
         context.start_workers(0)
         for thread in started:
             thread.join()
