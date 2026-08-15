@@ -138,7 +138,7 @@ int main(int argc, char **argv)
 		die("nds_io_destroy_ctx", err);
 	ctx = NULL;
 
-	err = nds_unregister_mem((void *)(uintptr_t)hbm_va);
+	err = nds_unregister_mem((void *)(uintptr_t)hbm_va, 0, 0);
 	if (err)
 		die("nds_unregister_mem", err);
 

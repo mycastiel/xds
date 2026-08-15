@@ -873,7 +873,7 @@ int main(int argc, char **argv)
 
 	nds_io_destroy_ctx(ctx);
 	if (register_mem)
-		nds_unregister_mem((void *)(uintptr_t)cmb_va);
+		nds_unregister_mem((void *)(uintptr_t)cmb_va, 0, 0);
 	nds_exit();
 	xds_hbm_free(&hbm);
 	close(file_fd);

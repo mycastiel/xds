@@ -374,7 +374,7 @@ int main(int argc, char **argv)
 
 	nds_io_destroy_ctx(ctx);
 	if (register_mem)
-		nds_unregister_mem(hbm.addr);
+		nds_unregister_mem(hbm.addr, 0, 0);
 	nds_exit();
 	xds_hbm_free(&hbm);
 	free(file_buf);

@@ -41,8 +41,8 @@ _Static_assert(offsetof(struct nds_io_vec, buf_addr) ==
 	       "nds_io_vec field layout must match p2p_iov");
 _Static_assert(sizeof(struct nds_io_event) == sizeof(struct p2p_io_event),
 	       "nds_io_event must match p2p_io_event for zero-copy getevents");
-_Static_assert(sizeof(struct nds_io_event) == 32,
-	       "nds_io_event must remain a 32-byte completion record");
+_Static_assert(sizeof(struct nds_io_event) == 48,
+	       "nds_io_event / p2p_io_event are user_data + res + reserved[4]");
 _Static_assert(offsetof(struct nds_io_event, user_data) ==
 		       offsetof(struct p2p_io_event, user_data) &&
 	       offsetof(struct nds_io_event, res) ==
@@ -206,11 +206,15 @@ int nds_register_mem(void *addr, uint64_t size, int flags)
 	return 0;
 }
 
-int nds_unregister_mem(void *addr)
+int nds_unregister_mem(void *addr, uint64_t size, int flags)
 {
 	struct nds_reg_entry *r, **prev;
 	struct p2p_mem_unregister_param up;
 	int ret = 0;
+
+	(void)size;
+	if (flags)
+		return -EINVAL;
 
 	pthread_mutex_lock(&g_state.reg_lock);
 	for (prev = &g_state.regs; *prev; prev = &(*prev)->next) {
@@ -427,7 +431,8 @@ static int nds_submit_one_iocb(struct nds_io_ctx *ctx,
 	int file_fd = cb->obj.fd;
 	int ret;
 
-	if (cb->reserved || cb->obj.reserved || file_fd < 0)
+	if (cb->reserved[0] || cb->reserved[1] || cb->obj.reserved ||
+	    file_fd < 0)
 		return -EINVAL;
 
 	ret = nds_iocb_to_io_param(cb, file_fd, &param, &exts);
@@ -491,7 +496,7 @@ int nds_io_getevents(struct nds_io_ctx *ctx, int min_nr,
 		return -EINVAL;
 
 	/*
-	 * nds_io_event is binary-identical to p2p_io_event (32B); pass the
+	 * nds_io_event is binary-identical to p2p_io_event (48B); pass the
 	 * caller's buffer straight to the ioctl — no intermediate copy.
 	 */
 	param.min_nr = min_nr;
