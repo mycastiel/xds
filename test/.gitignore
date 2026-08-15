@@ -8,3 +8,5 @@
 /rw_api_test
 /uapi_rw_test
 /remote_test.env
+/nds_bw_bench
+/nds_crc_verify

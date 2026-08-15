@@ -16,17 +16,23 @@ struct p2p_iov {
 #define P2P_IO_READ 0U
 #define P2P_IO_WRITE 1U
 
+/*
+ * Fixed-size request; iov and extents are userspace pointers.
+ * One IOCTL_RW_FILE is one logical I/O covering all iov/extents and
+ * completing as one event carrying user_data.
+ */
 struct p2p_io_param {
 	unsigned int op;
 	unsigned int flags;
 	int file_fd;
 	int host_pid;
 	__u64 mem_handle;
-	__u64 user_data;          /* echo'd in completion event */
+	__u64 user_data;          /* echo'd in the completion event */
 	__u64 iov;                /* userspace pointer to struct p2p_iov[] */
 	unsigned int iov_nr;
 	unsigned int ext_nr;
-	struct fiemap_extent extents[];
+	__u64 extents;            /* userspace pointer to struct fiemap_extent[] */
+	__u64 reserved;           /* must be zero */
 };
 
 struct p2p_io_event {

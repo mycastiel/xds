@@ -15,6 +15,7 @@
 #include "file_p2p_api.h"
 
 #define TEST_TOO_LARGE_IOV_SIZE ((2U << 30) + 512U)
+#define TEST_TOO_LARGE_EXTENT_SIZE (1ULL << 41)
 
 _Static_assert(sizeof(struct p2p_iov) == 16,
 	       "p2p_iov must remain a 16-byte UAPI record");
@@ -53,6 +54,7 @@ int main(int argc, char **argv)
 		{ NULL, 0, NULL, 0 },
 	};
 	struct p2p_io_param *param;
+	struct fiemap_extent extent = { 0 };
 	struct io_parameter userspace = { };
 	struct p2p_iov iov = {
 		.addr = 0,
@@ -83,7 +85,7 @@ int main(int argc, char **argv)
 	if (!target || optind != argc)
 		return EXIT_FAILURE;
 
-	param = calloc(1, sizeof(*param) + sizeof(param->extents[0]));
+	param = calloc(1, sizeof(*param));
 	if (!param)
 		return EXIT_FAILURE;
 	param->op = P2P_IO_WRITE;
@@ -91,9 +93,10 @@ int main(int argc, char **argv)
 	param->iov = (uint64_t)(uintptr_t)&iov;
 	param->iov_nr = 1;
 	param->ext_nr = 1;
-	param->extents[0].fe_logical = 0;
-	param->extents[0].fe_physical = 0;
-	param->extents[0].fe_length = 512;
+	extent.fe_logical = 0;
+	extent.fe_physical = 0;
+	extent.fe_length = 512;
+	param->extents = (uint64_t)(uintptr_t)&extent;
 
 	dev_fd = new_p2p_fd();
 	if (dev_fd < 0) {
@@ -144,6 +147,11 @@ int main(int argc, char **argv)
 	if (err)
 		goto out;
 	iov.size = 512;
+	extent.fe_length = TEST_TOO_LARGE_EXTENT_SIZE;
+	err = expect("extent reaches 2 TiB", issue(dev_fd, param), -EINVAL);
+	if (err)
+		goto out;
+	extent.fe_length = 512;
 
 	param->file_fd = regular_fd;
 	err = expect("regular file write", issue(dev_fd, param),
@@ -162,8 +170,8 @@ int main(int argc, char **argv)
 	if (err)
 		goto out;
 	iov.size = 512;
-	param->extents[0].fe_logical = capacity;
-	param->extents[0].fe_physical = capacity;
+	extent.fe_logical = capacity;
+	extent.fe_physical = capacity;
 	err = expect("out-of-capacity range", issue(dev_fd, param), -EFBIG);
 	if (err)
 		goto out;

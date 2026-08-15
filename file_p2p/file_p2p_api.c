@@ -51,7 +51,6 @@ int rw_file(int dev_fd, const struct io_parameter *param)
 	struct stat file_stat;
 	unsigned long io_size;
 	unsigned long long total_size = 0;
-	size_t request_size;
 	unsigned int ext_num = 0;
 	const char *name;
 	int file_fd = -1;
@@ -109,12 +108,7 @@ int rw_file(int dev_fd, const struct io_parameter *param)
 		goto free_ext_out;
 	}
 
-	if (__builtin_mul_overflow((size_t)ext_num, sizeof(io->extents[0]), &request_size) ||
-	    __builtin_add_overflow(request_size, sizeof(*io), &request_size)) {
-		err = -E2BIG;
-		goto free_ext_out;
-	}
-	io = calloc(1, request_size);
+	io = calloc(1, sizeof(*io));
 	if (io == NULL) {
 		err = -ENOMEM;
 		fprintf(stderr, "calloc p2p_io_param failed, errno: %d\n", err);
@@ -134,7 +128,7 @@ int rw_file(int dev_fd, const struct io_parameter *param)
 	io->iov = (uint64_t)(uintptr_t)param->iov;
 	io->iov_nr = param->iov_nr;
 	io->ext_nr = ext_num;
-	memcpy(io->extents, exts->fm_extents, ext_num * sizeof(io->extents[0]));
+	io->extents = (uint64_t)(uintptr_t)exts->fm_extents;
 
 	err = ioctl(dev_fd, IOCTL_RW_FILE, io);
 	if (err < 0) {

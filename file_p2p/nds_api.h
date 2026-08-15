@@ -144,7 +144,9 @@ struct nds_io_event {
 	uint64_t reserved[2];
 };
 
-/* Process-wide init / teardown. nds_init is not re-entrant; call once. */
+/* Process-wide init / teardown.
+ * nds_init is not thread-safe and not re-entrant: call it once from a single
+ * thread before any other NDS call; concurrent nds_init is undefined. */
 int nds_init(struct nds_init_param *param);
 int nds_exit(void);
 
@@ -157,14 +159,27 @@ int nds_exit(void);
 int nds_register_mem(void *addr, uint64_t size, int flags);
 int nds_unregister_mem(void *addr);
 
-/* Create / destroy a per-queue I/O context. Destroy drains outstanding I/O. */
+/* Create / destroy a per-queue I/O context. Destroy drains outstanding I/O
+ * and frees @ctx. The caller owns the pointer until destroy; double destroy
+ * (or any use after destroy) is undefined behavior.
+ * Do not call nds_io_getevents concurrently with destroy on the same ctx:
+ * destroy holds the kernel harvest lock until all I/O completes. */
 int nds_io_new_ctx(const struct nds_io_ctx_param *param,
 		   struct nds_io_ctx **ctx);
 int nds_io_destroy_ctx(struct nds_io_ctx *ctx);
 
 /*
- * Submit nr control blocks. Returns number submitted, or -errno.
- * Completions are reaped with nds_io_getevents().
+ * Submit nr control blocks. Returns the number accepted, or -errno.
+ *
+ * Each iocb is one logical I/O: its iov[] is scatter-gather on a single
+ * obj.fd / offset and completes as one event (user_data). Different iocbs
+ * may target different files; the library issues one IOCTL_RW_FILE per
+ * iocb (no cross-iocb merge).
+ *
+ * Fail-stop like Linux io_submit: on a mid-batch failure return the count
+ * of iocbs already accepted (positive); the failed iocb's errno is not
+ * returned. If nothing was accepted, return -errno. Accepted I/Os are not
+ * rolled back — reap them with nds_io_getevents().
  */
 int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 		  const struct nds_io_cb *iocb);
@@ -173,6 +188,9 @@ int nds_io_submit(struct nds_io_ctx *ctx, int nr,
  * Wait for at least min_nr completions, up to nr.
  * timeout NULL = wait forever; {0,0} = non-blocking.
  * On success returns the number of events filled (>= 0); on failure -errno.
+ * When no I/Os are outstanding, returns 0 immediately even if min_nr > 0
+ * (does not block until timeout like Linux AIO on an empty ctx).
+ * Must not run concurrently with nds_io_destroy_ctx on the same ctx.
  */
 int nds_io_getevents(struct nds_io_ctx *ctx, int min_nr,
 		     int nr, struct nds_io_event *events,

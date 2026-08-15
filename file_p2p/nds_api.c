@@ -7,6 +7,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <errno.h>
 #include <stddef.h>
@@ -23,7 +24,7 @@
 
 #include <linux/fiemap.h>
 
-#include "nds_api.h"
+#include "nds_api_internal.h"
 #include "p2p_dev_uapi.h"
 #include "p2p_common.h"
 
@@ -55,10 +56,6 @@ struct nds_reg_entry {
 	void *addr;
 	uint64_t size;
 	uint64_t handle;
-};
-
-struct nds_io_ctx {
-	int p2p_fd;
 };
 
 struct nds_state {
@@ -118,6 +115,7 @@ int nds_init(struct nds_init_param *param)
 	uint32_t i;
 	int ret;
 
+	/* Not thread-safe: see nds_api.h. Concurrent init is undefined. */
 	if (!param || param->flags || is_init() || !param->desc.fs_fd ||
 	    !param->desc.fs_fd_cnt || param->desc.reserved || param->_data[2] ||
 	    param->_data[3])
@@ -279,15 +277,26 @@ int nds_io_destroy_ctx(struct nds_io_ctx *ctx)
 
 	if (!ctx)
 		return -EINVAL;
+	/*
+	 * Catches a closed-but-not-yet-freed ctx. A second destroy after
+	 * free() is still use-after-free (caller bug / UB).
+	 */
+	if (ctx->p2p_fd < 0)
+		return -EINVAL;
 
+	/* Full-fd quiesce before close; not exposed as a public NDS API. */
 	if (ioctl(ctx->p2p_fd, IOCTL_DRAIN_IO) < 0) {
 		drain_err = -errno;
-		fprintf(stderr, "nds: destroy_ctx drain failed %d\n", drain_err);
+		fprintf(stderr, "nds: destroy_ctx drain failed %d\n",
+			drain_err);
 	}
-	if (close(ctx->p2p_fd) < 0)
+	if (close(ctx->p2p_fd) < 0) {
 		close_err = -errno;
+		fprintf(stderr, "nds: destroy_ctx close failed %d\n", close_err);
+	}
 	ctx->p2p_fd = -1;
 	free(ctx);
+	/* Prefer the first failure; both are logged when both fail. */
 	return drain_err ? drain_err : close_err;
 }
 
@@ -322,6 +331,8 @@ static int validate_nds_iov(const struct nds_io_cb *cb, unsigned long *io_size)
 	if (!cb->iov || !cb->iov_cnt || cb->iov_cnt > NDS_IO_MAX_IOV)
 		return -EINVAL;
 	for (i = 0; i < cb->iov_cnt; i++) {
+		if (!cb->iov[i].buf_len || cb->iov[i].reserved)
+			return -EINVAL;
 		if (__builtin_add_overflow(size, (unsigned long)cb->iov[i].buf_len, &size))
 			return -EINVAL;
 	}
@@ -330,14 +341,13 @@ static int validate_nds_iov(const struct nds_io_cb *cb, unsigned long *io_size)
 }
 
 static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
-				struct p2p_io_param **io_out)
+				struct p2p_io_param *io,
+				struct fiemap **exts_out)
 {
-	struct p2p_io_param *io;
 	struct fiemap *exts = NULL;
 	struct stat file_stat;
 	unsigned long io_size;
 	unsigned long long total_size = 0;
-	size_t request_size;
 	unsigned int ext_num = 0;
 	uint64_t mem_handle = 0;
 	int err;
@@ -378,31 +388,18 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 	if (!ext_num || total_size < io_size) {
 		fprintf(stderr, "nds: extent size %llu < IOV size %lu\n",
 			total_size, io_size);
-		err = -ENODATA;
-		goto free_exts;
+		free(exts);
+		return -ENODATA;
 	}
 
-	if (__builtin_mul_overflow((size_t)ext_num, sizeof(io->extents[0]),
-				   &request_size) ||
-	    __builtin_add_overflow(request_size, sizeof(*io), &request_size)) {
-		err = -E2BIG;
-		goto free_exts;
-	}
-	io = calloc(1, request_size);
-	if (!io) {
-		err = -ENOMEM;
-		goto free_exts;
-	}
-
+	memset(io, 0, sizeof(*io));
 	io->op = (cb->opcode == NDS_IO_OP_PWRITE) ? P2P_IO_WRITE : P2P_IO_READ;
 	io->file_fd = file_fd;
 	io->user_data = cb->user_data;
-	/* nds_io_vec is layout-identical to p2p_iov; the ioctl copies it now. */
 	io->iov = (uint64_t)(uintptr_t)cb->iov;
 	io->iov_nr = cb->iov_cnt;
 	io->ext_nr = ext_num;
-	memcpy(io->extents, exts->fm_extents, ext_num * sizeof(io->extents[0]));
-	free(exts);
+	io->extents = (uint64_t)(uintptr_t)exts->fm_extents;
 
 	if (cb->rw_flags & NDS_IO_F_REGISTERED_MEM) {
 		io->flags = P2P_IO_F_REGISTERED_MEM;
@@ -414,17 +411,43 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 		io->mem_handle = 0;
 	}
 
-	*io_out = io;
+	*exts_out = exts;
 	return 0;
+}
 
-free_exts:
+/*
+ * One iocb → one IOCTL_RW_FILE (one logical completion). Multiple iovs in the
+ * iocb are scatter-gather for that single event, not multiple events.
+ */
+static int nds_submit_one_iocb(struct nds_io_ctx *ctx,
+			       const struct nds_io_cb *cb)
+{
+	struct p2p_io_param param;
+	struct fiemap *exts = NULL;
+	int file_fd = cb->obj.fd;
+	int ret;
+
+	if (cb->reserved || cb->obj.reserved || file_fd < 0)
+		return -EINVAL;
+
+	ret = nds_iocb_to_io_param(cb, file_fd, &param, &exts);
+	if (ret) {
+		fprintf(stderr, "nds: translate iocb failed %d\n", ret);
+		return ret;
+	}
+
+	if (ioctl(ctx->p2p_fd, IOCTL_RW_FILE, &param) < 0) {
+		ret = -errno;
+		fprintf(stderr, "nds: rw ioctl failed %d\n", ret);
+	}
 	free(exts);
-	return err;
+	return ret;
 }
 
 int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 		  const struct nds_io_cb *iocb)
 {
+	int accepted = 0;
 	int i;
 	int ret;
 
@@ -434,31 +457,21 @@ int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 		return -EINVAL;
 	if (!nr)
 		return 0;
+	if ((unsigned int)nr > NDS_IO_MAX_IO_CNT)
+		return -EINVAL;
 
+	/*
+	 * AIO-shaped fail-stop: submit iocbs in order, one ioctl each. On
+	 * partial success return the accepted count (errno of the failed
+	 * iocb is not returned). If nothing was accepted, return -errno.
+	 */
 	for (i = 0; i < nr; i++) {
-		struct p2p_io_param *io = NULL;
-		const struct nds_io_cb *cb = &iocb[i];
-		int file_fd = cb->obj.fd;
-
-		if (cb->reserved || cb->obj.reserved || file_fd < 0)
-			return i ? i : -EINVAL;
-
-		ret = nds_iocb_to_io_param(cb, file_fd, &io);
-		if (ret) {
-			fprintf(stderr, "nds: translate iocb failed %d\n", ret);
-			return i ? i : ret;
-		}
-
-		ret = ioctl(ctx->p2p_fd, IOCTL_RW_FILE, io);
-		if (ret < 0) {
-			ret = -errno;
-			fprintf(stderr, "nds: rw ioctl failed %d\n", ret);
-			free(io);
-			return i ? i : ret;
-		}
-		free(io);
+		ret = nds_submit_one_iocb(ctx, &iocb[i]);
+		if (ret)
+			return accepted ? accepted : ret;
+		accepted++;
 	}
-	return i;
+	return accepted;
 }
 
 int nds_io_getevents(struct nds_io_ctx *ctx, int min_nr,

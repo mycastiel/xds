@@ -47,9 +47,13 @@
 #define P2P_MAX_IOV 65536U
 #define P2P_MAX_EXTENTS 1048576U
 #define P2P_MAX_IOV_SIZE (2U << 30)
+#define P2P_MAX_EXTENT_SIZE ((u64)U32_MAX << SECTOR_SHIFT)
 #define P2P_MIN_PAGE_SIZE (64U << 10)
 #define P2P_MEM_COOKIE_SHIFT 48
 #define P2P_MEM_ID_MASK GENMASK_ULL(P2P_MEM_COOKIE_SHIFT - 1, 0)
+/* Power-of-two CQ; caps outstanding I/Os per batch (in-flight + unharvested). */
+#define P2P_CQ_SIZE 1024U
+#define P2P_CQ_MASK (P2P_CQ_SIZE - 1)
 
 struct p2p_pa_iov {
 	u64 addr;
@@ -103,14 +107,31 @@ struct p2p_pinned_io_mem {
 	};
 };
 
+struct p2p_io_context;
+
 struct p2p_batch {
-	/* Submitted I/Os not yet moved to done_list. */
-	struct list_head io_list;
-	/* Completed I/Os waiting for getevents/drain harvest (completion order). */
-	struct list_head done_list;
-	unsigned int io_cnt;
-	unsigned int done_cnt;
-	spinlock_t io_lock;
+	/*
+	 * Accepted CQ slots not yet retired; limited to P2P_CQ_SIZE.
+	 */
+	atomic_t io_cnt;
+
+	/*
+	 * AIO-style completion ring (fs/aio.c shape): the producer publishes
+	 * slots and advances cq_tail under completion_lock only; the consumer
+	 * reads slots and advances cq_head under the ring_lock mutex only.
+	 * Neither side takes the other's lock on the hot path.
+	 */
+	struct p2p_io_context **cq;
+	unsigned int cq_head;
+	unsigned int cq_tail;
+	/* Completed I/Os published to the CQ but not yet harvested. */
+	atomic_t ready_events;
+	/* Accepted I/Os not yet harvested, including ready_events. */
+	atomic_t outstanding_events;
+	spinlock_t completion_lock;
+	/* Consumer side: getevents harvest, serialized against drain. */
+	struct mutex ring_lock;
+
 	wait_queue_head_t wait;
 	struct shared_topo_list shared_topos;
 	struct list_head owned_mems;
@@ -129,9 +150,6 @@ struct p2p_io_context {
 	int io_err;
 	int issue_err;
 	struct p2p_batch *batch;
-	/* True while linked on batch->io_list or batch->done_list. */
-	bool on_batch;
-	struct list_head io_list;
 #if defined(CALC_CRC32) || defined(DUMP_CONTENT)
 	struct work_struct finalize_work;
 #endif
@@ -180,14 +198,23 @@ static int p2p_open(struct inode *inode, struct file *file)
 	if (!batch)
 		return -ENOMEM;
 
-	spin_lock_init(&batch->io_lock);
-	INIT_LIST_HEAD(&batch->io_list);
-	INIT_LIST_HEAD(&batch->done_list);
+	batch->cq = kcalloc(P2P_CQ_SIZE, sizeof(*batch->cq), GFP_KERNEL);
+	if (!batch->cq) {
+		kfree(batch);
+		return -ENOMEM;
+	}
+
+	spin_lock_init(&batch->completion_lock);
+	mutex_init(&batch->ring_lock);
 	init_waitqueue_head(&batch->wait);
 	spin_lock_init(&batch->shared_topos.lock);
 	INIT_LIST_HEAD(&batch->shared_topos.head);
 	INIT_LIST_HEAD(&batch->owned_mems);
-	batch->io_cnt = 0;
+	atomic_set(&batch->io_cnt, 0);
+	batch->cq_head = 0;
+	batch->cq_tail = 0;
+	atomic_set(&batch->ready_events, 0);
+	atomic_set(&batch->outstanding_events, 0);
 	file->private_data = batch;
 
 	return 0;
@@ -202,7 +229,7 @@ static int p2p_release(struct inode *inode, struct file *file)
 
 	p2p_revoke_all_registered_mem(batch, &revoked_mems);
 
-	if (batch->io_cnt > 0)
+	if (atomic_read(&batch->io_cnt) > 0)
 		p2p_drain_io(batch);
 
 	p2p_destroy_registered_mem_list(&revoked_mems);
@@ -216,6 +243,7 @@ static int p2p_release(struct inode *inode, struct file *file)
 		kfree(shared);
 	}
 
+	kfree(batch->cq);
 	kfree(batch);
 
 	file->private_data = NULL;
@@ -600,9 +628,9 @@ static void p2p_iov_iter_advance(struct p2p_iov_iter *iter, u64 bytes)
 	iter->iov_offset = 0;
 }
 
-static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
-		      unsigned int iov_nr, struct p2p_pa_iov **pa_iov,
-		      unsigned int *pa_iov_nr, struct p2p_pinned_pa **pinned_pa_out)
+static int get_pa_iov(int host_pid, const struct p2p_iov *iov, unsigned int iov_nr,
+		      struct p2p_pa_iov **pa_iov, unsigned int *pa_iov_nr,
+		      struct p2p_pinned_io_mem *pinned_mem)
 {
 	struct p2p_pinned_pa *pinned_pa;
 	struct p2p_pa_iov *new_pa_iov;
@@ -630,10 +658,8 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
 		u32 offset;
 		int page_size;
 
-		page_size = p2p_mem_get_page_size(&pinned_pa->process_id,
-						  iov[i].addr, iov[i].size);
-		if (page_size < P2P_MIN_PAGE_SIZE ||
-		    !is_power_of_2(page_size)) {
+		page_size = p2p_mem_get_page_size(&pinned_pa->process_id, iov[i].addr, iov[i].size);
+		if (page_size < P2P_MIN_PAGE_SIZE || !is_power_of_2(page_size)) {
 			pr_err("invalid page size %d for addr 0x%llx, iov %u\n",
 			       page_size, iov[i].addr, i);
 			err = -EINVAL;
@@ -714,7 +740,10 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov,
 
 	*pa_iov = new_pa_iov;
 	*pa_iov_nr = new_pa_iov_nr;
-	*pinned_pa_out = pinned_pa;
+	*pinned_mem = (struct p2p_pinned_io_mem) {
+		.pinned = true,
+		.pinned_pa = pinned_pa,
+	};
 	return 0;
 
 free_pa_iov:
@@ -753,11 +782,9 @@ unlock:
 	return err;
 }
 
-static int get_registered_pa_iov(u64 handle, const struct p2p_iov *iov,
-				 unsigned int iov_nr,
-				 struct p2p_pa_iov **pa_iov_out,
-				 unsigned int *pa_iov_nr_out,
-				 struct p2p_registered_mem **mem_out)
+static int get_registered_pa_iov(u64 handle, const struct p2p_iov *iov, unsigned int iov_nr,
+				 struct p2p_pa_iov **pa_iov_out, unsigned int *pa_iov_nr_out,
+				 struct p2p_pinned_io_mem *pinned_mem)
 {
 	struct p2p_registered_mem *mem;
 	const struct p2p_iov_map *map;
@@ -827,7 +854,11 @@ static int get_registered_pa_iov(u64 handle, const struct p2p_iov *iov,
 
 	*pa_iov_out = pa_iov;
 	*pa_iov_nr_out = pa_iov_nr;
-	*mem_out = mem;
+	*pinned_mem = (struct p2p_pinned_io_mem) {
+		.pinned = true,
+		.reg_mem = true,
+		.registered_mem = mem,
+	};
 	return 0;
 
 free_pa_iov:
@@ -886,12 +917,12 @@ static struct p2p_io_context *new_io_ctx(u32 op, struct file *file, struct p2p_p
 	io_ctx->user_data = user_data;
 
 	atomic_set(&io_ctx->io_ref, 1);
-	INIT_LIST_HEAD(&io_ctx->io_list);
 	init_completion(&io_ctx->io_done);
 #if defined(CALC_CRC32) || defined(DUMP_CONTENT)
 	INIT_WORK(&io_ctx->finalize_work, p2p_finalize_io_work);
 #endif
 
+	pinned_mem->pinned = false;
 	return io_ctx;
 }
 
@@ -1040,11 +1071,14 @@ static void p2p_tp_hook_exit(void)
 static void p2p_wake_batch_waiters(struct p2p_batch *batch)
 {
 	/*
-	 * A waiter that races this lockless check reevaluates the condition under
-	 * io_lock before sleeping, and therefore observes the published counters.
+	 * Pair condition stores (ready_events / cq_tail under completion_lock,
+	 * then unlock) with waitqueue_active: without this full barrier a
+	 * waiter can observe !active, then miss the published condition and
+	 * sleep. wait_event* still re-checks after prepare_to_wait.
 	 */
+	smp_mb();
 	if (waitqueue_active(&batch->wait))
-		wake_up_all(&batch->wait);
+		wake_up(&batch->wait);
 }
 
 static void p2p_publish_io_done(struct p2p_io_context *io_ctx)
@@ -1053,24 +1087,21 @@ static void p2p_publish_io_done(struct p2p_io_context *io_ctx)
 	unsigned long flags;
 
 	/*
-	 * Keep io_lock across publication so getevents cannot retire a context
-	 * that remains on the batch before complete() makes the final io_ctx
-	 * access. If drain already detached it, the draining owner keeps both the
-	 * context and batch alive until io_done is published.
+	 * Producer hot path: completion_lock only (AIO's ctx->completion_lock
+	 * shape). Always publish — drain never suppresses completion; it waits
+	 * for natural publish then harvests under ring_lock.
 	 */
-	spin_lock_irqsave(&batch->io_lock, flags);
-	if (io_ctx->on_batch) {
-		list_move_tail(&io_ctx->io_list, &batch->done_list);
-		batch->done_cnt++;
-		p2p_wake_batch_waiters(batch);
-		/* io_lock prevents harvest until this final io_ctx access completes. */
-		complete(&io_ctx->io_done);
-		spin_unlock_irqrestore(&batch->io_lock, flags);
-		return;
-	}
-	spin_unlock_irqrestore(&batch->io_lock, flags);
+	spin_lock_irqsave(&batch->completion_lock, flags);
+	WARN_ON_ONCE(batch->cq_tail - READ_ONCE(batch->cq_head) >= P2P_CQ_SIZE);
+	batch->cq[batch->cq_tail & P2P_CQ_MASK] = io_ctx;
+	/* Slot stores must be visible before cq_tail advances. */
+	smp_wmb();
+	WRITE_ONCE(batch->cq_tail, batch->cq_tail + 1);
+	atomic_inc(&batch->ready_events);
+	spin_unlock_irqrestore(&batch->completion_lock, flags);
 
 	p2p_wake_batch_waiters(batch);
+	/* Last touch of io_ctx: harvest/drain wait io_done before freeing. */
 	complete(&io_ctx->io_done);
 }
 
@@ -1138,8 +1169,7 @@ static int do_ios(struct p2p_io_context *io_ctx, struct topo *topo, struct fiema
 	unsigned int i;
 	int err = 0;
 
-	p2p_iov_iter_init(&iter, io_ctx->pa_iov, io_ctx->pa_iov_nr,
-			  io_ctx->data_size);
+	p2p_iov_iter_init(&iter, io_ctx->pa_iov, io_ctx->pa_iov_nr, io_ctx->data_size);
 	blk_start_plug(&plug);
 
 	for (i = 0; i < nr && p2p_iov_iter_count(&iter); i++) {
@@ -1149,8 +1179,8 @@ static int do_ios(struct p2p_io_context *io_ctx, struct topo *topo, struct fiema
 		unsigned int to_submit;
 
 		pr_debug("%s ext %u sec 0x%llx+0x%x cnt 0x%llx off 0x%llx cur 0x%llx+0x%llx nr %u\n",
-			p2p_io_op_name(io_ctx->op), i, sector, left, iter.count, iter.iov_offset,
-			iter.iov->addr, iter.iov->len, iter.nr_segs);
+			 p2p_io_op_name(io_ctx->op), i, sector, left, iter.count, iter.iov_offset,
+			 iter.iov->addr, iter.iov->len, iter.nr_segs);
 
 		while (left && p2p_iov_iter_count(&iter)) {
 			struct topo_bdev *topo_bdev;
@@ -1193,12 +1223,6 @@ static int do_ios(struct p2p_io_context *io_ctx, struct topo *topo, struct fiema
 out:
 	blk_finish_plug(&plug);
 	return err;
-}
-
-static int wait_io_done(struct p2p_io_context *io_ctx)
-{
-	wait_for_completion_io(&io_ctx->io_done);
-	return io_ctx->io_err;
 }
 
 #ifdef CALC_CRC32
@@ -1248,12 +1272,25 @@ static void p2p_finalize_io_work(struct work_struct *work)
 	dump_io_ctx_crc32(io_ctx);
 	dump_pa_content(io_ctx->pa_iov[0].addr,
 			min_t(u64, io_ctx->data_size, io_ctx->pa_iov[0].len));
+	/*
+	 * Registered unpin here (process context). One-shot stays pinned until
+	 * retire; pinned_mem itself is an embedded field and remains valid.
+	 */
 	if (io_ctx->pinned_mem.reg_mem)
 		p2p_unpin_io_mem(&io_ctx->pinned_mem);
-	/* Publish completion only after the worker's final io_ctx access. */
 	p2p_publish_io_done(io_ctx);
 }
 #endif
+
+static int p2p_io_ctx_errno(const struct p2p_io_context *io_ctx)
+{
+	int err = io_ctx->issue_err;
+	int io_err = io_ctx->io_err;
+
+	if (io_err && !err)
+		err = blk_status_to_errno(io_err);
+	return err;
+}
 
 static void p2p_io_ctx_put(struct p2p_io_context *io_ctx)
 {
@@ -1267,8 +1304,19 @@ static void p2p_io_ctx_put(struct p2p_io_context *io_ctx)
 	}
 #endif
 
+	/*
+	 * Registered: drop the percpu_ref on the completion path (safe).
+	 * One-shot: leave pinned until p2p_retire_cq_head so
+	 * devmm_put_mem_pa_list never runs in softirq.
+	 */
 	if (io_ctx->pinned_mem.reg_mem)
 		p2p_unpin_io_mem(&io_ctx->pinned_mem);
+
+	/* Log once per io_ctx when NVMe completion carried a blk error. */
+	if (io_ctx->io_err && !io_ctx->issue_err)
+		pr_err("I/O error status %d errno %d\n", io_ctx->io_err,
+		       blk_status_to_errno(io_ctx->io_err));
+
 	p2p_publish_io_done(io_ctx);
 }
 
@@ -1283,26 +1331,20 @@ static int validate_io_data(const struct p2p_iov *iov, unsigned int iov_nr,
 	for (i = 0; i < iov_nr; i++) {
 		u64 end;
 
-		if (!iov[i].size || iov[i].size > P2P_MAX_IOV_SIZE ||
-		    iov[i].reserved ||
+		if (!iov[i].size || iov[i].size > P2P_MAX_IOV_SIZE || iov[i].reserved ||
 		    ((iov[i].addr | iov[i].size) & (SECTOR_SIZE - 1)) ||
-		    check_add_overflow((u64)iov[i].addr, (u64)iov[i].size,
-				       &end) ||
-		    check_add_overflow(iov_size, (u64)iov[i].size,
-				       &iov_size))
+		    check_add_overflow((u64)iov[i].addr, (u64)iov[i].size, &end) ||
+		    check_add_overflow(iov_size, (u64)iov[i].size, &iov_size))
 			return -EINVAL;
 	}
 
 	for (i = 0; i < ext_nr; i++) {
 		u64 end;
 
-		if (!extents[i].fe_length ||
-		    ((extents[i].fe_physical | extents[i].fe_length) &
-		     (SECTOR_SIZE - 1)) ||
-		    check_add_overflow(extents[i].fe_physical,
-				       extents[i].fe_length, &end) ||
-		    check_add_overflow(extent_size, extents[i].fe_length,
-				       &extent_size))
+		if (!extents[i].fe_length || extents[i].fe_length > P2P_MAX_EXTENT_SIZE ||
+		    ((extents[i].fe_physical | extents[i].fe_length) & (SECTOR_SIZE - 1)) ||
+		    check_add_overflow(extents[i].fe_physical, extents[i].fe_length, &end) ||
+		    check_add_overflow(extent_size, extents[i].fe_length, &extent_size))
 			return -EINVAL;
 	}
 
@@ -1350,6 +1392,8 @@ static int validate_io_param(const struct p2p_io_param *param)
 	if (!param->iov_nr || param->iov_nr > P2P_MAX_IOV ||
 	    !param->ext_nr || param->ext_nr > P2P_MAX_EXTENTS)
 		return -EINVAL;
+	if (param->reserved)
+		return -EINVAL;
 	if (param->flags & P2P_IO_F_REGISTERED_MEM)
 		return !param->mem_handle || param->host_pid ? -EINVAL : 0;
 
@@ -1379,58 +1423,82 @@ static int validate_write_range(const struct p2p_io_param *param,
 	return 0;
 }
 
+static int p2p_copy_iov_extents(const struct p2p_io_param *param, struct p2p_iov **iov_out,
+				struct fiemap_extent **extents_out)
+{
+	struct p2p_iov *iov;
+	struct fiemap_extent *extents;
+	int err = 0;
+
+	if (!param->extents)
+		return -EINVAL;
+
+	iov = kvmalloc_array(param->iov_nr, sizeof(*iov), GFP_KERNEL);
+	if (!iov)
+		return -ENOMEM;
+	if (copy_from_user(iov, u64_to_user_ptr(param->iov),
+			   array_size(param->iov_nr, sizeof(*iov)))) {
+		err = -EFAULT;
+		goto free_iov;
+	}
+
+	extents = kvmalloc_array(param->ext_nr, sizeof(*extents), GFP_KERNEL);
+	if (!extents) {
+		err = -ENOMEM;
+		goto free_iov;
+	}
+	if (copy_from_user(extents, u64_to_user_ptr(param->extents),
+			   array_size(param->ext_nr, sizeof(*extents)))) {
+		err = -EFAULT;
+		goto free_extents;
+	}
+
+	*iov_out = iov;
+	*extents_out = extents;
+	return 0;
+
+free_extents:
+	kvfree(extents);
+free_iov:
+	kvfree(iov);
+	return err;
+}
+
 static int p2p_rw_file(struct p2p_batch *batch, void __user *arg)
 {
-	struct p2p_io_param __user *user_param = arg;
 	struct p2p_pa_iov *pa_iov = NULL;
 	struct p2p_io_param param;
-	struct fiemap_extent *extents;
-	struct p2p_iov *iov;
+	struct fiemap_extent *extents = NULL;
+	struct p2p_iov *iov = NULL;
 	struct file *reg_file = NULL;
 	struct block_device *bdev;
 	struct p2p_io_context *io_ctx;
-	struct p2p_pinned_io_mem pinned_mem = { };
+	struct p2p_pinned_io_mem pinned_mem;
 	struct topo *topo = NULL;
 	u64 data_size;
 	unsigned int pa_iov_nr;
-	unsigned long flags;
 	int err;
 
-	if (copy_from_user(&param, user_param, sizeof(param)))
+	if (copy_from_user(&param, arg, sizeof(param)))
 		return -EFAULT;
 	err = validate_io_param(&param);
 	if (err)
 		return err;
 
-	iov = kvmalloc_array(param.iov_nr, sizeof(*iov), GFP_KERNEL);
-	if (!iov)
-		return -ENOMEM;
-	if (copy_from_user(iov,
-			   u64_to_user_ptr(param.iov),
-			   array_size(param.iov_nr, sizeof(*iov)))) {
-		err = -EFAULT;
-		goto free_iov;
-	}
-
-	extents = kvmalloc_array(param.ext_nr, sizeof(*extents), GFP_KERNEL);
-	if (!extents) {
-		err = -ENOMEM;
-		goto free_iov;
-	}
-	if (copy_from_user(extents, user_param->extents,
-			   array_size(param.ext_nr, sizeof(*extents)))) {
-		err = -EFAULT;
-		goto free_extents;
-	}
-
-	err = validate_io_data(iov, param.iov_nr, extents, param.ext_nr, &data_size);
+	err = p2p_copy_iov_extents(&param, &iov, &extents);
 	if (err)
-		goto free_extents;
+		return err;
+
+	/* Validate payload before open/topo so rejection errno stays stable. */
+	err = validate_io_data(iov, param.iov_nr, extents, param.ext_nr,
+			       &data_size);
+	if (err)
+		goto free_bufs;
 
 	reg_file = fget(param.file_fd);
 	if (!reg_file) {
 		err = -EBADF;
-		goto free_extents;
+		goto free_bufs;
 	}
 	bdev = p2p_bdev_from_file(reg_file, param.op);
 	if (IS_ERR(bdev)) {
@@ -1452,120 +1520,114 @@ static int p2p_rw_file(struct p2p_batch *batch, void __user *arg)
 		goto put_reg_file;
 	}
 
-	if (param.flags & P2P_IO_F_REGISTERED_MEM) {
-		pinned_mem.reg_mem = true;
-		err = get_registered_pa_iov(param.mem_handle, iov, param.iov_nr,
-					    &pa_iov, &pa_iov_nr,
-					    &pinned_mem.registered_mem);
-	} else {
-		err = get_pa_iov(param.host_pid, iov, param.iov_nr, &pa_iov,
-				 &pa_iov_nr, &pinned_mem.pinned_pa);
-	}
+	if (param.flags & P2P_IO_F_REGISTERED_MEM)
+		err = get_registered_pa_iov(param.mem_handle, iov, param.iov_nr, &pa_iov,
+					    &pa_iov_nr, &pinned_mem);
+	else
+		err = get_pa_iov(param.host_pid, iov, param.iov_nr, &pa_iov, &pa_iov_nr,
+				 &pinned_mem);
 	if (err)
 		goto put_topo;
-	pinned_mem.pinned = true;
 
-	io_ctx = new_io_ctx(param.op, reg_file, pa_iov, pa_iov_nr, &pinned_mem, data_size,
-			    param.user_data);
+	io_ctx = new_io_ctx(param.op, reg_file, pa_iov, pa_iov_nr, &pinned_mem,
+			    data_size, param.user_data);
 	if (IS_ERR(io_ctx)) {
 		err = PTR_ERR(io_ctx);
 		goto free_pa_iov;
 	}
 	reg_file = NULL;
 	pa_iov = NULL;
-	pinned_mem.pinned = false;
 
-	/*
-	 * Queue on the batch before submitting so a completion cannot race
-	 * ahead of list membership (would lose a getevents wake-up).
-	 */
 	io_ctx->batch = batch;
-	spin_lock_irqsave(&batch->io_lock, flags);
-	batch->io_cnt++;
-	io_ctx->on_batch = true;
-	list_add_tail(&io_ctx->io_list, &batch->io_list);
-	spin_unlock_irqrestore(&batch->io_lock, flags);
+	if (atomic_inc_return(&batch->io_cnt) > P2P_CQ_SIZE) {
+		if (atomic_dec_and_test(&batch->io_cnt))
+			p2p_wake_batch_waiters(batch);
+		free_io_ctx(io_ctx);
+		err = -EAGAIN;
+		goto free_pa_iov;
+	}
+	atomic_inc(&batch->outstanding_events);
 
 	io_ctx->issue_err = do_ios(io_ctx, topo, extents, param.ext_nr);
 	if (io_ctx->issue_err)
 		p2p_stats_io_issue_failed();
 	p2p_io_ctx_put(io_ctx);
-	topo_put(topo);
-	topo = NULL;
+	err = 0;
 
 free_pa_iov:
 	p2p_unpin_io_mem(&pinned_mem);
 	kvfree(pa_iov);
 put_topo:
-	if (topo)
-		topo_put(topo);
+	topo_put(topo);
 put_reg_file:
 	if (reg_file)
 		fput(reg_file);
-free_extents:
+free_bufs:
 	kvfree(extents);
-free_iov:
 	kvfree(iov);
 	return err;
 }
 
+/*
+ * Pop the CQ head slot and free its io_ctx. Caller holds ring_lock and must
+ * have finished delivering (or discarding) the slot's single logical event.
+ * Counts for remaining events were already adjusted by the caller.
+ */
+static void p2p_retire_cq_head(struct p2p_batch *batch, int *first_err)
+{
+	struct p2p_io_context *io_ctx;
+	int err;
+
+	/* Pairs with the producer's smp_wmb() before cq_tail. */
+	smp_rmb();
+	io_ctx = batch->cq[batch->cq_head & P2P_CQ_MASK];
+	WRITE_ONCE(batch->cq_head, batch->cq_head + 1);
+
+	err = p2p_io_ctx_errno(io_ctx);
+	if (first_err && err && !*first_err)
+		*first_err = err;
+
+	/* Publisher's complete() is its final field access before unpin. */
+	wait_for_completion(&io_ctx->io_done);
+	/* Publish cq_head before returning its CQ slot to submitters. */
+	smp_mb__before_atomic();
+	atomic_dec(&batch->io_cnt);
+	free_io_ctx(io_ctx);
+}
+
+/*
+ * Drain waits for every accepted I/O to publish naturally, then harvests the
+ * CQ under ring_lock (same consumer lock as getevents). No on_batch / steal:
+ * publish always lands on the ring.
+ */
 static int p2p_drain_io(struct p2p_batch *batch)
 {
-	struct p2p_io_context *io_ctx, *next_io_ctx;
 	int first_err = 0;
-	unsigned long flags;
-	LIST_HEAD(tmp);
 
-	if (!READ_ONCE(batch->io_cnt))
-		return 0;
+	mutex_lock(&batch->ring_lock);
+	while (atomic_read(&batch->io_cnt)) {
+		/*
+		 * Sleep with ring_lock held so getevents cannot interleave.
+		 * Publish only takes completion_lock, so it can still wake us.
+		 */
+		wait_event(batch->wait,
+			   batch->cq_head != READ_ONCE(batch->cq_tail) ||
+			   !atomic_read(&batch->io_cnt));
 
-	spin_lock_irqsave(&batch->io_lock, flags);
-	if (!batch->io_cnt) {
-		spin_unlock_irqrestore(&batch->io_lock, flags);
-		return 0;
-	}
-	list_for_each_entry(io_ctx, &batch->io_list, io_list)
-		io_ctx->on_batch = false;
-	list_for_each_entry(io_ctx, &batch->done_list, io_list)
-		io_ctx->on_batch = false;
-	list_splice_init(&batch->io_list, &tmp);
-	list_splice_tail_init(&batch->done_list, &tmp);
-	batch->io_cnt = 0;
-	batch->done_cnt = 0;
-	spin_unlock_irqrestore(&batch->io_lock, flags);
-
-	list_for_each_entry_safe(io_ctx, next_io_ctx, &tmp, io_list) {
-		int err, io_err;
-
-		io_err = wait_io_done(io_ctx);
-		err = io_ctx->issue_err;
-
-		if (io_err && !err) {
-			pr_err("I/O error status %d errno %d\n", io_err,
-			       blk_status_to_errno(io_err));
-			err = blk_status_to_errno(io_err);
+		while (batch->cq_head != READ_ONCE(batch->cq_tail)) {
+			atomic_dec(&batch->ready_events);
+			atomic_dec(&batch->outstanding_events);
+			p2p_retire_cq_head(batch, &first_err);
 		}
-		if (err && !first_err)
-			first_err = err;
-
-		list_del_init(&io_ctx->io_list);
-		free_io_ctx(io_ctx);
 	}
+	mutex_unlock(&batch->ring_lock);
 
 	return first_err;
 }
 
-static void p2p_fill_io_event(struct p2p_io_context *io_ctx,
-			      struct p2p_io_event *out)
+static void p2p_fill_io_event(struct p2p_io_context *io_ctx, struct p2p_io_event *out)
 {
-	int err = io_ctx->issue_err;
-	int io_err = io_ctx->io_err;
-
-	if (io_err && !err) {
-		pr_err("I/O error status %d errno %d\n", io_err,
-		       blk_status_to_errno(io_err));
-		err = blk_status_to_errno(io_err);
-	}
+	int err = p2p_io_ctx_errno(io_ctx);
 
 	out->user_data = io_ctx->user_data;
 	out->res = err ? err : 0;
@@ -1573,75 +1635,28 @@ static void p2p_fill_io_event(struct p2p_io_context *io_ctx,
 	out->reserved[1] = 0;
 }
 
+static bool p2p_cq_ready(struct p2p_batch *batch, unsigned int min_nr)
+{
+	unsigned int ready = atomic_read(&batch->ready_events);
+	unsigned int outstanding = atomic_read(&batch->outstanding_events);
+
+	return ready >= min_nr || ready == outstanding;
+}
+
 /*
- * Move up to @max completed contexts from done_list into @out.
- * Returns how many were moved. Matches AIO: harvest in completion order.
+ * AIO-style getevents: wait on ready logical I/Os, harvest under the
+ * ring_lock mutex only, copy one event at a time (no kvmalloc intermediate).
+ * Each CQ slot is one logical I/O / one event. On copy_to_user fault the slot
+ * stays at head for the next call.
  */
-static unsigned int p2p_harvest_done(struct p2p_batch *batch, struct list_head *out,
-				     unsigned int max)
-{
-	struct p2p_io_context *io_ctx, *next;
-	unsigned int n = 0;
-	unsigned long flags;
-
-	spin_lock_irqsave(&batch->io_lock, flags);
-	list_for_each_entry_safe(io_ctx, next, &batch->done_list, io_list) {
-		if (n >= max)
-			break;
-		batch->done_cnt--;
-		io_ctx->on_batch = false;
-		list_del_init(&io_ctx->io_list);
-		batch->io_cnt--;
-		list_add_tail(&io_ctx->io_list, out);
-		n++;
-	}
-	spin_unlock_irqrestore(&batch->io_lock, flags);
-	return n;
-}
-
-static void p2p_requeue_harvested(struct p2p_batch *batch,
-				  struct list_head *contexts)
-{
-	struct p2p_io_context *io_ctx;
-	unsigned int n = 0;
-	unsigned long flags;
-
-	spin_lock_irqsave(&batch->io_lock, flags);
-	list_for_each_entry(io_ctx, contexts, io_list) {
-		io_ctx->on_batch = true;
-		n++;
-	}
-	batch->io_cnt += n;
-	batch->done_cnt += n;
-	list_splice_init(contexts, &batch->done_list);
-	spin_unlock_irqrestore(&batch->io_lock, flags);
-	p2p_wake_batch_waiters(batch);
-}
-
-static bool p2p_events_ready(struct p2p_batch *batch, unsigned int min_nr)
-{
-	bool ready;
-	unsigned long flags;
-
-	spin_lock_irqsave(&batch->io_lock, flags);
-	ready = batch->done_cnt >= min_nr ||
-		batch->done_cnt == batch->io_cnt;
-	spin_unlock_irqrestore(&batch->io_lock, flags);
-	return ready;
-}
-
 static int p2p_get_io_events(struct p2p_batch *batch, void __user *arg)
 {
 	struct p2p_getevents_param param;
 	struct p2p_io_event __user *user_events;
-	struct p2p_io_event *events = NULL;
-	struct p2p_io_context *io_ctx, *next_io_ctx;
-	LIST_HEAD(tmp);
+	struct p2p_io_context *io_ctx;
+	struct p2p_io_event event;
 	unsigned int total = 0;
-	ktime_t timeout = KTIME_MAX;
-	bool nonblock = false;
-	int i;
-	int wait_ret;
+	int ret = 0;
 
 	if (copy_from_user(&param, arg, sizeof(param)))
 		return -EFAULT;
@@ -1651,51 +1666,49 @@ static int p2p_get_io_events(struct p2p_batch *batch, void __user *arg)
 
 	user_events = u64_to_user_ptr(param.events);
 
-	if (param.timeout_ns == 0) {
-		nonblock = true;
-	} else if (param.timeout_ns > 0) {
-		timeout = ns_to_ktime(param.timeout_ns);
+	if (param.timeout_ns) {
+		ktime_t until = param.timeout_ns < 0 ? KTIME_MAX :
+				    ns_to_ktime(param.timeout_ns);
+
+		ret = wait_event_interruptible_hrtimeout(
+			batch->wait, p2p_cq_ready(batch, param.min_nr), until);
+		if (ret == -ERESTARTSYS)
+			ret = -EINTR;
+		else if (ret == -ETIME)
+			ret = 0;
+		/* Fall through and harvest whatever is already on the CQ. */
+	}
+
+	mutex_lock(&batch->ring_lock);
+	while (total < (unsigned int)param.max_nr) {
+		if (batch->cq_head == READ_ONCE(batch->cq_tail))
+			break;
+		/* Pairs with the producer's smp_wmb() before cq_tail. */
+		smp_rmb();
+		io_ctx = batch->cq[batch->cq_head & P2P_CQ_MASK];
+
+		p2p_fill_io_event(io_ctx, &event);
+		if (copy_to_user(&user_events[total], &event, sizeof(event))) {
+			ret = -EFAULT;
+			break;
+		}
+		total++;
+		p2p_retire_cq_head(batch, NULL);
 	}
 
 	/*
-	 * Wait once for min_nr completions or exhaustion of the current batch. The
-	 * condition inspects all counters under io_lock.
+	 * Single consumer under ring_lock: one atomic_sub for all successfully
+	 * copied events instead of a per-event atomic_dec.
 	 */
-	if (!nonblock) {
-		wait_ret = wait_event_interruptible_hrtimeout(
-			batch->wait, p2p_events_ready(batch, param.min_nr), timeout);
-		if (wait_ret == -ERESTARTSYS)
-			wait_ret = -EINTR;
-		if (wait_ret != -ETIME && wait_ret)
-			return wait_ret;
+	if (total) {
+		atomic_sub(total, &batch->ready_events);
+		atomic_sub(total, &batch->outstanding_events);
 	}
+	mutex_unlock(&batch->ring_lock);
 
-	total = p2p_harvest_done(batch, &tmp, param.max_nr);
-	if (!total)
-		return 0;
-
-	events = kvmalloc_array(total, sizeof(*events), GFP_KERNEL);
-	if (!events) {
-		p2p_requeue_harvested(batch, &tmp);
-		return -ENOMEM;
-	}
-
-	i = 0;
-	list_for_each_entry(io_ctx, &tmp, io_list)
-		p2p_fill_io_event(io_ctx, &events[i++]);
-	if (copy_to_user(user_events, events, total * sizeof(*events))) {
-		p2p_requeue_harvested(batch, &tmp);
-		kvfree(events);
-		return -EFAULT;
-	}
-
-	list_for_each_entry_safe(io_ctx, next_io_ctx, &tmp, io_list) {
-		list_del_init(&io_ctx->io_list);
-		free_io_ctx(io_ctx);
-	}
-	kvfree(events);
-
-	return total;
+	if (total)
+		return (int)total;
+	return ret;
 }
 
 static int p2p_add_topo(struct p2p_batch *batch, void __user *arg)

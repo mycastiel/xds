@@ -1,14 +1,17 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <time.h>
 
-#include "nds_api.h"
+#include "nds_api_internal.h"
+#include "p2p_dev_uapi.h"
 
 /*
  * Opaque ctx wrapper: Python holds the pointer as a PyCapsule named "nds_io_ctx".
@@ -225,6 +228,23 @@ static PyObject *py_nds_io_destroy_ctx(PyObject *Py_UNUSED(self), PyObject *args
 	return PyLong_FromLong(ret);
 }
 
+static PyObject *py_nds_io_dup_fd_for_test(PyObject *Py_UNUSED(self),
+					   PyObject *args)
+{
+	PyObject *capsule;
+	struct nds_io_ctx *ctx;
+	int fd;
+
+	if (!PyArg_ParseTuple(args, "O", &capsule))
+		return NULL;
+	ctx = nds_ctx_from_obj(capsule);
+	if (!ctx)
+		return NULL;
+
+	fd = fcntl(ctx->p2p_fd, F_DUPFD_CLOEXEC, 0);
+	return PyLong_FromLong(fd < 0 ? -errno : fd);
+}
+
 static PyObject *py_nds_io_submit(PyObject *Py_UNUSED(self), PyObject *args)
 {
 	PyObject *capsule;
@@ -412,6 +432,8 @@ static PyMethodDef NdsMethods[] = {
 	  "io_new_ctx(max_io_cnt[, flags=0]) -> ctx capsule | negative errno\n" },
 	{ "io_destroy_ctx", py_nds_io_destroy_ctx, METH_VARARGS,
 	  "io_destroy_ctx(ctx) -> int\n" },
+	{ "_io_dup_fd_for_test", py_nds_io_dup_fd_for_test, METH_VARARGS,
+	  "Internal test hook: duplicate the context fd.\n" },
 	{ "io_submit", py_nds_io_submit, METH_VARARGS,
 	  "io_submit(ctx, iocbs) -> int\n\n"
 	  "iocb: (opcode, fd, offset, iov"
@@ -448,7 +470,9 @@ PyMODINIT_FUNC PyInit_nds(void)
 	    PyModule_AddIntConstant(module, "NDS_IO_OP_PREAD", NDS_IO_OP_PREAD) ||
 	    PyModule_AddIntConstant(module, "NDS_IO_OP_PWRITE", NDS_IO_OP_PWRITE) ||
 	    PyModule_AddIntConstant(module, "NDS_IO_F_REGISTERED_MEM",
-				    NDS_IO_F_REGISTERED_MEM)) {
+				    NDS_IO_F_REGISTERED_MEM) ||
+	    PyModule_AddIntConstant(module, "_IOCTL_DRAIN_IO",
+				    IOCTL_DRAIN_IO)) {
 		Py_DECREF(module);
 		return NULL;
 	}

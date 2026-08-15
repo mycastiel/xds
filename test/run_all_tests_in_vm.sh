@@ -159,6 +159,11 @@ main()
 			"XDS_STRESS_ITERATIONS=$STRESS_ITERATIONS" \
 			"$SCRIPT_DIR/stress_test.sh"
 	done
+	for mode in raid0 dm nvme; do
+		run_suite "cq-race-$mode" 0 \
+			"XDS_STRESS_MODE=$mode" \
+			"$SCRIPT_DIR/cq_race_test.sh"
+	done
 
 	sudo chown -R "$(id -u):$(id -g)" "$VARIANT_DIR"
 	printf '\nAll %s tests passed.\n' "$KERNEL_VARIANT"

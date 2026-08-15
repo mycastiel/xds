@@ -22,7 +22,6 @@
 
 #define P2P_SECTOR_SIZE 512U
 #define P2P_SECTORS_PER_KB (1024U / P2P_SECTOR_SIZE)
-#define P2P_DEFAULT_BLOCK_SIZE 4096U
 #define P2P_DM_CONTROL "/dev/mapper/control"
 #define P2P_DM_BUFFER_SIZE (16U << 10)
 #define P2P_UNSUPPORTED_FIEMAP_FLAGS \
@@ -214,6 +213,7 @@ static int discover_nvme(const char *dev, dev_t top_dev,
 	cfg->nr_devs = 1;
 	cfg->top_dev = top_dev;
 	cfg->bdevs[0].dev_id = top_dev;
+	cfg->bdevs[0].reserved = 0;
 	cfg->bdevs[0].size_sector = size_sectors;
 	cfg->bdevs[0].start_sector = 0;
 	return 0;
@@ -358,6 +358,7 @@ static int discover_linear(const char *dev, dev_t top_dev,
 		if (err)
 			goto out;
 		entry->dev_id = component;
+		entry->reserved = 0;
 		entry->size_sector = spec->length;
 		entry->start_sector = start_sector;
 		if (__builtin_add_overflow(logical_end,
@@ -456,6 +457,11 @@ static int read_raid0_member(int md_fd, const char *name,
 	if (err)
 		goto out;
 
+	/*
+	 * member is stack-allocated by the caller; zero reserved so
+	 * topo_validate_cfg does not reject uninitialized garbage.
+	 */
+	memset(member, 0, sizeof(*member));
 	member->slot = slot;
 	member->bdev.dev_id = component;
 	member->bdev.size_sector = size_kb * P2P_SECTORS_PER_KB;
@@ -478,6 +484,7 @@ static int discover_raid0_members(dev_t top_dev, unsigned int raid_disks,
 	int dir_fd;
 	int err;
 
+	memset(members, 0, sizeof(members));
 	err = sysfs_path(md_path, sizeof(md_path), top_dev, "md");
 	if (err)
 		return err;
@@ -650,23 +657,6 @@ out:
 	return err;
 }
 
-static int is_power_of_two(unsigned int value)
-{
-	return value && !(value & (value - 1));
-}
-
-static unsigned int get_fiemap_block_size(int file_fd)
-{
-	int block_size = 0;
-
-	if (!ioctl(file_fd, FIGETBSZ, &block_size) &&
-	    block_size >= (int)P2P_SECTOR_SIZE &&
-	    is_power_of_two((unsigned int)block_size))
-		return block_size;
-
-	return P2P_DEFAULT_BLOCK_SIZE;
-}
-
 static unsigned long long align_down_u64(unsigned long long value,
 					 unsigned int alignment)
 {
@@ -785,7 +775,7 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat,
 	if (!S_ISREG(file_stat->st_mode))
 		return -EINVAL;
 
-	block_size = get_fiemap_block_size(file_fd);
+	block_size = file_stat->st_blksize;
 	err = calc_fiemap_extent_count(offset, size, block_size, &max_num);
 	if (err)
 		return err;
