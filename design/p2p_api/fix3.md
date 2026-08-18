@@ -75,9 +75,11 @@ FIEMAP extent packing (`p2p_prepare_io_extents` / `p2p_get_iov_size`) only.
      `-ERANGE`.
    - A process-wide mutex protects the internal registration table during
      registration, lookup, removal, and teardown.
-   - `nds_unregister_mem` frees the kernel handle on success. If the kernel
-     ioctl fails, the library keeps the address-to-handle entry so the caller
-     can retry the unregister operation.
+   - `nds_unregister_mem(addr, size, flags)` requires `flags == 0` and an exact
+     base-address and size match with the registered range. A size mismatch
+     returns `-EINVAL` and leaves the entry tracked. On a matching request, the
+     function frees the kernel handle; if the ioctl fails, the library keeps
+     the entry so the caller can retry.
 
 5. **Async-only surface: no synchronous helpers**
    - `nds_io_pread` / `nds_io_pwrite` (and their Python `io_pread`/`io_pwrite`
@@ -154,6 +156,7 @@ int nds_exit(void);
 int nds_register_fs(const struct nds_fs_desc *desc);
 int nds_unregister_fs(const struct nds_fs_desc *desc); /* currently no-op */
 int nds_register_mem(void *addr, uint64_t size, int flags);   /* no handle out */
+int nds_unregister_mem(void *addr, uint64_t size, int flags);
 int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 		  const struct nds_io_cb *iocb);
 int nds_io_getevents(struct nds_io_ctx *ctx, int min_nr, int nr,
@@ -182,6 +185,8 @@ callers.
   without removing any topology.
 - `nds.exit() -> int`.
 - `nds.register_mem(addr, size[, flags]) -> int` (errno-style, no handle).
+- `nds.unregister_mem(addr, size[, flags]) -> int`; `size` is mandatory and
+  must match the registered range.
 - Targets are passed directly as nonnegative fds; there is no object-type tuple.
 - The optional `host_pid` moved into the iocb tuple:
   `(opcode, fd, offset, iov[, rw_flags=0, host_pid=0, user_data=0])`, where
@@ -205,6 +210,7 @@ callers.
 | unknown `rw_flags`                          | `-EOPNOTSUPP` |
 | init: nonzero flags or reserved fields      | `-EINVAL`     |
 | register fs: `fs_fd_cnt == 0` / NULL `fs_fd` / nonzero reserved | `-EINVAL` |
+| unregister mem: registered size mismatch       | `-EINVAL`     |
 | ctx: `max_io_cnt == 0` or `max_io_cnt > NDS_IO_MAX_IO_CNT` | `-EINVAL` |
 | negative submit/getevents counts            | `-EINVAL`     |
 | any nonzero reserved input field            | `-EINVAL`     |
@@ -224,6 +230,7 @@ remains the kernel's responsibility; NDS just propagates the errno.
   `reject-reg-unregistered-buf` (replaces `reject-reg-zero-handle` and
   `reject-oneshot-with-handle`), `reject-reg-iov-out-of-region` (register a
   small window, multi-iov with later vector outside → `-ERANGE`),
+  `reject-reg-unregister-size` (wrong registered range size → `-EINVAL`),
   `reject-host-pid-neg`,
   `reject-reg-host-pid`, `reject-unknown-rw-flags`, reserved-field checks,
   Python integer-overflow checks, init/ctx range checks, negative completion
