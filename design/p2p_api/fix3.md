@@ -1,9 +1,9 @@
-# fix3 — NDS v2.6 API: init-time topologies, FD-only vector I/O, hidden mem_handle, async-only
+# fix3 — NDS v2.6 API: dynamic filesystem registration, FD-only vector I/O, hidden mem_handle, async-only
 
 Status: authoritative v1 contract implemented in this tree. It supersedes the
 conflicting API descriptions in `../p2p_api.md` and the other documents in this
 directory, including the per-ctx topology-caching part of `fix1.md` (topology
-is registered once at `nds_init`, not per I/O ctx).
+is registered process-wide through `nds_register_fs`, not per I/O ctx).
 
 The kernel registered-memory UAPI remains handle-based:
 `p2p_mem_register_param` returns `mem_handle`, and `p2p_io_param` consumes it.
@@ -26,23 +26,33 @@ FIEMAP extent packing (`p2p_prepare_io_extents` / `p2p_get_iov_size`) only.
 
 ## Goals
 
-1. **Topology registration at init time, once**
-   - `nds_init_param` carries an `nds_fs_desc` (in the `_data[4]` union):
-     `int32_t *fs_fd` + `uint32_t fs_fd_cnt` — an array of file descriptors
-     identifying the top device(s) of the I/O topology (regular file on the
-     filesystem, or the block device itself). v1 requires `fs_fd_cnt >= 1` and
-     registers the topology identified by every supplied descriptor.
-   - `nds_init` uses `fstat(fs_fd[i])` to obtain each open file's device identity;
-     regular files use `st_dev` and block devices use `st_rdev`. It resolves
-     `/sys/dev/block/<maj>:<min>` to `/dev/<base>` and issues `IOCTL_ADD_TOPO`
-     on the global `book_fd`, without reopening or restating the file path.
+1. **Dynamic process-wide filesystem topology registration**
+   - `nds_init_param` contains only flags, reserved expansion space, and the
+     output API version. `nds_init` opens separate private `/dev/p2p_device`
+     fds for topology ownership and registered-memory bookkeeping and retains
+     both until `nds_exit`; it does not take filesystem descriptors.
+   - `nds_register_fs` accepts an `nds_fs_desc`: `int32_t *fs_fd` plus
+     `uint32_t fs_fd_cnt`, an array of descriptors identifying the top
+     device(s) of an I/O topology (a regular file on the filesystem or the
+     block device itself). v1 requires `fs_fd_cnt >= 1`.
+   - `nds_register_fs` uses `fstat(fs_fd[i])` to obtain each open file's device
+     identity; regular files use `st_dev` and block devices use `st_rdev`. It
+     resolves `/sys/dev/block/<maj>:<min>` to `/dev/<base>` and issues
+     `IOCTL_ADD_TOPO` on the topology-specific fd opened by `nds_init`, without
+     reopening or restating the file path. It never uses the memory
+     bookkeeping fd for `IOCTL_ADD_TOPO`.
+   - Applications call `nds_register_fs` for the initial set and call it again
+     whenever another underlying filesystem becomes available. A multi-fd call
+     is processed in array order; if a later descriptor fails, topologies from
+     the successful prefix remain registered.
    - All `p2p_fd` I/O contexts created afterwards share the registered topology.
      The per-ctx topo cache from `fix1.md` is removed.
    - Any `add_topo` error is propagated; the current topology path does not
      return `-EEXIST` for an already installed global topology.
    - `nds_init_param.version` is output-only and is set to
      `NDS_API_VERSION` when initialization succeeds.
-   - Teardown is `nds_exit()` (renamed from `nds_shutdown`).
+   - `nds_unregister_fs` is currently an explicit no-op placeholder. Registered
+     topologies remain pinned until `nds_exit()` closes the topology fd.
 
 2. **FD-only object surface**
    - Object-type constants are removed. `nds_io_obj` contains only an fd plus
@@ -100,7 +110,7 @@ struct nds_fs_desc {
 
 struct nds_init_param {
 	uint32_t flags;
-	union { uint64_t _data[4]; struct nds_fs_desc desc; };
+	uint64_t reserved[4];
 	uint32_t version;          /* output: NDS_API_VERSION */
 };
 
@@ -141,6 +151,8 @@ struct nds_io_event {
 
 int nds_init(struct nds_init_param *param);
 int nds_exit(void);
+int nds_register_fs(const struct nds_fs_desc *desc);
+int nds_unregister_fs(const struct nds_fs_desc *desc); /* currently no-op */
 int nds_register_mem(void *addr, uint64_t size, int flags);   /* no handle out */
 int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 		  const struct nds_io_cb *iocb);
@@ -162,8 +174,12 @@ callers.
 
 ## Python binding
 
-- `nds.init(fs_fds[, flags])` — `fs_fds` is a sequence of fds
-  (e.g. `[topo_fd]`); empty/invalid entries raise in the binding.
+- `nds.init([flags]) -> int` initializes the process-wide state without a
+  filesystem descriptor.
+- `nds.register_fs(fs_fds) -> int` accepts a sequence of file/block-device fds
+  (for example `[topo_fd]`) and may be called repeatedly after initialization.
+- `nds.unregister_fs(fs_fds) -> int` is exposed but currently returns success
+  without removing any topology.
 - `nds.exit() -> int`.
 - `nds.register_mem(addr, size[, flags]) -> int` (errno-style, no handle).
 - Targets are passed directly as nonnegative fds; there is no object-type tuple.
@@ -187,7 +203,8 @@ callers.
 | REGISTERED_MEM + `host_pid != 0`            | `-EINVAL`     |
 | `host_pid < 0`                              | `-EINVAL`     |
 | unknown `rw_flags`                          | `-EOPNOTSUPP` |
-| init: `fs_fd_cnt == 0` / NULL `fs_fd`       | `-EINVAL`     |
+| init: nonzero flags or reserved fields      | `-EINVAL`     |
+| register fs: `fs_fd_cnt == 0` / NULL `fs_fd` / nonzero reserved | `-EINVAL` |
 | ctx: `max_io_cnt == 0` or `max_io_cnt > NDS_IO_MAX_IO_CNT` | `-EINVAL` |
 | negative submit/getevents counts            | `-EINVAL`     |
 | any nonzero reserved input field            | `-EINVAL`     |
@@ -198,8 +215,11 @@ remains the kernel's responsibility; NDS just propagates the errno.
 ## Tests
 
 - `nds_api_test.c` / `python_nds_api_test.py` open every manifest path
-  (`O_RDONLY|O_DIRECT`) and pass the fd; `--topology` is opened once and handed
-  to `nds_init` as the single element of `desc.fs_fd`.
+  (`O_RDONLY|O_DIRECT`) and pass the fd. They call `nds_init` first, then hand
+  `--topology` to `nds_register_fs`.
+- Reject mode opens a second topology fd after initialization and passes it to
+  a second `nds_register_fs` call, demonstrating dynamic growth. It also calls
+  the current no-op `nds_unregister_fs` and verifies I/O can continue.
 - Reject mode updated to the new surface:
   `reject-reg-unregistered-buf` (replaces `reject-reg-zero-handle` and
   `reject-oneshot-with-handle`), `reject-reg-iov-out-of-region` (register a
@@ -208,7 +228,10 @@ remains the kernel's responsibility; NDS just propagates the errno.
   `reject-reg-host-pid`, `reject-unknown-rw-flags`, reserved-field checks,
   Python integer-overflow checks, init/ctx range checks, negative completion
   results, and `reject-getevents-empty`.
-- `nds_init` is process-wide and not thread-safe: call once from one thread.
+- `nds_init` and `nds_exit` are process-wide lifecycle boundaries and must not
+  run concurrently with other NDS operations. After successful initialization,
+  concurrent `nds_register_fs` calls are supported; `nds_unregister_fs` remains
+  a no-op.
 - `nds_io_destroy_ctx` frees the ctx; double destroy is undefined behavior.
 - Completion tests match each event to its request by `user_data` and verify
   `res` and reserved output fields, including queued
