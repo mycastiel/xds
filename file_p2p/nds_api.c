@@ -235,7 +235,6 @@ int nds_unregister_mem(void *addr, uint64_t size, int flags)
 	struct p2p_mem_unregister_param up;
 	int ret = 0;
 
-	(void)size;
 	if (flags)
 		return -EINVAL;
 
@@ -247,6 +246,14 @@ int nds_unregister_mem(void *addr, uint64_t size, int flags)
 	if (!*prev) {
 		pthread_mutex_unlock(&g_state.reg_lock);
 		return -ENOENT;
+	}
+	if ((*prev)->size != size) {
+		fprintf(stderr,
+			"nds: unregister memory addr=%p size=%llu does not match registered size=%llu\n",
+			addr, (unsigned long long)size,
+			(unsigned long long)(*prev)->size);
+		pthread_mutex_unlock(&g_state.reg_lock);
+		return -EINVAL;
 	}
 
 	r = *prev;
