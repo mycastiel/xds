@@ -181,9 +181,13 @@ def main() -> int:
             hbm = AscendHbm(args.npu_device, buf_span, args.acl_policy)
             cmb_va = hbm.addr
 
-        ret = nds.init([topo_fd])
+        ret = nds.init()
         if ret:
             raise RuntimeError(f"nds.init returned {ret}")
+        ret = nds.register_fs([topo_fd])
+        if ret:
+            nds.exit()
+            raise RuntimeError(f"nds.register_fs returned {ret}")
         try:
             if register_mem:
                 ret = nds.register_mem(cmb_va, buf_span)
