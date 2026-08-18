@@ -13,6 +13,7 @@ REG_SIZE = (4 << 20) - REG_ADDR
 SECOND_REG_ADDR = (8 << 20) + 512
 SECOND_REG_SIZE = (4 << 20) - 512
 REGISTERED = file_p2p.P2P_IO_F_REGISTERED_MEM
+UNKNOWN_FLAG = 1 << 31
 
 
 def require(operation: str, actual: int, expected: int = 0) -> None:
@@ -74,7 +75,7 @@ def main() -> int:
                 0,
                 [(REG_ADDR, 512)],
                 handle,
-                1 << 1,
+                UNKNOWN_FLAG,
             ),
             -errno.EOPNOTSUPP,
         )
