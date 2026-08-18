@@ -133,15 +133,15 @@ struct nds_io_cb {
 	 * Must be 0 when NDS_IO_F_REGISTERED_MEM is set.
 	 */
 	int32_t host_pid;
-	uint64_t reserved;
+	uint64_t reserved[2];		/* must be zero */
 };
 
-/* One completion. Layout matches kernel struct p2p_io_event (32B).
+/* One completion. Layout matches kernel struct p2p_io_event (48B).
  * res is success(==0) or -errno; reserved must be zero. */
 struct nds_io_event {
 	uint64_t user_data;
 	int64_t res;
-	uint64_t reserved[2];
+	uint64_t reserved[4];
 };
 
 /* Process-wide init / teardown.
@@ -157,7 +157,7 @@ int nds_exit(void);
  * an unregister failure keeps the registration tracked so it can be retried.
  */
 int nds_register_mem(void *addr, uint64_t size, int flags);
-int nds_unregister_mem(void *addr);
+int nds_unregister_mem(void *addr, uint64_t size, int flags);
 
 /* Create / destroy a per-queue I/O context. Destroy drains outstanding I/O
  * and frees @ctx. The caller owns the pointer until destroy; double destroy

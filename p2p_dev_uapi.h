@@ -11,7 +11,9 @@ struct p2p_iov {
 };
 
 #define P2P_IO_F_REGISTERED_MEM (1U << 0)
-#define P2P_IO_F_MASK P2P_IO_F_REGISTERED_MEM
+/* Echo completion_data separately while preserving caller-owned user_data. */
+#define P2P_IO_F_COMPLETION_DATA (1U << 1)
+#define P2P_IO_F_MASK (P2P_IO_F_REGISTERED_MEM | P2P_IO_F_COMPLETION_DATA)
 
 #define P2P_IO_READ 0U
 #define P2P_IO_WRITE 1U
@@ -32,13 +34,13 @@ struct p2p_io_param {
 	unsigned int iov_nr;
 	unsigned int ext_nr;
 	__u64 extents;            /* userspace pointer to struct fiemap_extent[] */
-	__u64 reserved;           /* must be zero */
+	__u64 reserved[3];           /* must be zero */
 };
 
 struct p2p_io_event {
 	__u64 user_data;
 	__s64 res;                /* 0 on success or -errno */
-	__u64 reserved[2];        /* pad to 32B; matches NDS nds_io_event */
+	__u64 reserved[4];
 };
 
 struct p2p_getevents_param {

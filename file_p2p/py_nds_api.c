@@ -169,13 +169,15 @@ static PyObject *py_nds_register_mem(PyObject *Py_UNUSED(self), PyObject *args)
 static PyObject *py_nds_unregister_mem(PyObject *Py_UNUSED(self), PyObject *args)
 {
 	unsigned long long addr;
+	unsigned long long size = 0;
+	int flags = 0;
 	int ret;
 
-	if (!PyArg_ParseTuple(args, "K", &addr))
+	if (!PyArg_ParseTuple(args, "K|Ki", &addr, &size, &flags))
 		return NULL;
 
 	Py_BEGIN_ALLOW_THREADS
-	ret = nds_unregister_mem((void *)(uintptr_t)addr);
+	ret = nds_unregister_mem((void *)(uintptr_t)addr, size, flags);
 	Py_END_ALLOW_THREADS
 	return PyLong_FromLong(ret);
 }
@@ -427,7 +429,8 @@ static PyMethodDef NdsMethods[] = {
 	{ "register_mem", py_nds_register_mem, METH_VARARGS,
 	  "register_mem(addr, size[, flags=0]) -> int\n" },
 	{ "unregister_mem", py_nds_unregister_mem, METH_VARARGS,
-	  "unregister_mem(addr) -> int\n" },
+	  "unregister_mem(addr[, size=0[, flags=0]]) -> int\n"
+	  "size=0 looks up by addr (current single-range mode).\n" },
 	{ "io_new_ctx", py_nds_io_new_ctx, METH_VARARGS,
 	  "io_new_ctx(max_io_cnt[, flags=0]) -> ctx capsule | negative errno\n" },
 	{ "io_destroy_ctx", py_nds_io_destroy_ctx, METH_VARARGS,

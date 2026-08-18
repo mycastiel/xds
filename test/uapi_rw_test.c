@@ -21,6 +21,10 @@ _Static_assert(sizeof(struct p2p_iov) == 16,
 	       "p2p_iov must remain a 16-byte UAPI record");
 _Static_assert(offsetof(struct p2p_iov, reserved) == 12,
 	       "p2p_iov reserved field must occupy the old padding");
+_Static_assert(sizeof(struct p2p_io_param) == 80,
+	       "p2p_io_param includes reserved[3]");
+_Static_assert(sizeof(struct p2p_io_event) == 48,
+	       "p2p_io_event matches nds_io_event: user_data + res + reserved[4]");
 _Static_assert(sizeof(((struct p2p_io_param *)0)->iov) == sizeof(uint64_t),
 	       "p2p_io_param iov address must be fixed-width");
 _Static_assert(sizeof(((struct p2p_getevents_param *)0)->events) ==
@@ -137,6 +141,11 @@ int main(int argc, char **argv)
 	if (err)
 		goto out;
 	param->flags = 0;
+	param->reserved[0] = 1;
+	err = expect("IO reserved field", issue(dev_fd, param), -EINVAL);
+	if (err)
+		goto out;
+	param->reserved[0] = 0;
 	iov.reserved = 1;
 	err = expect("IOV reserved field", issue(dev_fd, param), -EINVAL);
 	if (err)

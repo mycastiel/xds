@@ -486,7 +486,8 @@ static int harvest_io(struct nds_io_ctx *ctx,
 		for (i = 0; i < (unsigned int)n; i++) {
 			unsigned int j;
 
-			if (events[i].reserved[0] || events[i].reserved[1]) {
+			if (events[i].reserved[0] || events[i].reserved[1] ||
+			    events[i].reserved[2] || events[i].reserved[3]) {
 				fprintf(stderr,
 					"completion cookie %llu has nonzero reserved fields\n",
 					(unsigned long long)events[i].user_data);
@@ -789,12 +790,18 @@ static int run_reject(const char *topology)
 	cb.iov = iov;
 	cb.iov_cnt = 2;
 
-	cb.reserved = 1;
+	cb.reserved[0] = 1;
 	ret = nds_io_submit(ctx, 1, &cb);
 	err = expect_case("reject-cb-reserved", ret, -EINVAL);
 	if (err)
 		goto out;
-	cb.reserved = 0;
+	cb.reserved[0] = 0;
+	cb.reserved[1] = 1;
+	ret = nds_io_submit(ctx, 1, &cb);
+	err = expect_case("reject-cb-reserved1", ret, -EINVAL);
+	if (err)
+		goto out;
+	cb.reserved[1] = 0;
 
 	cb.obj.reserved = 1;
 	ret = nds_io_submit(ctx, 1, &cb);
@@ -862,7 +869,7 @@ static int run_reject(const char *topology)
 	ret = nds_io_submit(ctx, 1, &cb);
 	err = expect_case("reject-reg-iov-out-of-region", ret, -ERANGE);
 	{
-		int uret = nds_unregister_mem((void *)(uintptr_t)0);
+		int uret = nds_unregister_mem((void *)(uintptr_t)0, 0, 0);
 
 		if (uret && !err)
 			err = expect_case("reject-reg-range-unregister", uret, 0);
@@ -1611,6 +1618,7 @@ static void *cq_race_reaper(void *argument)
 			size_t index;
 
 			if (events[i].reserved[0] || events[i].reserved[1] ||
+			    events[i].reserved[2] || events[i].reserved[3] ||
 			    events[i].res != 0) {
 				cq_race_fail(context, -EINVAL, "bad event",
 					     UINT_MAX);
@@ -2007,7 +2015,7 @@ out:
 	if (registered) {
 		int unregister_err;
 
-		unregister_err = nds_unregister_mem((void *)(uintptr_t)0);
+		unregister_err = nds_unregister_mem((void *)(uintptr_t)0, 0, 0);
 		if (unregister_err && !err)
 			err = unregister_err;
 	}
@@ -2120,7 +2128,7 @@ out:
 		int unregister_err;
 
 		unregister_err = nds_unregister_mem(
-			(void *)(uintptr_t)context.reg_addr);
+			(void *)(uintptr_t)context.reg_addr, 0, 0);
 		if (unregister_err && !err)
 			err = unregister_err;
 	}
@@ -2511,7 +2519,7 @@ out:
 		int unregister_err;
 
 		unregister_err =
-			nds_unregister_mem((void *)(uintptr_t)reg_addr);
+			nds_unregister_mem((void *)(uintptr_t)reg_addr, 0, 0);
 		if (unregister_err && !err)
 			err = unregister_err;
 	}

@@ -1392,7 +1392,7 @@ static int validate_io_param(const struct p2p_io_param *param)
 	if (!param->iov_nr || param->iov_nr > P2P_MAX_IOV ||
 	    !param->ext_nr || param->ext_nr > P2P_MAX_EXTENTS)
 		return -EINVAL;
-	if (param->reserved)
+	if (param->reserved[0] || param->reserved[1] || param->reserved[2])
 		return -EINVAL;
 	if (param->flags & P2P_IO_F_REGISTERED_MEM)
 		return !param->mem_handle || param->host_pid ? -EINVAL : 0;
@@ -1633,6 +1633,8 @@ static void p2p_fill_io_event(struct p2p_io_context *io_ctx, struct p2p_io_event
 	out->res = err ? err : 0;
 	out->reserved[0] = 0;
 	out->reserved[1] = 0;
+	out->reserved[2] = 0;
+	out->reserved[3] = 0;
 }
 
 static bool p2p_cq_ready(struct p2p_batch *batch, unsigned int min_nr)
