@@ -870,13 +870,17 @@ static int run_reject(const char *topology)
 	err = expect_case("reject-reg-range-register", ret, 0);
 	if (err)
 		goto out;
+	ret = nds_unregister_mem((void *)(uintptr_t)0, 8192, 0);
+	err = expect_case("reject-reg-unregister-size", ret, -EINVAL);
+	if (err)
+		goto out;
 	cb.rw_flags = NDS_IO_F_REGISTERED_MEM;
 	cb.host_pid = 0;
 	cb.iov_cnt = 2;
 	ret = nds_io_submit(ctx, 1, &cb);
 	err = expect_case("reject-reg-iov-out-of-region", ret, -ERANGE);
 	{
-		int uret = nds_unregister_mem((void *)(uintptr_t)0, 0, 0);
+		int uret = nds_unregister_mem((void *)(uintptr_t)0, 4096, 0);
 
 		if (uret && !err)
 			err = expect_case("reject-reg-range-unregister", uret, 0);
@@ -2022,7 +2026,8 @@ out:
 	if (registered) {
 		int unregister_err;
 
-		unregister_err = nds_unregister_mem((void *)(uintptr_t)0, 0, 0);
+		unregister_err = nds_unregister_mem((void *)(uintptr_t)0,
+					    cmb_size, 0);
 		if (unregister_err && !err)
 			err = unregister_err;
 	}
@@ -2135,7 +2140,7 @@ out:
 		int unregister_err;
 
 		unregister_err = nds_unregister_mem(
-			(void *)(uintptr_t)context.reg_addr, 0, 0);
+			(void *)(uintptr_t)context.reg_addr, cmb_size, 0);
 		if (unregister_err && !err)
 			err = unregister_err;
 	}
@@ -2153,7 +2158,7 @@ out:
 }
 
 static int register_test_cases(const struct test_case *tests, size_t count,
-			       uint64_t *reg_addr)
+			       uint64_t *reg_addr, uint64_t *reg_size)
 {
 	unsigned long range_start = ULONG_MAX;
 	unsigned long range_end = 0;
@@ -2182,6 +2187,7 @@ static int register_test_cases(const struct test_case *tests, size_t count,
 	if (err)
 		return err;
 	*reg_addr = range_start;
+	*reg_size = range_end - range_start;
 	return 0;
 }
 
@@ -2212,6 +2218,7 @@ int main(int argc, char **argv)
 	unsigned long backing_page_size = 0;
 	unsigned int drain_overlap_ms = 0;
 	uint64_t reg_addr = 0;
+	uint64_t reg_size = 0;
 	bool registered_mem = false;
 	bool registered = false;
 	bool nds_ready = false;
@@ -2529,7 +2536,7 @@ reject_out:
 		}
 	}
 	if (registered_mem) {
-		err = register_test_cases(tests, count, &reg_addr);
+		err = register_test_cases(tests, count, &reg_addr, &reg_size);
 		if (err) {
 			fprintf(stderr, "register test memory failed: %s\n",
 				strerror(-err));
@@ -2568,7 +2575,8 @@ out:
 		int unregister_err;
 
 		unregister_err =
-			nds_unregister_mem((void *)(uintptr_t)reg_addr, 0, 0);
+			nds_unregister_mem((void *)(uintptr_t)reg_addr,
+					   reg_size, 0);
 		if (unregister_err && !err)
 			err = unregister_err;
 	}

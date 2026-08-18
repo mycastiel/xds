@@ -260,6 +260,11 @@ def run_reject(topology: str) -> None:
         require("reject-reg-range-register", nds.register_mem(0, 4096), 0)
         try:
             require(
+                "reject-reg-unregister-size",
+                nds.unregister_mem(0, 8192),
+                -errno.EINVAL,
+            )
+            require(
                 "reject-reg-iov-out-of-region",
                 nds.io_submit(
                     ctx,
@@ -280,7 +285,7 @@ def run_reject(topology: str) -> None:
         finally:
             require(
                 "reject-reg-range-unregister",
-                nds.unregister_mem(0),
+                nds.unregister_mem(0, 4096),
                 0,
             )
         require(
@@ -1311,7 +1316,7 @@ def main() -> int:
                 cleanup_errors = []
                 close_case_fds(tests)
                 if reg_addr is not None:
-                    result = nds.unregister_mem(reg_addr)
+                    result = nds.unregister_mem(reg_addr, args.cmb_size)
                     if result:
                         cleanup_errors.append(f"unregister_mem returned {result}")
                 exit_rc = nds.exit()
@@ -1347,6 +1352,7 @@ def main() -> int:
             raise RuntimeError(f"nds.register_fs returned {ret}")
         ctx = None
         reg_addr: Optional[int] = None
+        reg_size = 0
         try:
             if args.registered_mem:
                 addr, size = registered_range(tests)
@@ -1354,6 +1360,7 @@ def main() -> int:
                 if result:
                     raise RuntimeError(f"register_mem returned {result}")
                 reg_addr = addr
+                reg_size = size
             flags = nds.NDS_IO_F_REGISTERED_MEM if args.registered_mem else 0
             open_case_fds(tests)
             if args.mode == "threaded":
@@ -1373,7 +1380,7 @@ def main() -> int:
                 except BaseException as error:
                     cleanup_errors.append(str(error))
             if reg_addr is not None:
-                result = nds.unregister_mem(reg_addr)
+                result = nds.unregister_mem(reg_addr, reg_size)
                 if result:
                     cleanup_errors.append(f"unregister_mem returned {result}")
             exit_rc = nds.exit()

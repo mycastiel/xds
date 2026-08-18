@@ -309,7 +309,7 @@ def main() -> int:
                 if destroy:
                     raise RuntimeError(f"io_destroy_ctx returned {destroy}")
             if register_mem:
-                unreg = nds.unregister_mem(cmb_va)
+                unreg = nds.unregister_mem(cmb_va, buf_span)
                 if unreg:
                     raise RuntimeError(f"unregister_mem returned {unreg}")
         finally:
