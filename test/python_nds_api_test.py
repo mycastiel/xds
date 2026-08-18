@@ -260,6 +260,11 @@ def run_reject(topology: str) -> None:
         require("reject-reg-range-register", nds.register_mem(0, 4096), 0)
         try:
             require(
+                "reject-reg-unregister-size",
+                nds.unregister_mem(0, 8192),
+                -errno.EINVAL,
+            )
+            require(
                 "reject-reg-iov-out-of-region",
                 nds.io_submit(
                     ctx,
@@ -280,7 +285,7 @@ def run_reject(topology: str) -> None:
         finally:
             require(
                 "reject-reg-range-unregister",
-                nds.unregister_mem(0),
+                nds.unregister_mem(0, 4096),
                 0,
             )
         require(
@@ -1212,23 +1217,44 @@ def main() -> int:
         if args.registered_mem:
             parser.error("reject mode does not take --registered-mem")
         topo_fd = os.open(args.topology, os.O_RDONLY | os.O_DIRECT)
+        second_topo_fd: Optional[int] = None
         try:
-            require("reject-init-empty-fds", nds.init([]), -errno.EINVAL)
             require(
                 "reject-init-flags",
-                nds.init([topo_fd], 1),
+                nds.init(1),
                 -errno.EINVAL,
             )
-            ret = nds.init([topo_fd])
+            ret = nds.init()
             if ret:
                 raise RuntimeError(f"nds.init returned {ret}")
             try:
+                require(
+                    "reject-register-fs-empty",
+                    nds.register_fs([]),
+                    -errno.EINVAL,
+                )
+                require("register-fs-initial", nds.register_fs([topo_fd]), 0)
+                second_topo_fd = os.open(
+                    args.topology, os.O_RDONLY | os.O_DIRECT
+                )
+                require(
+                    "register-fs-dynamic",
+                    nds.register_fs([second_topo_fd]),
+                    0,
+                )
+                require(
+                    "unregister-fs-noop",
+                    nds.unregister_fs([second_topo_fd]),
+                    0,
+                )
                 run_reject(args.topology)
             finally:
                 exit_rc = nds.exit()
                 if exit_rc:
                     raise RuntimeError(f"nds.exit returned {exit_rc}")
         finally:
+            if second_topo_fd is not None:
+                os.close(second_topo_fd)
             os.close(topo_fd)
         return 0
 
@@ -1243,9 +1269,13 @@ def main() -> int:
         tests = load_stress_manifest(args.manifest)
         topo_fd = os.open(args.topology, os.O_RDONLY | os.O_DIRECT)
         try:
-            ret = nds.init([topo_fd])
+            ret = nds.init()
             if ret:
                 raise RuntimeError(f"nds.init returned {ret}")
+            ret = nds.register_fs([topo_fd])
+            if ret:
+                nds.exit()
+                raise RuntimeError(f"nds.register_fs returned {ret}")
             reg_addr: Optional[int] = None
             try:
                 if args.registered_mem:
@@ -1286,7 +1316,7 @@ def main() -> int:
                 cleanup_errors = []
                 close_case_fds(tests)
                 if reg_addr is not None:
-                    result = nds.unregister_mem(reg_addr)
+                    result = nds.unregister_mem(reg_addr, args.cmb_size)
                     if result:
                         cleanup_errors.append(f"unregister_mem returned {result}")
                 exit_rc = nds.exit()
@@ -1313,11 +1343,16 @@ def main() -> int:
     tests = load_manifest(args.manifest)
     topo_fd = os.open(args.topology, os.O_RDONLY | os.O_DIRECT)
     try:
-        ret = nds.init([topo_fd])
+        ret = nds.init()
         if ret:
             raise RuntimeError(f"nds.init returned {ret}")
+        ret = nds.register_fs([topo_fd])
+        if ret:
+            nds.exit()
+            raise RuntimeError(f"nds.register_fs returned {ret}")
         ctx = None
         reg_addr: Optional[int] = None
+        reg_size = 0
         try:
             if args.registered_mem:
                 addr, size = registered_range(tests)
@@ -1325,6 +1360,7 @@ def main() -> int:
                 if result:
                     raise RuntimeError(f"register_mem returned {result}")
                 reg_addr = addr
+                reg_size = size
             flags = nds.NDS_IO_F_REGISTERED_MEM if args.registered_mem else 0
             open_case_fds(tests)
             if args.mode == "threaded":
@@ -1344,7 +1380,7 @@ def main() -> int:
                 except BaseException as error:
                     cleanup_errors.append(str(error))
             if reg_addr is not None:
-                result = nds.unregister_mem(reg_addr)
+                result = nds.unregister_mem(reg_addr, reg_size)
                 if result:
                     cleanup_errors.append(f"unregister_mem returned {result}")
             exit_rc = nds.exit()

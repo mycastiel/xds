@@ -2,7 +2,7 @@
  * nds_example.c — end-to-end NDS usage from init to I/O completion.
  *
  * Demonstrates the recommended hot path:
- *   nds_init → nds_register_mem → nds_io_new_ctx →
+ *   nds_init → nds_register_fs → nds_register_mem → nds_io_new_ctx →
  *   nds_io_submit → nds_io_getevents → teardown
  *
  * Build (from the repository root):
@@ -47,8 +47,10 @@ int main(int argc, char **argv)
 	int topo_fd = -1;
 	int file_fd = -1;
 	int32_t fs_fds[1];
-	struct nds_init_param init_param = {
-		.desc = { .fs_fd = fs_fds, .fs_fd_cnt = 1 },
+	struct nds_init_param init_param = { 0 };
+	struct nds_fs_desc fs_desc = {
+		.fs_fd = fs_fds,
+		.fs_fd_cnt = 1,
 	};
 	struct nds_io_ctx *ctx = NULL;
 	struct nds_io_cb cb;
@@ -81,12 +83,15 @@ int main(int argc, char **argv)
 	if (file_fd < 0)
 		die("open file", -errno);
 
-	/* ---- 2. Process-wide init (registers topology once) ---- */
-	fs_fds[0] = topo_fd;
+	/* ---- 2. Process-wide init + initial filesystem registration ---- */
 	err = nds_init(&init_param);
 	if (err)
 		die("nds_init", err);
 	printf("XDS API version: %u\n", init_param.version);
+	fs_fds[0] = topo_fd;
+	err = nds_register_fs(&fs_desc);
+	if (err)
+		die("nds_register_fs", err);
 
 	/*
 	 * ---- 3. Register the HBM window (optional but recommended) ----
@@ -138,9 +143,12 @@ int main(int argc, char **argv)
 		die("nds_io_destroy_ctx", err);
 	ctx = NULL;
 
-	err = nds_unregister_mem((void *)(uintptr_t)hbm_va, 0, 0);
+	err = nds_unregister_mem((void *)(uintptr_t)hbm_va, length, 0);
 	if (err)
 		die("nds_unregister_mem", err);
+	err = nds_unregister_fs(&fs_desc);
+	if (err)
+		die("nds_unregister_fs", err);
 
 	err = nds_exit();
 	if (err)

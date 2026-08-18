@@ -722,13 +722,9 @@ static int expect_case(const char *name, int ret, int expected)
 	return ret == expected ? 0 : -EINVAL;
 }
 
-static int init_nds(int32_t *topo_fds, uint32_t topo_fd_cnt)
+static int init_nds(void)
 {
 	struct nds_init_param param = {
-		.desc = {
-			.fs_fd = topo_fds,
-			.fs_fd_cnt = topo_fd_cnt,
-		},
 		.version = UINT32_MAX,
 	};
 	int ret;
@@ -739,9 +735,20 @@ static int init_nds(int32_t *topo_fds, uint32_t topo_fd_cnt)
 	if (param.version != NDS_API_VERSION) {
 		fprintf(stderr, "nds_init returned version %u, expected %u\n",
 			param.version, NDS_API_VERSION);
+		nds_exit();
 		return -EPROTO;
 	}
 	return 0;
+}
+
+static int register_nds_fs(int32_t *topo_fds, uint32_t topo_fd_cnt)
+{
+	const struct nds_fs_desc desc = {
+		.fs_fd = topo_fds,
+		.fs_fd_cnt = topo_fd_cnt,
+	};
+
+	return nds_register_fs(&desc);
 }
 
 static int run_reject(const char *topology)
@@ -863,13 +870,17 @@ static int run_reject(const char *topology)
 	err = expect_case("reject-reg-range-register", ret, 0);
 	if (err)
 		goto out;
+	ret = nds_unregister_mem((void *)(uintptr_t)0, 8192, 0);
+	err = expect_case("reject-reg-unregister-size", ret, -EINVAL);
+	if (err)
+		goto out;
 	cb.rw_flags = NDS_IO_F_REGISTERED_MEM;
 	cb.host_pid = 0;
 	cb.iov_cnt = 2;
 	ret = nds_io_submit(ctx, 1, &cb);
 	err = expect_case("reject-reg-iov-out-of-region", ret, -ERANGE);
 	{
-		int uret = nds_unregister_mem((void *)(uintptr_t)0, 0, 0);
+		int uret = nds_unregister_mem((void *)(uintptr_t)0, 4096, 0);
 
 		if (uret && !err)
 			err = expect_case("reject-reg-range-unregister", uret, 0);
@@ -2015,7 +2026,8 @@ out:
 	if (registered) {
 		int unregister_err;
 
-		unregister_err = nds_unregister_mem((void *)(uintptr_t)0, 0, 0);
+		unregister_err = nds_unregister_mem((void *)(uintptr_t)0,
+					    cmb_size, 0);
 		if (unregister_err && !err)
 			err = unregister_err;
 	}
@@ -2128,7 +2140,7 @@ out:
 		int unregister_err;
 
 		unregister_err = nds_unregister_mem(
-			(void *)(uintptr_t)context.reg_addr, 0, 0);
+			(void *)(uintptr_t)context.reg_addr, cmb_size, 0);
 		if (unregister_err && !err)
 			err = unregister_err;
 	}
@@ -2146,7 +2158,7 @@ out:
 }
 
 static int register_test_cases(const struct test_case *tests, size_t count,
-			       uint64_t *reg_addr)
+			       uint64_t *reg_addr, uint64_t *reg_size)
 {
 	unsigned long range_start = ULONG_MAX;
 	unsigned long range_end = 0;
@@ -2175,6 +2187,7 @@ static int register_test_cases(const struct test_case *tests, size_t count,
 	if (err)
 		return err;
 	*reg_addr = range_start;
+	*reg_size = range_end - range_start;
 	return 0;
 }
 
@@ -2205,6 +2218,7 @@ int main(int argc, char **argv)
 	unsigned long backing_page_size = 0;
 	unsigned int drain_overlap_ms = 0;
 	uint64_t reg_addr = 0;
+	uint64_t reg_size = 0;
 	bool registered_mem = false;
 	bool registered = false;
 	bool nds_ready = false;
@@ -2311,7 +2325,11 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 	if (mode == MODE_REJECT) {
-		struct nds_init_param invalid_init;
+		struct nds_init_param invalid_init = { 0 };
+		struct nds_fs_desc fs_desc = { 0 };
+		int32_t fs_fd;
+		int second_topo_fd = -1;
+		bool reject_nds_ready = false;
 
 		if (workers || iterations || cmb_size || va_granularity ||
 		    backing_page_size || result_manifest) {
@@ -2325,61 +2343,93 @@ int main(int argc, char **argv)
 				strerror(errno));
 			return EXIT_FAILURE;
 		}
-		invalid_init = (struct nds_init_param) {
-			.desc = { .fs_fd = (int32_t[]){ topo_fd },
-				  .fs_fd_cnt = 1 },
-		};
 		invalid_init.flags = 1;
 		err = expect_case("reject-init-flags", nds_init(&invalid_init),
 				  -EINVAL);
-		if (err) {
-			close(topo_fd);
-			return EXIT_FAILURE;
-		}
+		if (err)
+			goto reject_out;
 		invalid_init.flags = 0;
-		invalid_init.desc.fs_fd_cnt = 0;
-		err = expect_case("reject-init-empty-fds", nds_init(&invalid_init),
+		invalid_init.reserved[0] = 1;
+		err = expect_case("reject-init-reserved0", nds_init(&invalid_init),
 				  -EINVAL);
-		if (err) {
-			close(topo_fd);
-			return EXIT_FAILURE;
-		}
-		invalid_init.desc.fs_fd_cnt = 1;
-		invalid_init.desc.reserved = 1;
-		err = expect_case("reject-init-desc-reserved",
-				  nds_init(&invalid_init), -EINVAL);
-		if (err) {
-			close(topo_fd);
-			return EXIT_FAILURE;
-		}
-		invalid_init.desc.reserved = 0;
-		invalid_init._data[2] = 1;
-		err = expect_case("reject-init-data2", nds_init(&invalid_init),
+		if (err)
+			goto reject_out;
+		invalid_init.reserved[0] = 0;
+		invalid_init.reserved[1] = 1;
+		err = expect_case("reject-init-reserved1", nds_init(&invalid_init),
 				  -EINVAL);
-		if (err) {
-			close(topo_fd);
-			return EXIT_FAILURE;
-		}
-		invalid_init._data[2] = 0;
-		invalid_init._data[3] = 1;
-		err = expect_case("reject-init-data3", nds_init(&invalid_init),
+		if (err)
+			goto reject_out;
+		invalid_init.reserved[1] = 0;
+		invalid_init.reserved[2] = 1;
+		err = expect_case("reject-init-reserved2", nds_init(&invalid_init),
 				  -EINVAL);
-		if (err) {
-			close(topo_fd);
-			return EXIT_FAILURE;
-		}
-		err = init_nds((int32_t[]){ topo_fd, topo_fd }, 2);
+		if (err)
+			goto reject_out;
+		invalid_init.reserved[2] = 0;
+		invalid_init.reserved[3] = 1;
+		err = expect_case("reject-init-reserved3", nds_init(&invalid_init),
+				  -EINVAL);
+		if (err)
+			goto reject_out;
+
+		err = init_nds();
 		if (err) {
 			fprintf(stderr, "nds_init failed: %s\n",
 				strerror(-err));
-			close(topo_fd);
-			return EXIT_FAILURE;
+			goto reject_out;
 		}
+		reject_nds_ready = true;
+
+		fs_fd = topo_fd;
+		fs_desc.fs_fd = &fs_fd;
+		fs_desc.fs_fd_cnt = 1;
+		err = expect_case("reject-register-fs-null",
+				  nds_register_fs(NULL), -EINVAL);
+		if (err)
+			goto reject_out;
+		fs_desc.fs_fd_cnt = 0;
+		err = expect_case("reject-register-fs-empty",
+				  nds_register_fs(&fs_desc), -EINVAL);
+		if (err)
+			goto reject_out;
+		fs_desc.fs_fd_cnt = 1;
+		fs_desc.reserved = 1;
+		err = expect_case("reject-register-fs-reserved",
+				  nds_register_fs(&fs_desc), -EINVAL);
+		if (err)
+			goto reject_out;
+		fs_desc.reserved = 0;
+
+		err = expect_case("register-fs-initial",
+				  nds_register_fs(&fs_desc), 0);
+		if (err)
+			goto reject_out;
+		second_topo_fd = open(topology, O_RDONLY | O_DIRECT);
+		if (second_topo_fd < 0) {
+			err = -errno;
+			goto reject_out;
+		}
+		fs_fd = second_topo_fd;
+		err = expect_case("register-fs-dynamic",
+				  nds_register_fs(&fs_desc), 0);
+		if (err)
+			goto reject_out;
+		err = expect_case("unregister-fs-noop",
+				  nds_unregister_fs(&fs_desc), 0);
+		if (err)
+			goto reject_out;
+
 		err = run_reject(topology);
 		if (err)
 			fprintf(stderr, "reject run failed: %s (%d)\n",
 				strerror(-err), err);
-		nds_exit();
+
+reject_out:
+		if (reject_nds_ready)
+			nds_exit();
+		if (second_topo_fd >= 0)
+			close(second_topo_fd);
 		close(topo_fd);
 		return err ? EXIT_FAILURE : EXIT_SUCCESS;
 	}
@@ -2408,10 +2458,13 @@ int main(int argc, char **argv)
 			free_stress_cases(stress_tests, count);
 			return EXIT_FAILURE;
 		}
-		err = init_nds((int32_t[]){ topo_fd }, 1);
+		err = init_nds();
+		if (!err)
+			err = register_nds_fs((int32_t[]){ topo_fd }, 1);
 		if (err) {
-			fprintf(stderr, "nds_init failed: %s\n",
+			fprintf(stderr, "NDS setup failed: %s\n",
 				strerror(-err));
+			nds_exit();
 			close(topo_fd);
 			free_stress_cases(stress_tests, count);
 			return EXIT_FAILURE;
@@ -2462,9 +2515,12 @@ int main(int argc, char **argv)
 		fprintf(stderr, "open topology failed: %s\n", strerror(errno));
 		goto out;
 	}
-	err = init_nds((int32_t[]){ topo_fd }, 1);
+	err = init_nds();
+	if (!err)
+		err = register_nds_fs((int32_t[]){ topo_fd }, 1);
 	if (err) {
-		fprintf(stderr, "nds_init failed: %s\n", strerror(-err));
+		fprintf(stderr, "NDS setup failed: %s\n", strerror(-err));
+		nds_exit();
 		goto out;
 	}
 	nds_ready = true;
@@ -2480,7 +2536,7 @@ int main(int argc, char **argv)
 		}
 	}
 	if (registered_mem) {
-		err = register_test_cases(tests, count, &reg_addr);
+		err = register_test_cases(tests, count, &reg_addr, &reg_size);
 		if (err) {
 			fprintf(stderr, "register test memory failed: %s\n",
 				strerror(-err));
@@ -2519,7 +2575,8 @@ out:
 		int unregister_err;
 
 		unregister_err =
-			nds_unregister_mem((void *)(uintptr_t)reg_addr, 0, 0);
+			nds_unregister_mem((void *)(uintptr_t)reg_addr,
+					   reg_size, 0);
 		if (unregister_err && !err)
 			err = unregister_err;
 	}

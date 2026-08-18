@@ -60,18 +60,20 @@ struct nds_reg_entry {
 
 struct nds_state {
 	int book_fd;
+	int topo_fd;
 	struct nds_reg_entry *regs;
 	pthread_mutex_t reg_lock;
 };
 
 static struct nds_state g_state = {
 	.book_fd = -1,
+	.topo_fd = -1,
 	.reg_lock = PTHREAD_MUTEX_INITIALIZER,
 };
 
 static int is_init(void)
 {
-	return g_state.book_fd >= 0;
+	return g_state.book_fd >= 0 && g_state.topo_fd >= 0;
 }
 
 static int topo_fd_to_bdev(int32_t topo_fd, char *bdev, size_t bdev_size)
@@ -111,35 +113,54 @@ static int topo_fd_to_bdev(int32_t topo_fd, char *bdev, size_t bdev_size)
 
 int nds_init(struct nds_init_param *param)
 {
+	/* Not thread-safe: see nds_api.h. Concurrent init is undefined. */
+	if (!param || param->flags || is_init() || param->reserved[0] ||
+	    param->reserved[1] || param->reserved[2] || param->reserved[3])
+		return -EINVAL;
+
+	/* Keep memory registration and topology ownership on separate fds. */
+	g_state.book_fd = p2p_open_dev();
+	if (g_state.book_fd < 0)
+		return g_state.book_fd;
+	g_state.topo_fd = p2p_open_dev();
+	if (g_state.topo_fd < 0) {
+		int ret = g_state.topo_fd;
+
+		close(g_state.book_fd);
+		g_state.book_fd = -1;
+		return ret;
+	}
+	g_state.regs = NULL;
+	param->version = NDS_API_VERSION;
+	return 0;
+}
+
+int nds_register_fs(const struct nds_fs_desc *desc)
+{
 	char bdev[PATH_MAX];
 	uint32_t i;
 	int ret;
 
-	/* Not thread-safe: see nds_api.h. Concurrent init is undefined. */
-	if (!param || param->flags || is_init() || !param->desc.fs_fd ||
-	    !param->desc.fs_fd_cnt || param->desc.reserved || param->_data[2] ||
-	    param->_data[3])
+	if (!desc || !desc->fs_fd || !desc->fs_fd_cnt || desc->reserved)
 		return -EINVAL;
 
-	g_state.book_fd = p2p_open_dev();
-	if (g_state.book_fd < 0)
-		return g_state.book_fd;
-	g_state.regs = NULL;
-
-	/* Register every supplied topology for the lifetime of book_fd. */
-	for (i = 0; i < param->desc.fs_fd_cnt; i++) {
-		ret = topo_fd_to_bdev(param->desc.fs_fd[i], bdev, sizeof(bdev));
+	/* Register every supplied topology for the lifetime of topo_fd. */
+	for (i = 0; i < desc->fs_fd_cnt; i++) {
+		ret = topo_fd_to_bdev(desc->fs_fd[i], bdev, sizeof(bdev));
 		if (!ret)
-			ret = p2p_add_topo(g_state.book_fd, bdev);
+			ret = p2p_add_topo(g_state.topo_fd, bdev);
 		if (ret) {
 			fprintf(stderr, "nds: add topology for fd %d failed %d\n",
-				param->desc.fs_fd[i], ret);
-			close(g_state.book_fd);
-			g_state.book_fd = -1;
+				desc->fs_fd[i], ret);
 			return ret;
 		}
 	}
-	param->version = NDS_API_VERSION;
+	return 0;
+}
+
+int nds_unregister_fs(const struct nds_fs_desc *desc)
+{
+	(void)desc;
 	return 0;
 }
 
@@ -166,6 +187,8 @@ int nds_exit(void)
 		free(r);
 	}
 
+	close(g_state.topo_fd);
+	g_state.topo_fd = -1;
 	close(g_state.book_fd);
 	g_state.book_fd = -1;
 	return 0;
@@ -212,7 +235,6 @@ int nds_unregister_mem(void *addr, uint64_t size, int flags)
 	struct p2p_mem_unregister_param up;
 	int ret = 0;
 
-	(void)size;
 	if (flags)
 		return -EINVAL;
 
@@ -224,6 +246,14 @@ int nds_unregister_mem(void *addr, uint64_t size, int flags)
 	if (!*prev) {
 		pthread_mutex_unlock(&g_state.reg_lock);
 		return -ENOENT;
+	}
+	if ((*prev)->size != size) {
+		fprintf(stderr,
+			"nds: unregister memory addr=%p size=%llu does not match registered size=%llu\n",
+			addr, (unsigned long long)size,
+			(unsigned long long)(*prev)->size);
+		pthread_mutex_unlock(&g_state.reg_lock);
+		return -EINVAL;
 	}
 
 	r = *prev;

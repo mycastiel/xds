@@ -10,13 +10,18 @@
  *
  * Typical usage:
  *
- *   1. Open a file or block device that sits on the target topology, then:
+ *   1. Initialize NDS, then register each filesystem topology as it becomes
+ *      available:
+ *        struct nds_init_param ip = { 0 };
  *        int fds[] = { topo_fd };
- *        struct nds_init_param ip = {
- *            .desc = { .fs_fd = fds, .fs_fd_cnt = 1 },
+ *        struct nds_fs_desc fs = {
+ *            .fs_fd = fds,
+ *            .fs_fd_cnt = 1,
  *        };
  *        nds_init(&ip);
  *        assert(ip.version == NDS_API_VERSION);
+ *        nds_register_fs(&fs);
+ *      Call nds_register_fs() again to add filesystems after initialization.
  *
  *   2. (Optional) Register HBM / CMB windows once:
  *        nds_register_mem(addr, size, 0);
@@ -51,7 +56,7 @@
  *   - I/O is async only (no synchronous pread/pwrite helpers).
  *   - Targets are open file or block-device FDs. Paths are not accepted.
  *   - Offsets / lengths / buffer addresses must be sector-aligned (512 B).
- *   - reserved / _data fields must be zero.
+ *   - reserved fields must be zero.
  */
 
 #define NDS_API_VERSION 1u
@@ -60,25 +65,22 @@
 
 struct nds_io_ctx;
 
+struct nds_init_param {
+	uint32_t flags;			/* must be 0 in v1 */
+	uint64_t reserved[4];		/* must be zero when unused */
+	uint32_t version;		/* output: NDS_API_VERSION on success */
+};
+
 /*
- * Topology descriptor for nds_init.
+ * Filesystem topology registration descriptor.
  * v1: fs_fd_cnt must be at least 1. Every entry is a regular-file or
  * block-device fd whose underlying block device is registered via add_topo
- * once for the process.
+ * for the process. Additional descriptors may be registered after nds_init.
  */
 struct nds_fs_desc {
 	int32_t *fs_fd;
 	uint32_t fs_fd_cnt;
 	uint32_t reserved;
-};
-
-struct nds_init_param {
-	uint32_t flags;			/* must be 0 in v1 */
-	union {
-		uint64_t _data[4];	/* must be zero when unused */
-		struct nds_fs_desc desc;
-	};
-	uint32_t version;		/* output: NDS_API_VERSION on success */
 };
 
 /* max_io_cnt: v1 accepts 1..NDS_IO_MAX_IO_CNT as a queue-size hint but does
@@ -144,17 +146,33 @@ struct nds_io_event {
 	uint64_t reserved[4];
 };
 
-/* Process-wide init / teardown.
- * nds_init is not thread-safe and not re-entrant: call it once from a single
- * thread before any other NDS call; concurrent nds_init is undefined. */
+/*
+ * Process-wide initialization and teardown.
+ * nds_init opens separate private NDS device fds for filesystem topology
+ * ownership and memory-registration bookkeeping. It is not thread-safe or
+ * re-entrant; call it once from one thread. Do not call nds_exit concurrently
+ * with nds_register_fs() or any other NDS operation.
+ */
 int nds_init(struct nds_init_param *param);
 int nds_exit(void);
 
 /*
+ * Register filesystem topologies after nds_init(). Call nds_register_fs()
+ * once for the initial filesystem set and again whenever more filesystems
+ * become available. Concurrent nds_register_fs() calls are thread-safe.
+ *
+ * nds_unregister_fs() is currently a no-op placeholder; registered
+ * topologies remain active until nds_exit() closes the topology device fd.
+ */
+int nds_register_fs(const struct nds_fs_desc *desc);
+int nds_unregister_fs(const struct nds_fs_desc *desc);
+
+/*
  * Pin / unpin an HBM (or CMB) VA range for P2P I/O.
  * flags must be 0. No handle is returned — use NDS_IO_F_REGISTERED_MEM and
- * vectors within that range on later submits. Unregister by the same addr;
- * an unregister failure keeps the registration tracked so it can be retried.
+ * vectors within that range on later submits. Unregister by the same base
+ * address and exact size. A size mismatch returns -EINVAL, and any unregister
+ * failure keeps the registration tracked so it can be retried.
  */
 int nds_register_mem(void *addr, uint64_t size, int flags);
 int nds_unregister_mem(void *addr, uint64_t size, int flags);

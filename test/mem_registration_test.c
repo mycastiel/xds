@@ -197,7 +197,8 @@ static int test_validation(int dev_fd, int other_fd, const char *source,
 	if (err)
 		return err;
 	err = expect("unknown read flag",
-		     submit_read(dev_fd, source, &valid, 1, 1UL << 1, handle),
+		     submit_read(dev_fd, source, &valid, 1,
+				 P2P_IO_F_MASK + 1U, handle),
 		     -EOPNOTSUPP);
 	if (err)
 		return err;

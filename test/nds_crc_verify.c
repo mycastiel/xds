@@ -209,8 +209,10 @@ int main(int argc, char **argv)
 	int topo_fd = -1;
 	int file_fd = -1;
 	int32_t fs_fds[1];
-	struct nds_init_param init_param = {
-		.desc = { .fs_fd = fs_fds, .fs_fd_cnt = 1 },
+	struct nds_init_param init_param = { 0 };
+	struct nds_fs_desc fs_desc = {
+		.fs_fd = fs_fds,
+		.fs_fd_cnt = 1,
 	};
 	struct nds_io_ctx *ctx = NULL;
 	struct nds_io_cb cb;
@@ -314,10 +316,13 @@ int main(int argc, char **argv)
 	if (err)
 		die("xds_hbm_alloc", err);
 
-	fs_fds[0] = topo_fd;
 	err = nds_init(&init_param);
 	if (err)
 		die("nds_init", err);
+	fs_fds[0] = topo_fd;
+	err = nds_register_fs(&fs_desc);
+	if (err)
+		die("nds_register_fs", err);
 
 	if (register_mem) {
 		err = nds_register_mem(hbm.addr, alloc_size, 0);
@@ -374,7 +379,7 @@ int main(int argc, char **argv)
 
 	nds_io_destroy_ctx(ctx);
 	if (register_mem)
-		nds_unregister_mem(hbm.addr, 0, 0);
+		nds_unregister_mem(hbm.addr, alloc_size, 0);
 	nds_exit();
 	xds_hbm_free(&hbm);
 	free(file_buf);
