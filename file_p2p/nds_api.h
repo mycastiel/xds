@@ -191,8 +191,8 @@ int nds_io_destroy_ctx(struct nds_io_ctx *ctx);
  *
  * Each iocb is one logical I/O: its iov[] is scatter-gather on a single
  * obj.fd / offset and completes as one event (user_data). Different iocbs
- * may target different files; the library issues one IOCTL_RW_FILE per
- * iocb (no cross-iocb merge).
+ * may target different files; the library submits the valid prefix as
+ * independent IOCTL_SUBMIT_IO items without cross-iocb merging.
  *
  * Fail-stop like Linux io_submit: on a mid-batch failure return the count
  * of iocbs already accepted (positive); the failed iocb's errno is not

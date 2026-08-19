@@ -46,6 +46,7 @@ int unregister_mem(int dev_fd, const struct p2p_mem_unregister_param *param)
 
 int rw_file(int dev_fd, const struct io_parameter *param)
 {
+	struct p2p_io_batch_param batch;
 	struct p2p_io_param *io;
 	struct fiemap *exts = NULL;
 	struct stat file_stat;
@@ -130,13 +131,23 @@ int rw_file(int dev_fd, const struct io_parameter *param)
 	io->ext_nr = ext_num;
 	io->extents = (uint64_t)(uintptr_t)exts->fm_extents;
 
-	err = ioctl(dev_fd, IOCTL_RW_FILE, io);
+	batch.nr = 1;
+	batch.reserved = 0;
+	batch.items = (uint64_t)(uintptr_t)io;
+	err = ioctl(dev_fd, IOCTL_SUBMIT_IO, &batch);
 	if (err < 0) {
 		err = -errno;
 		fprintf(stderr, "%s file ioctl failed, errno: %d\n",
 			param->op == P2P_IO_WRITE ? "write" : "read", -err);
 		goto free_io_out;
 	}
+	if (err != 1) {
+		fprintf(stderr, "%s file ioctl accepted %d requests, expected 1\n",
+			param->op == P2P_IO_WRITE ? "write" : "read", err);
+		err = -EIO;
+		goto free_io_out;
+	}
+	err = 0;
 
 free_io_out:
 	free(io);

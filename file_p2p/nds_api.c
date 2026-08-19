@@ -30,6 +30,8 @@
 
 _Static_assert(sizeof(struct nds_io_vec) == sizeof(struct p2p_iov),
 	       "nds_io_vec must match p2p_iov for zero-copy submission");
+_Static_assert(NDS_IO_MAX_IO_CNT <= P2P_MAX_IO_NR,
+	       "NDS submit size must fit the kernel batch ioctl");
 _Static_assert(_Alignof(struct nds_io_vec) == _Alignof(struct p2p_iov),
 	       "nds_io_vec alignment must match p2p_iov");
 _Static_assert(offsetof(struct nds_io_vec, buf_addr) ==
@@ -449,15 +451,10 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 	return 0;
 }
 
-/*
- * One iocb → one IOCTL_RW_FILE (one logical completion). Multiple iovs in the
- * iocb are scatter-gather for that single event, not multiple events.
- */
-static int nds_submit_one_iocb(struct nds_io_ctx *ctx,
-			       const struct nds_io_cb *cb)
+static int nds_build_one_iocb(const struct nds_io_cb *cb,
+			      struct p2p_io_param *param,
+			      struct fiemap **exts_out)
 {
-	struct p2p_io_param param;
-	struct fiemap *exts = NULL;
 	int file_fd = cb->obj.fd;
 	int ret;
 
@@ -465,25 +462,21 @@ static int nds_submit_one_iocb(struct nds_io_ctx *ctx,
 	    file_fd < 0)
 		return -EINVAL;
 
-	ret = nds_iocb_to_io_param(cb, file_fd, &param, &exts);
-	if (ret) {
+	ret = nds_iocb_to_io_param(cb, file_fd, param, exts_out);
+	if (ret)
 		fprintf(stderr, "nds: translate iocb failed %d\n", ret);
-		return ret;
-	}
-
-	if (ioctl(ctx->p2p_fd, IOCTL_RW_FILE, &param) < 0) {
-		ret = -errno;
-		fprintf(stderr, "nds: rw ioctl failed %d\n", ret);
-	}
-	free(exts);
 	return ret;
 }
 
 int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 		  const struct nds_io_cb *iocb)
 {
-	int accepted = 0;
-	int i;
+	struct p2p_io_batch_param batch = { 0 };
+	struct p2p_io_param *items;
+	struct fiemap **exts;
+	unsigned int built = 0;
+	unsigned int i;
+	int build_err = 0;
 	int ret;
 
 	if (!ctx || !iocb)
@@ -495,18 +488,47 @@ int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 	if ((unsigned int)nr > NDS_IO_MAX_IO_CNT)
 		return -EINVAL;
 
-	/*
-	 * AIO-shaped fail-stop: submit iocbs in order, one ioctl each. On
-	 * partial success return the accepted count (errno of the failed
-	 * iocb is not returned). If nothing was accepted, return -errno.
-	 */
-	for (i = 0; i < nr; i++) {
-		ret = nds_submit_one_iocb(ctx, &iocb[i]);
-		if (ret)
-			return accepted ? accepted : ret;
-		accepted++;
+	items = calloc((size_t)nr, sizeof(*items));
+	exts = calloc((size_t)nr, sizeof(*exts));
+	if (!items || !exts) {
+		free(exts);
+		free(items);
+		return -ENOMEM;
 	}
-	return accepted;
+
+	/*
+	 * Build the valid prefix in iocb order, then submit its independent
+	 * requests through one ioctl. Translation and kernel acceptance are both
+	 * fail-stop: return the accepted prefix, or -errno if item zero fails.
+	 */
+	while (built < (unsigned int)nr) {
+		build_err = nds_build_one_iocb(&iocb[built], &items[built],
+					       &exts[built]);
+		if (build_err)
+			break;
+		built++;
+	}
+	if (!built) {
+		ret = build_err;
+		goto out;
+	}
+
+	batch.nr = built;
+	batch.items = (uint64_t)(uintptr_t)items;
+	ret = ioctl(ctx->p2p_fd, IOCTL_SUBMIT_IO, &batch);
+	if (ret < 0) {
+		ret = -errno;
+		fprintf(stderr, "nds: submit ioctl failed %d\n", ret);
+	} else if (!ret) {
+		ret = -EIO;
+	}
+
+out:
+	for (i = 0; i < built; i++)
+		free(exts[i]);
+	free(exts);
+	free(items);
+	return ret;
 }
 
 int nds_io_getevents(struct nds_io_ctx *ctx, int min_nr,
