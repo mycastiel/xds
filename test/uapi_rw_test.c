@@ -30,6 +30,10 @@ _Static_assert(sizeof(((struct p2p_io_param *)0)->iov) == sizeof(uint64_t),
 _Static_assert(sizeof(((struct p2p_getevents_param *)0)->events) ==
 	       sizeof(uint64_t),
 	       "p2p_getevents_param events address must be fixed-width");
+_Static_assert(sizeof(struct p2p_io_batch_param) == 16,
+	       "p2p_io_batch_param must remain a 16-byte UAPI record");
+_Static_assert(offsetof(struct p2p_io_batch_param, items) == 0,
+	       "p2p_io_batch_param items must remain the first field");
 
 static int expect(const char *name, int actual, int expected)
 {
@@ -45,9 +49,22 @@ static int expect(const char *name, int actual, int expected)
 
 static int issue(int dev_fd, struct p2p_io_param *param)
 {
-	if (ioctl(dev_fd, IOCTL_RW_FILE, param) < 0)
+	struct p2p_io_batch_param batch = {
+		.nr = 1,
+		.items = (uint64_t)(uintptr_t)param,
+	};
+	int ret = ioctl(dev_fd, IOCTL_SUBMIT_IO, &batch);
+
+	if (ret < 0)
 		return -errno;
-	return 0;
+	return ret == 1 ? 0 : -EIO;
+}
+
+static int issue_batch(int dev_fd, struct p2p_io_batch_param *batch)
+{
+	int ret = ioctl(dev_fd, IOCTL_SUBMIT_IO, batch);
+
+	return ret < 0 ? -errno : ret;
 }
 
 int main(int argc, char **argv)
@@ -58,6 +75,7 @@ int main(int argc, char **argv)
 		{ NULL, 0, NULL, 0 },
 	};
 	struct p2p_io_param *param;
+	struct p2p_io_batch_param batch = { 0 };
 	struct fiemap_extent extent = { 0 };
 	struct io_parameter userspace = { };
 	struct p2p_iov iov = {
@@ -131,8 +149,40 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
+	batch.items = (uint64_t)(uintptr_t)param;
+	err = expect("batch zero count", issue_batch(dev_fd, &batch), -EINVAL);
+	if (err)
+		goto out;
+	batch.nr = 1;
+	batch.reserved = 1;
+	err = expect("batch reserved field", issue_batch(dev_fd, &batch),
+		     -EINVAL);
+	if (err)
+		goto out;
+	batch.reserved = 0;
+	batch.items = 0;
+	err = expect("batch null items", issue_batch(dev_fd, &batch), -EFAULT);
+	if (err)
+		goto out;
+	batch.items = 1;
+	err = expect("batch bad items pointer", issue_batch(dev_fd, &batch),
+		     -EFAULT);
+	if (err)
+		goto out;
+	batch.items = (uint64_t)(uintptr_t)param;
+	batch.nr = P2P_MAX_IO_NR + 1;
+	err = expect("batch excessive count", issue_batch(dev_fd, &batch),
+		     -EINVAL);
+	if (err)
+		goto out;
+	batch.nr = 1;
+
 	param->op = P2P_IO_WRITE + 1;
 	err = expect("unknown operation", issue(dev_fd, param), -EINVAL);
+	if (err)
+		goto out;
+	err = expect("batch item failure", issue_batch(dev_fd, &batch),
+		     -EINVAL);
 	if (err)
 		goto out;
 	param->op = P2P_IO_WRITE;
