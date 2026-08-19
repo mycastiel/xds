@@ -20,8 +20,8 @@ struct p2p_iov {
 
 /*
  * Fixed-size request; iov and extents are userspace pointers.
- * One IOCTL_RW_FILE is one logical I/O covering all iov/extents and
- * completing as one event carrying user_data.
+ * One batch item is one logical I/O covering all iov/extents and completing
+ * as one event carrying user_data.
  */
 struct p2p_io_param {
 	unsigned int op;
@@ -35,6 +35,20 @@ struct p2p_io_param {
 	unsigned int ext_nr;
 	__u64 extents;            /* userspace pointer to struct fiemap_extent[] */
 	__u64 reserved[3];           /* must be zero */
+};
+
+#define P2P_MAX_IO_NR 1024U
+
+/*
+ * Submit independent p2p_io_param records in array order. The ioctl stops at
+ * the first item that cannot be accepted and returns the accepted prefix, or
+ * a negative errno when the first item fails. Each accepted item produces one
+ * completion event.
+ */
+struct p2p_io_batch_param {
+	__u64 items;              /* userspace pointer to p2p_io_param[] */
+	__u32 nr;
+	__u32 reserved;
 };
 
 struct p2p_io_event {
@@ -88,7 +102,7 @@ struct topo_user_cfg {
 };
 
 #define IOCTL_ADD_TOPO _IOW('k', 1, struct topo_user_cfg)
-#define IOCTL_RW_FILE _IOWR('k', 2, struct p2p_io_param)
+#define IOCTL_SUBMIT_IO _IOWR('k', 2, struct p2p_io_batch_param)
 /*
  * Drain snapshots I/O contexts already published by read/write ioctls. An I/O
  * or another drain that overlaps this ioctl need not be covered by its wait.

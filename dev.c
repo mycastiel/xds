@@ -52,7 +52,7 @@
 #define P2P_MEM_COOKIE_SHIFT 48
 #define P2P_MEM_ID_MASK GENMASK_ULL(P2P_MEM_COOKIE_SHIFT - 1, 0)
 /* Power-of-two CQ; caps outstanding I/Os per batch (in-flight + unharvested). */
-#define P2P_CQ_SIZE 1024U
+#define P2P_CQ_SIZE P2P_MAX_IO_NR
 #define P2P_CQ_MASK (P2P_CQ_SIZE - 1)
 
 struct p2p_pa_iov {
@@ -1464,10 +1464,9 @@ free_iov:
 	return err;
 }
 
-static int p2p_rw_file(struct p2p_batch *batch, void __user *arg)
+static int p2p_submit_one(struct p2p_batch *batch, const struct p2p_io_param *param)
 {
 	struct p2p_pa_iov *pa_iov = NULL;
-	struct p2p_io_param param;
 	struct fiemap_extent *extents = NULL;
 	struct p2p_iov *iov = NULL;
 	struct file *reg_file = NULL;
@@ -1479,33 +1478,30 @@ static int p2p_rw_file(struct p2p_batch *batch, void __user *arg)
 	unsigned int pa_iov_nr;
 	int err;
 
-	if (copy_from_user(&param, arg, sizeof(param)))
-		return -EFAULT;
-	err = validate_io_param(&param);
+	err = validate_io_param(param);
 	if (err)
 		return err;
 
-	err = p2p_copy_iov_extents(&param, &iov, &extents);
+	err = p2p_copy_iov_extents(param, &iov, &extents);
 	if (err)
 		return err;
 
 	/* Validate payload before open/topo so rejection errno stays stable. */
-	err = validate_io_data(iov, param.iov_nr, extents, param.ext_nr,
-			       &data_size);
+	err = validate_io_data(iov, param->iov_nr, extents, param->ext_nr, &data_size);
 	if (err)
 		goto free_bufs;
 
-	reg_file = fget(param.file_fd);
+	reg_file = fget(param->file_fd);
 	if (!reg_file) {
 		err = -EBADF;
 		goto free_bufs;
 	}
-	bdev = p2p_bdev_from_file(reg_file, param.op);
+	bdev = p2p_bdev_from_file(reg_file, param->op);
 	if (IS_ERR(bdev)) {
 		err = PTR_ERR(bdev);
 		goto put_reg_file;
 	}
-	err = validate_write_range(&param, extents, bdev);
+	err = validate_write_range(param, extents, bdev);
 	if (err)
 		goto put_reg_file;
 	topo = topo_get(bdev);
@@ -1520,17 +1516,17 @@ static int p2p_rw_file(struct p2p_batch *batch, void __user *arg)
 		goto put_reg_file;
 	}
 
-	if (param.flags & P2P_IO_F_REGISTERED_MEM)
-		err = get_registered_pa_iov(param.mem_handle, iov, param.iov_nr, &pa_iov,
+	if (param->flags & P2P_IO_F_REGISTERED_MEM)
+		err = get_registered_pa_iov(param->mem_handle, iov, param->iov_nr, &pa_iov,
 					    &pa_iov_nr, &pinned_mem);
 	else
-		err = get_pa_iov(param.host_pid, iov, param.iov_nr, &pa_iov, &pa_iov_nr,
+		err = get_pa_iov(param->host_pid, iov, param->iov_nr, &pa_iov, &pa_iov_nr,
 				 &pinned_mem);
 	if (err)
 		goto put_topo;
 
-	io_ctx = new_io_ctx(param.op, reg_file, pa_iov, pa_iov_nr, &pinned_mem,
-			    data_size, param.user_data);
+	io_ctx = new_io_ctx(param->op, reg_file, pa_iov, pa_iov_nr, &pinned_mem,
+			    data_size, param->user_data);
 	if (IS_ERR(io_ctx)) {
 		err = PTR_ERR(io_ctx);
 		goto free_pa_iov;
@@ -1548,7 +1544,7 @@ static int p2p_rw_file(struct p2p_batch *batch, void __user *arg)
 	}
 	atomic_inc(&batch->outstanding_events);
 
-	io_ctx->issue_err = do_ios(io_ctx, topo, extents, param.ext_nr);
+	io_ctx->issue_err = do_ios(io_ctx, topo, extents, param->ext_nr);
 	if (io_ctx->issue_err)
 		p2p_stats_io_issue_failed();
 	p2p_io_ctx_put(io_ctx);
@@ -1566,6 +1562,41 @@ free_bufs:
 	kvfree(extents);
 	kvfree(iov);
 	return err;
+}
+
+static int p2p_submit_io(struct p2p_batch *batch, void __user *arg)
+{
+	struct p2p_io_batch_param param;
+	struct p2p_io_param *items;
+	unsigned int accepted = 0;
+	unsigned int i;
+	int err;
+
+	if (copy_from_user(&param, arg, sizeof(param)))
+		return -EFAULT;
+	/* Every accepted item needs one slot in this fd's completion queue. */
+	if (!param.nr || param.nr > P2P_MAX_IO_NR || param.reserved)
+		return -EINVAL;
+
+	items = kvmalloc_array(param.nr, sizeof(*items), GFP_KERNEL);
+	if (!items)
+		return -ENOMEM;
+	if (copy_from_user(items, u64_to_user_ptr(param.items),
+			   array_size(param.nr, sizeof(*items)))) {
+		err = -EFAULT;
+		goto out;
+	}
+
+	for (i = 0; i < param.nr; i++) {
+		err = p2p_submit_one(batch, &items[i]);
+		if (err)
+			goto out;
+		accepted++;
+	}
+	err = accepted;
+out:
+	kvfree(items);
+	return accepted ? accepted : err;
 }
 
 /*
@@ -1748,8 +1779,8 @@ static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	int err = 0;
 
 	switch (cmd) {
-	case IOCTL_RW_FILE:
-		err = p2p_rw_file(batch, (void __user *)arg);
+	case IOCTL_SUBMIT_IO:
+		err = p2p_submit_io(batch, (void __user *)arg);
 		break;
 	case IOCTL_DRAIN_IO:
 		err = p2p_drain_io(batch);
