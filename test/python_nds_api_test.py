@@ -149,6 +149,11 @@ def harvest(ctx, nr: int) -> None:
             raise RuntimeError(f"nds.io_getevents returned {events}")
         if not events:
             raise TimeoutError(errno.ETIMEDOUT, "nds.io_getevents timed out")
+        for user_data, result in events:
+            if result:
+                raise RuntimeError(
+                    f"NDS completion user_data={user_data} returned {result}"
+                )
         got += len(events)
 
 
@@ -407,22 +412,38 @@ def run_threaded(tests: List[TestCase], flags: int) -> None:
     if any(test.expected for test in tests):
         raise ValueError("threaded mode only accepts successful cases")
     barrier = threading.Barrier(len(tests))
+    errors: List[BaseException] = []
+    error_lock = threading.Lock()
+
+    def fail(error: BaseException) -> None:
+        with error_lock:
+            if not errors:
+                errors.append(error)
 
     def worker(test: TestCase) -> None:
-        barrier.wait()
-        ctx = new_ctx(4)
+        ctx = None
         try:
+            barrier.wait()
+            ctx = new_ctx(4)
             submit(ctx, test, flags)
             if test.result == 0:
                 harvest(ctx, 1)
+        except BaseException as error:
+            fail(error)
         finally:
-            destroy_ctx(ctx)
+            if ctx is not None:
+                try:
+                    destroy_ctx(ctx)
+                except BaseException as error:
+                    fail(error)
 
     threads = [threading.Thread(target=worker, args=(test,)) for test in tests]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
+    if errors:
+        raise RuntimeError(f"threaded worker failed: {errors[0]}")
     for test in tests:
         check_result(test)
 
