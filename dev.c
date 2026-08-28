@@ -1071,8 +1071,9 @@ static void p2p_tp_hook_exit(void)
 static void p2p_wake_batch_waiters(struct p2p_batch *batch)
 {
 	/*
-	 * Pair condition stores (ready_events / cq_tail under completion_lock,
-	 * then unlock) with waitqueue_active: without this full barrier a
+	 * Pair condition stores (ready_events / outstanding_events / cq_tail
+	 * under completion_lock, then unlock) with waitqueue_active: without this
+	 * full barrier a
 	 * waiter can observe !active, then miss the published condition and
 	 * sleep. wait_event* still re-checks after prepare_to_wait.
 	 */
@@ -1648,6 +1649,7 @@ static int p2p_drain_io(struct p2p_batch *batch)
 		while (batch->cq_head != READ_ONCE(batch->cq_tail)) {
 			atomic_dec(&batch->ready_events);
 			atomic_dec(&batch->outstanding_events);
+			p2p_wake_batch_waiters(batch);
 			p2p_retire_cq_head(batch, &first_err);
 		}
 	}
@@ -1736,6 +1738,7 @@ static int p2p_get_io_events(struct p2p_batch *batch, void __user *arg)
 	if (total) {
 		atomic_sub(total, &batch->ready_events);
 		atomic_sub(total, &batch->outstanding_events);
+		p2p_wake_batch_waiters(batch);
 	}
 	mutex_unlock(&batch->ring_lock);
 
