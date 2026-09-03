@@ -4,8 +4,8 @@
 
 Add a small debugfs interface for observing global NVMe request activity in
 the `p2p_dev` module.  The interface reports request counts, submitted bytes,
-in-flight requests, and failures across all p2p device fds and all registered
-topologies.
+in-flight requests, and failures separately for reads and writes across all
+p2p device fds and all registered topologies.
 
 The interface is diagnostic only.  It is not a stable userspace ABI and does
 not change read, drain, topology, or completion semantics.
@@ -24,52 +24,60 @@ is ignored.
 ## 2. Statistics and exact meanings
 
 All counters are module-global per-CPU values (`DEFINE_PER_CPU`), following the
-block layer `disk_stats` / `part_stat` pattern: hot-path updates use
-`preempt_disable()` with `__this_cpu_*` (and `local_t` for `io_inflight`);
-readers sum across `for_each_possible_cpu`.
+block layer `disk_stats` / `part_stat` pattern.  Each field in the per-CPU
+object is a two-element array indexed by the internal `P2P_IO_STATS_READ`
+(`0`) or `P2P_IO_STATS_WRITE` (`1`) macros.  The UAPI operation is explicitly
+mapped to one of these indices inside the debugfs accounting helpers.  Hot-path
+updates use `preempt_disable()` (and `local_t` for each `io_inflight`); readers
+sum both indices across `for_each_possible_cpu`.
 
 | Output field | Meaning | Resettable |
 | --- | --- | --- |
-| `io_issued` | NVMe block requests successfully passed to `blk_execute_rq_nowait()` | yes |
-| `io_bytes` | Payload bytes in successfully submitted requests | yes |
-| `io_inflight` | Submitted requests whose end-I/O callback has not run | no |
-| `io_failed` | Submitted requests completed with a nonzero `blk_status_t` | yes |
-| `io_issue_failed` | I/O contexts whose `do_read_ios()` call returned an issue-side error | yes |
+| `{read,write}_io_issued` | Submitted NVMe requests by direction | yes |
+| `{read,write}_io_bytes` | Submitted payload bytes by direction | yes |
+| `{read,write}_io_inflight` | Requests awaiting completion by direction | no |
+| `{read,write}_io_failed` | Failed completions by direction | yes |
+| `{read,write}_io_issue_failed` | Issue-side failures by direction | yes |
 
-Except for `io_issue_failed`, the unit is an individual lower NVMe request,
-not a read ioctl, FIEMAP extent, I/O context, or drain operation.  Topology and
-queue-limit splitting therefore may cause one read ioctl to add several
-`io_issued` operations.  `io_issue_failed` is counted once per I/O context
-whose request-generation loop returns an error.
+Except for `{read,write}_io_issue_failed`, the unit is an individual lower
+NVMe request, not an I/O ioctl, FIEMAP extent, I/O context, or drain operation.
+Topology and queue-limit splitting therefore may cause one I/O ioctl to add
+several `{read,write}_io_issued` operations.  The issue-failure fields are
+counted once per I/O context whose request-generation loop returns an error.
 
-`io_bytes` is submitted payload, calculated as `sector_nr << SECTOR_SHIFT` at
-the successful issue point.  It does not claim that a failed command
-transferred those bytes; the NVMe completion status does not report a reliable
-partial byte count.
+`{read,write}_io_bytes` is submitted payload, calculated as
+`sector_nr << SECTOR_SHIFT` at the successful issue point.  It does not claim
+that a failed command transferred those bytes; the NVMe completion status does
+not report a reliable partial byte count.
 
-`io_issue_failed` is derived from `io_ctx->issue_err` immediately after
-`do_read_ios()` returns.  It covers request-allocation failures, topology
+`{read,write}_io_issue_failed` is derived from `io_ctx->issue_err` immediately
+after `do_ios()` returns.  It covers request-allocation failures, topology
 mapping failures, zero-sized mapped segments, and source extents that do not
 cover the complete destination.  A partial submission that issues some lower
-requests before encountering one of these errors increments `io_issue_failed`
-once.  Validation, topology lookup, PA lookup, and other errors that occur
-before the I/O context calls `do_read_ios()` are not counted.
+requests before encountering one of these errors increments its direction's
+issue-failure field once.  Validation, topology lookup, PA lookup, and other
+errors that occur before the I/O context calls `do_ios()` are not counted.
 
 ## 3. Read format
 
 Reading `summary` produces decimal values in this fixed order:
 
 ```text
-io_issued: 123
-io_bytes: 503808
-io_inflight: 2
-io_failed: 1
-io_issue_failed: 4
+read_io_issued: 123
+read_io_bytes: 503808
+read_io_inflight: 2
+read_io_failed: 1
+read_io_issue_failed: 4
+write_io_issued: 17
+write_io_bytes: 69632
+write_io_inflight: 1
+write_io_failed: 0
+write_io_issue_failed: 0
 ```
 
 The show callback sums each per-CPU counter into a local snapshot and then
 formats the values with `seq_file`.  Each field is an approximate cross-CPU
-sum, and the five values are not a transaction: request submission,
+sum, and the ten values are not a transaction: request submission,
 completion, or reset may occur between the individual field sums.  This weakly
 consistent view is sufficient for diagnostics and avoids a global lock in the
 I/O hot path.
@@ -83,20 +91,22 @@ The write callback does not parse or copy the payload.  Any write with a
 nonzero byte count performs a reset and returns the supplied byte count.  A
 zero-length write returns zero without changing the counters.
 
-Reset zeroes these cumulative counters on every possible CPU:
+Reset zeroes both array elements for these cumulative counters on every
+possible CPU:
 
 - `io_issued`;
 - `io_bytes`;
 - `io_failed`; and
 - `io_issue_failed`.
 
-`io_inflight` is a live gauge and is never reset.  Clearing it while requests
-are active would make their later completions decrement the gauge below zero.
-Issue and complete may run on different CPUs, so a single CPU's `local_t`
-`io_inflight` may temporarily be negative; the cross-CPU sum remains the live
-count.  If reset races an increment, that event may fall on either side of
-the reset.  If a request issued before reset completes with an error after
-reset, its completion increments the new `io_failed` interval.
+Each direction's `io_inflight` is a live gauge and is never reset.  Clearing
+it while requests are active would make their later completions decrement the
+gauge below zero.  Issue and complete may run on different CPUs, so one CPU's
+`local_t` gauge may temporarily be negative; each direction's cross-CPU sum
+remains its live count.  If reset races an increment, that event may fall on
+either side of the reset.  If a request issued before reset completes with an
+error after reset, its completion increments the new failure interval for
+that direction.
 
 Reset does not drain I/O, wait for completions, modify an I/O context, or alter
 the per-fd batch list.
@@ -105,15 +115,16 @@ the per-fd batch list.
 
 ### 5.1 Successful issue
 
-Instrument `do_read_io()` after the request and NVMe command are completely
+Instrument `do_io()` after the request and NVMe command are completely
 initialized and after the I/O-context reference has been acquired, but before
 calling `blk_execute_rq_nowait()`.
 
 At that point, under `preempt_disable()`:
 
-1. increment this CPU's `io_issued`;
-2. add `sector_nr << SECTOR_SHIFT` to this CPU's `io_bytes`; and
-3. `local_inc` this CPU's `io_inflight`.
+1. map `io_ctx->op` to the internal read or write array index;
+2. increment this CPU's `io_issued` at that index;
+3. add `sector_nr << SECTOR_SHIFT` to `io_bytes` at that index; and
+4. `local_inc` `io_inflight` at that index.
 
 The accounting must precede `blk_execute_rq_nowait()` because the request may
 complete on another CPU before that function returns.  Accounting afterward
@@ -121,28 +132,29 @@ could let the completion decrement `io_inflight` before submission increments
 it.
 
 `blk_execute_rq_nowait()` has no synchronous error return.  Every request that
-reaches it is counted as issued and must eventually run `end_read_io()`.
+reaches it is counted as issued and must eventually run `p2p_end_io()`.
 
 ### 5.2 Issue failure
 
-After `p2p_read_file()` stores the result of `do_read_ios()` in
-`io_ctx->issue_err`, increment `io_issue_failed` once when that field is
+After `p2p_rw_file()` stores the result of `do_ios()` in `io_ctx->issue_err`,
+increment the read or write `io_issue_failed` field once when that field is
 nonzero.  Keep this accounting next to the assignment so it occurs even when
 the I/O context contains successfully submitted requests that a later drain
 must wait for.
 
-Do not increment `io_issue_failed` directly in individual `do_read_io()` or
-mapping error paths.  `do_read_ios()` stops at the first issue-side error, and
+Do not increment `io_issue_failed` directly in individual `do_io()` or mapping
+error paths.  `do_ios()` stops at the first issue-side error, and
 the single `io_ctx->issue_err` check provides exactly one count for the failed
 I/O context.  Successfully submitted lower requests still contribute normally
 to `io_issued`, `io_bytes`, and `io_inflight`.
 
 ### 5.3 Completion
 
-At the start of `end_read_io()`:
+At the start of `p2p_complete_io()`:
 
-1. increment `io_failed` when `status` is nonzero; and
-2. decrement `io_inflight` exactly once for every completion.
+1. map `io_ctx->op` to the internal read or write array index;
+2. increment `io_failed` at that index when `status` is nonzero; and
+3. decrement `io_inflight` at that index exactly once for every completion.
 
 This accounting is per request even though `io_ctx->io_err` retains only the
 first error for the drain result.  It is independent of the existing
@@ -167,9 +179,13 @@ The cross-file interface is conceptually:
 void p2p_debugfs_init(void);
 void p2p_debugfs_exit(void);
 
-void p2p_stats_io_issued(u64 bytes);
-void p2p_stats_io_issue_failed(void);
-void p2p_stats_io_complete(blk_status_t status);
+#define P2P_IO_STATS_READ 0U
+#define P2P_IO_STATS_WRITE 1U
+#define P2P_IO_STATS_NR 2U
+
+void p2p_stats_io_issued(u32 op, u64 bytes);
+void p2p_stats_io_issue_failed(u32 op);
+void p2p_stats_io_complete(u32 op, blk_status_t status);
 ```
 
 The statistics object remains private to `debugfs.c`; `dev.c` does not access
@@ -252,26 +268,28 @@ path is identical when debugfs was unavailable.
 ### Functional checks
 
 1. Load the module with debugfs mounted and verify `p2p_device/summary` exists
-   with the expected mode and five zero values.
-2. Issue a direct-NVMe read and verify `io_issued`, `io_bytes`, and
-   `io_inflight` at submission and completion.
-3. Issue linear and RAID0 reads that cross topology or queue boundaries and
+   with the expected mode and ten zero values.
+2. Issue a direct-NVMe read and verify only the read group's `io_issued`,
+   `io_bytes`, and `io_inflight` change at submission and completion.
+3. Issue a direct-NVMe write and verify only the corresponding write fields
+   change.
+4. Issue linear and RAID0 reads that cross topology or queue boundaries and
    verify every generated lower request is counted separately.
-4. Force `do_read_ios()` to return an issue-side error and verify
-   `io_issue_failed` increments once for that I/O context.  In a partial
-   submission case, verify already-issued lower requests remain reflected in
-   the other counters.
-5. Complete a request with a nonzero block status and verify `io_failed`
+5. Force `do_ios()` to return an issue-side error for each direction and verify
+   its `io_issue_failed` field increments once for that I/O context.  In a
+   partial submission case, verify already-issued lower requests remain
+   reflected in the other counters.
+6. Complete a request with a nonzero block status and verify `io_failed`
    increments while `io_inflight` returns toward zero.
-6. Write an arbitrary non-empty payload with no I/O active and verify all
+7. Write an arbitrary non-empty payload with no I/O active and verify all
    cumulative counters become zero.
-7. Reset while I/O is active and verify `io_inflight` is unchanged and reaches
+8. Reset while I/O is active and verify `io_inflight` is unchanged and reaches
    zero when those requests complete.
-8. Race repeated reads and resets with submission and completion; values may be
+9. Race repeated reads and resets with submission and completion; values may be
    weakly consistent, but the file remains readable and the summed
    `io_inflight` does not become negative once all requests complete.
-9. Unload and reload the module and verify the debugfs directory is removed and
-   the counters restart at zero.
+10. Unload and reload the module and verify the debugfs directory is removed
+    and the counters restart at zero.
 
 ### Configuration checks
 
@@ -285,7 +303,7 @@ path is identical when debugfs was unavailable.
 
 - Per-fd, per-topology, per-namespace, or per-process statistics;
 - latency histograms, bandwidth rates, or time-series storage;
-- counting errors that occur before `do_read_ios()` as I/O issue failures;
+- counting errors that occur before `do_ios()` as I/O issue failures;
 - determining the actual byte count of a failed NVMe command;
 - changing read/drain synchronization or waiting for I/O during reset; and
 - providing a stable production monitoring ABI.
