@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/debugfs.h>
-#include <linux/err.h>
 #include <linux/module.h>
 #include <linux/percpu.h>
 #include <linux/preempt.h>
@@ -190,28 +189,10 @@ static const struct file_operations p2p_topo_fops = {
 
 void p2p_debugfs_init(void)
 {
-	struct dentry *root;
-	struct dentry *summary;
-
-	root = debugfs_create_dir("p2p_device", NULL);
-	if (IS_ERR(root)) {
-		pr_warn("p2p: create debugfs directory err %ld\n",
-			PTR_ERR(root));
-		return;
-	}
-
-	summary = debugfs_create_file("summary", 0600, root, NULL,
-				      &p2p_summary_fops);
-	if (IS_ERR(summary)) {
-		pr_warn("p2p: create debugfs summary err %ld\n",
-			PTR_ERR(summary));
-		debugfs_remove_recursive(root);
-		return;
-	}
-
-	debugfs_create_file("memory", 0400, root, NULL, &p2p_memory_fops);
-	debugfs_create_file("topo", 0400, root, NULL, &p2p_topo_fops);
-	p2p_debugfs_root = root;
+	p2p_debugfs_root = debugfs_create_dir("p2p_device", NULL);
+	debugfs_create_file("summary", 0600, p2p_debugfs_root, NULL, &p2p_summary_fops);
+	debugfs_create_file("memory", 0400, p2p_debugfs_root, NULL, &p2p_memory_fops);
+	debugfs_create_file("topo", 0400, p2p_debugfs_root, NULL, &p2p_topo_fops);
 }
 
 void p2p_debugfs_exit(void)
