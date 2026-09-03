@@ -32,13 +32,16 @@ direct NVMe namespace.  Once registered, the topology is visible to all open
 The registered topology must remain unchanged while it is pinned.  In
 particular, dm table reload, MD reshape, component replacement, slot changes,
 and component size or data-offset changes are unsupported.  Before making
-such a change, userspace must close every p2p fd that registered the topology,
-perform the reconfiguration, and register the new topology.
+such a change, userspace must delete the topology pin from every p2p fd that
+registered it (or close those fds), perform the reconfiguration, and register
+the new topology.
 
-There is no `DEL_TOPO` ioctl.  Each successful `ADD_TOPO` call owns one pin.
-Closing that p2p fd drops all pins acquired through it.  Therefore, repeated
-`ADD_TOPO` calls on one fd are permitted and create repeated pins; the close
-path releases each of them.
+Each successful `ADD_TOPO` call owns one pin.  `DEL_TOPO` takes the encoded
+top-device number and removes one matching pin from the p2p fd receiving the
+ioctl; it returns `-ENOENT` when that fd does not own a matching pin.  Closing
+that p2p fd drops all remaining pins acquired through it.  Therefore,
+repeated `ADD_TOPO` calls on one fd are permitted and create repeated pins;
+each delete or the close path releases one pin.
 
 When concurrent callers register the same top-device `dev_t`, the first
 insertion wins.  Later callers use the existing topology and acquire a pin
@@ -86,6 +89,13 @@ struct topo_user_cfg {
 };
 
 #define IOCTL_ADD_TOPO _IOW('k', 1, struct topo_user_cfg)
+
+struct topo_del_cfg {
+	__u32 top_dev;
+	__u32 reserved;
+};
+
+#define IOCTL_DEL_TOPO _IOW('k', 7, struct topo_del_cfg)
 ```
 
 The flexible array is not included in the encoded ioctl size.  The kernel
@@ -126,16 +136,17 @@ the selected `topo_ops` mapping function directly.
 
 `dev.c` includes `topo.h` and retains responsibility for:
 
-- `IOCTL_ADD_TOPO` dispatch;
+- `IOCTL_ADD_TOPO` and `IOCTL_DEL_TOPO` dispatch;
 - embedding and initializing `shared_topo_list` in each `p2p_batch`;
-- calling `topo_del()` for those pins during p2p-fd release;
+- calling `topo_del()` for those pins during explicit delete and p2p-fd
+  release;
 - requiring a registered topology for every read;
 - splitting reads by topology and destination queue limits; and
 - constructing and submitting the NVMe command.
 
-The topology UAPI structures and `IOCTL_ADD_TOPO` remain in
-`p2p_dev_uapi.h`.  Userspace discovery and `add_topo()` remain in
-`file_p2p/file_p2p_api.c` and `file_p2p/file_p2p_api.h`.
+The topology UAPI structures and `IOCTL_ADD_TOPO` / `IOCTL_DEL_TOPO` remain in
+`p2p_dev_uapi.h`.  Userspace discovery and `add_topo()` / `del_topo()` remain
+in `file_p2p/file_p2p_api.c` and `file_p2p/file_p2p_api.h`.
 
 ### 4.2 Module composition
 

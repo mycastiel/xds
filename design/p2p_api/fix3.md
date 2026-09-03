@@ -14,8 +14,9 @@ The NDS userspace API hides that handle in `file_p2p/nds_api.h`,
 
 NDS and `file_p2p` remain **two independent public userspace APIs** on top of
 the same kernel UAPI (`p2p_dev_uapi.h`). They share an internal `p2p_common`
-layer (`p2p_common.h` / `p2p_common.c`) for `p2p_open_dev` / `p2p_add_topo` /
-FIEMAP extent packing (`p2p_prepare_io_extents` / `p2p_get_iov_size`) only.
+layer (`p2p_common.h` / `p2p_common.c`) for `p2p_open_dev` /
+`p2p_add_topo` / `p2p_del_topo_fd` / FIEMAP extent packing
+(`p2p_prepare_io_extents` / `p2p_get_iov_size`) only.
 
 - NDS still does **not** include `file_p2p_api.h` or link `file_p2p_api.c`.
 - Each public API keeps its own surface (`nds_api.h` vs `file_p2p_api.h`) and
@@ -51,8 +52,9 @@ FIEMAP extent packing (`p2p_prepare_io_extents` / `p2p_get_iov_size`) only.
      return `-EEXIST` for an already installed global topology.
    - `nds_init_param.version` is output-only and is set to
      `NDS_API_VERSION` when initialization succeeds.
-   - `nds_unregister_fs` is currently an explicit no-op placeholder. Registered
-     topologies remain pinned until `nds_exit()` closes the topology fd.
+   - `nds_unregister_fs` issues `IOCTL_DEL_TOPO` for each descriptor on the
+     topology fd. Deletion removes one matching topology pin from that fd;
+     the topology remains active while another pin exists.
 
 2. **FD-only object surface**
    - Object-type constants are removed. `nds_io_obj` contains only an fd plus
@@ -154,7 +156,7 @@ struct nds_io_event {
 int nds_init(struct nds_init_param *param);
 int nds_exit(void);
 int nds_register_fs(const struct nds_fs_desc *desc);
-int nds_unregister_fs(const struct nds_fs_desc *desc); /* currently no-op */
+int nds_unregister_fs(const struct nds_fs_desc *desc);
 int nds_register_mem(void *addr, uint64_t size, int flags);   /* no handle out */
 int nds_unregister_mem(void *addr, uint64_t size, int flags);
 int nds_io_submit(struct nds_io_ctx *ctx, int nr,
@@ -181,8 +183,8 @@ callers.
   filesystem descriptor.
 - `nds.register_fs(fs_fds) -> int` accepts a sequence of file/block-device fds
   (for example `[topo_fd]`) and may be called repeatedly after initialization.
-- `nds.unregister_fs(fs_fds) -> int` is exposed but currently returns success
-  without removing any topology.
+- `nds.unregister_fs(fs_fds) -> int` removes the topology identified by each
+  file/block-device fd from the topology fd.
 - `nds.exit() -> int`.
 - `nds.register_mem(addr, size[, flags]) -> int` (errno-style, no handle).
 - `nds.unregister_mem(addr, size[, flags]) -> int`; `size` is mandatory and
@@ -210,6 +212,8 @@ callers.
 | unknown `rw_flags`                          | `-EOPNOTSUPP` |
 | init: nonzero flags or reserved fields      | `-EINVAL`     |
 | register fs: `fs_fd_cnt == 0` / NULL `fs_fd` / nonzero reserved | `-EINVAL` |
+| unregister fs: `fs_fd_cnt == 0` / NULL `fs_fd` / nonzero reserved | `-EINVAL` |
+| unregister fs: topology not pinned by topology fd | `-ENOENT` |
 | unregister mem: registered size mismatch       | `-EINVAL`     |
 | ctx: `max_io_cnt == 0` or `max_io_cnt > NDS_IO_MAX_IO_CNT` | `-EINVAL` |
 | negative submit/getevents counts            | `-EINVAL`     |
@@ -223,9 +227,13 @@ remains the kernel's responsibility; NDS just propagates the errno.
 - `nds_api_test.c` / `python_nds_api_test.py` open every manifest path
   (`O_RDONLY|O_DIRECT`) and pass the fd. They call `nds_init` first, then hand
   `--topology` to `nds_register_fs`.
+- `topo_test.c` verifies that `DEL_TOPO` rejects nonzero reserved fields and
+  missing per-fd pins, affects only the receiving p2p fd, and removes one pin
+  at a time after duplicate `ADD_TOPO` calls.
 - Reject mode opens a second topology fd after initialization and passes it to
-  a second `nds_register_fs` call, demonstrating dynamic growth. It also calls
-  the current no-op `nds_unregister_fs` and verifies I/O can continue.
+  a second `nds_register_fs` call, demonstrating dynamic growth. It then calls
+  `nds_unregister_fs` and verifies I/O can continue through the remaining
+  topology pin.
 - Reject mode updated to the new surface:
   `reject-reg-unregistered-buf` (replaces `reject-reg-zero-handle` and
   `reject-oneshot-with-handle`), `reject-reg-iov-out-of-region` (register a
@@ -237,8 +245,8 @@ remains the kernel's responsibility; NDS just propagates the errno.
   results, and `reject-getevents-empty`.
 - `nds_init` and `nds_exit` are process-wide lifecycle boundaries and must not
   run concurrently with other NDS operations. After successful initialization,
-  concurrent `nds_register_fs` calls are supported; `nds_unregister_fs` remains
-  a no-op.
+  concurrent `nds_register_fs` calls are supported; `nds_unregister_fs` removes
+  matching topology pins from the topology fd.
 - `nds_io_destroy_ctx` frees the ctx; double destroy is undefined behavior.
 - Completion tests match each event to its request by `user_data` and verify
   `res` and reserved output fields, including queued
