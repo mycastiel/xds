@@ -218,13 +218,14 @@ that statistics are available before I/O becomes reachable.
 `p2p_debugfs_init()`:
 
 1. creates the top-level `p2p_device` directory;
-2. creates its `summary` file; and
-3. removes a partially created directory and records no root dentry if either
-   creation fails.
+2. creates its `summary`, `memory`, and `topo` files; and
+3. records the root dentry for recursive removal.
 
 An unavailable debugfs filesystem, including a kernel built without
-`CONFIG_DEBUG_FS`, leaves the module operational without the directory.  A
-creation failure may emit one warning but is not returned from module init.
+`CONFIG_DEBUG_FS`, leaves the module operational without the directory.
+Creation return values are intentionally ignored as recommended by the debugfs
+API.  Child creation and recursive removal safely accept an error-valued root
+dentry.
 
 `p2p_drv_exit()` calls `p2p_debugfs_exit()` before removing the character
 device or unregistering the NVMe tracepoint.  Exit calls
