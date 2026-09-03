@@ -162,7 +162,20 @@ int nds_register_fs(const struct nds_fs_desc *desc)
 
 int nds_unregister_fs(const struct nds_fs_desc *desc)
 {
-	(void)desc;
+	uint32_t i;
+	int ret;
+
+	if (!desc || !desc->fs_fd || !desc->fs_fd_cnt || desc->reserved)
+		return -EINVAL;
+
+	for (i = 0; i < desc->fs_fd_cnt; i++) {
+		ret = p2p_del_topo_fd(g_state.topo_fd, desc->fs_fd[i]);
+		if (ret) {
+			fprintf(stderr, "nds: delete topology for fd %d failed %d\n",
+				desc->fs_fd[i], ret);
+			return ret;
+		}
+	}
 	return 0;
 }
 

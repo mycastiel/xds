@@ -657,6 +657,45 @@ out:
 	return err;
 }
 
+static int p2p_del_topo_dev(int dev_fd, dev_t top_dev)
+{
+	struct topo_del_cfg param = {
+		.top_dev = top_dev,
+		.reserved = 0,
+	};
+
+	if (ioctl(dev_fd, IOCTL_DEL_TOPO, &param) < 0)
+		return -errno;
+	return 0;
+}
+
+int p2p_del_topo(int dev_fd, const char *dev)
+{
+	struct stat st;
+
+	if (stat(dev, &st) < 0)
+		return -errno;
+	if (!S_ISBLK(st.st_mode))
+		return -EINVAL;
+	return p2p_del_topo_dev(dev_fd, st.st_rdev);
+}
+
+int p2p_del_topo_fd(int dev_fd, int topo_fd)
+{
+	struct stat st;
+	dev_t top_dev;
+
+	if (fstat(topo_fd, &st) < 0)
+		return -errno;
+	if (S_ISBLK(st.st_mode))
+		top_dev = st.st_rdev;
+	else if (S_ISREG(st.st_mode))
+		top_dev = st.st_dev;
+	else
+		return -EINVAL;
+	return p2p_del_topo_dev(dev_fd, top_dev);
+}
+
 static unsigned long long align_down_u64(unsigned long long value,
 					 unsigned int alignment)
 {

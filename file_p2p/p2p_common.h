@@ -14,6 +14,14 @@ int p2p_open_dev(void);
  * IOCTL_ADD_TOPO on @dev_fd. Returns 0 or -errno. */
 int p2p_add_topo(int dev_fd, const char *dev);
 
+/* Delete the topology identified by block device path @dev from @dev_fd.
+ * Returns 0 or -errno. */
+int p2p_del_topo(int dev_fd, const char *dev);
+
+/* Delete the topology identified by open file/block-device @topo_fd from
+ * @dev_fd. Returns 0 or -errno. */
+int p2p_del_topo_fd(int dev_fd, int topo_fd);
+
 /* Build FIEMAP (or synthetic block-dev) extents covering [offset, size).
  * Caller frees *exts_out. Returns 0 or -errno. */
 int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat,

@@ -161,8 +161,9 @@ int nds_exit(void);
  * once for the initial filesystem set and again whenever more filesystems
  * become available. Concurrent nds_register_fs() calls are thread-safe.
  *
- * nds_unregister_fs() is currently a no-op placeholder; registered
- * topologies remain active until nds_exit() closes the topology device fd.
+ * nds_unregister_fs() removes the topology identified by each descriptor
+ * from NDS's topology fd. A topology remains active if another registration
+ * still pins the same top device.
  */
 int nds_register_fs(const struct nds_fs_desc *desc);
 int nds_unregister_fs(const struct nds_fs_desc *desc);

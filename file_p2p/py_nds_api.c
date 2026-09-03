@@ -475,7 +475,7 @@ static PyMethodDef NdsMethods[] = {
 	  "fs_fds: file/block fds identifying topologies to add\n" },
 	{ "unregister_fs", py_nds_unregister_fs, METH_VARARGS,
 	  "unregister_fs(fs_fds) -> int\n"
-	  "Currently a no-op; topologies remain until exit().\n" },
+	  "Remove the topology identified by each file descriptor.\n" },
 	{ "register_mem", py_nds_register_mem, METH_VARARGS,
 	  "register_mem(addr, size[, flags=0]) -> int\n" },
 	{ "unregister_mem", py_nds_unregister_mem, METH_VARARGS,

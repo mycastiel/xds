@@ -19,6 +19,7 @@ struct io_parameter {
 int new_p2p_fd(void);
 int close_p2p_fd(int dev_fd);
 int add_topo(int dev_fd, const char *dev);
+int del_topo(int dev_fd, const char *dev);
 int register_mem(int dev_fd, struct p2p_mem_register_param *param);
 int unregister_mem(int dev_fd, const struct p2p_mem_unregister_param *param);
 int rw_file(int dev_fd, const struct io_parameter *param);

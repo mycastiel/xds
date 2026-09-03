@@ -30,6 +30,11 @@ int add_topo(int dev_fd, const char *dev)
 	return p2p_add_topo(dev_fd, dev);
 }
 
+int del_topo(int dev_fd, const char *dev)
+{
+	return p2p_del_topo(dev_fd, dev);
+}
+
 int register_mem(int dev_fd, struct p2p_mem_register_param *param)
 {
 	if (ioctl(dev_fd, IOCTL_REGISTER_MEM, param) < 0)

@@ -193,6 +193,21 @@ static PyObject *py_add_topo(PyObject *Py_UNUSED(self), PyObject *args)
 	return PyLong_FromLong((long)ret);
 }
 
+static PyObject *py_del_topo(PyObject *Py_UNUSED(self), PyObject *args)
+{
+	const char *dev;
+	int dev_fd;
+	int ret;
+
+	if (!PyArg_ParseTuple(args, "is", &dev_fd, &dev))
+		return NULL;
+
+	Py_BEGIN_ALLOW_THREADS
+	ret = del_topo(dev_fd, dev);
+	Py_END_ALLOW_THREADS
+	return PyLong_FromLong((long)ret);
+}
+
 static PyObject *py_close_p2p_fd(PyObject *Py_UNUSED(self), PyObject *args)
 {
 	int dev_fd = 0;
@@ -251,6 +266,10 @@ static PyMethodDef FileP2PMethods[] = {
 	{ "add_topo", py_add_topo, METH_VARARGS,
 	  "add_topo(dev_fd, dev) -> int\n\n"
 	  "Discover and register the required block-device topology.\n"
+	  "Returns 0 on success or a negative errno.\n" },
+	{ "del_topo", py_del_topo, METH_VARARGS,
+	  "del_topo(dev_fd, dev) -> int\n\n"
+	  "Delete one topology pin from the p2p device fd.\n"
 	  "Returns 0 on success or a negative errno.\n" },
 	{ "close_p2p_fd", py_close_p2p_fd, METH_VARARGS,
 	  "close_p2p_fd(dev_fd) -> None\n\n"
