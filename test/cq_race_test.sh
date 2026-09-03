@@ -129,7 +129,7 @@ $((get_after - get_before)) PA-list gets"
 				die "$api registered $mode used \
 $((put_after - put_before)) PA-list puts"
 		fi
-		check_stats
+		check_stats read
 	done
 }
 

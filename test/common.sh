@@ -374,7 +374,7 @@ reset_p2p_stats()
 
 check_stats()
 {
-	local direction=${1:-read}
+	local direction=$1
 	local summary=/sys/kernel/debug/p2p_device/summary
 	local op
 	local -a active inactive
@@ -390,7 +390,6 @@ check_stats()
 			;;
 		mixed)
 			active=(read write)
-			inactive=()
 			;;
 		*) die "invalid p2p statistics direction '$direction'" ;;
 	esac
@@ -403,10 +402,12 @@ check_stats()
 			'$1 == field { found = 1; if ($2 > 0) ok = 1 } END { exit !(found && ok) }' \
 			"$summary" || die "p2p transferred no $op bytes"
 	done
-	for op in "${inactive[@]}"; do
-		grep -Eq "^${op}_io_issued: 0$" "$summary" || die "p2p unexpectedly issued $op NVMe requests"
-		grep -Eq "^${op}_io_bytes: 0$" "$summary" || die "p2p unexpectedly transferred $op bytes"
-	done
+	if [[ $direction != mixed ]]; then
+		for op in "${inactive[@]}"; do
+			grep -Eq "^${op}_io_issued: 0$" "$summary" || die "p2p unexpectedly issued $op NVMe requests"
+			grep -Eq "^${op}_io_bytes: 0$" "$summary" || die "p2p unexpectedly transferred $op bytes"
+		done
+	fi
 	for op in read write; do
 		grep -Eq "^${op}_io_inflight: 0$" "$summary" || die "p2p $op I/O remains inflight"
 		grep -Eq "^${op}_io_failed: 0$" "$summary" || die "p2p $op completion failure recorded"
@@ -465,7 +466,7 @@ run_manifest()
 	python3 "$SCRIPT_DIR/check_crc.py" --manifest "$manifest" \
 		--log "$kernel_log" --crc-tool "$SCRIPT_DIR/crc32_verify" \
 		>>"$output"
-	check_stats
+	check_stats read
 }
 
 wipe_test_devices()

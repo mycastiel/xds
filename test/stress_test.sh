@@ -131,7 +131,7 @@ $((put_after - put_before)) PA-list puts"
 		--log "$kernel_log" \
 		--crc-tool "$SCRIPT_DIR/crc32_verify" |
 		tee -a "$output"
-	check_stats
+	check_stats read
 }
 
 run_cq_race_api()
@@ -206,7 +206,7 @@ $((put_after - put_before)) PA-list puts"
 		--log "$kernel_log" \
 		--crc-tool "$SCRIPT_DIR/crc32_verify" |
 		tee -a "$output"
-	check_stats
+	check_stats read
 }
 
 main()
