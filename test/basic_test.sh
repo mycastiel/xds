@@ -658,6 +658,8 @@ main()
 	crc_self_test
 	save_kernel_identity
 	load_modules
+	log "Topology delete API"
+	"$SCRIPT_DIR/topo_test" --topology "$DEV1"
 	log "NDS rejection coverage"
 	"$SCRIPT_DIR/nds_api_test" --topology "$DEV1" --mode reject
 	env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \

@@ -2415,7 +2415,7 @@ int main(int argc, char **argv)
 				  nds_register_fs(&fs_desc), 0);
 		if (err)
 			goto reject_out;
-		err = expect_case("unregister-fs-noop",
+		err = expect_case("unregister-fs",
 				  nds_unregister_fs(&fs_desc), 0);
 		if (err)
 			goto reject_out;

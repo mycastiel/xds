@@ -1264,7 +1264,7 @@ def main() -> int:
                     0,
                 )
                 require(
-                    "unregister-fs-noop",
+                    "unregister-fs",
                     nds.unregister_fs([second_topo_fd]),
                     0,
                 )
