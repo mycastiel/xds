@@ -488,10 +488,14 @@ int topo_add(const struct topo_user_cfg *cfg, struct shared_topo_list *list)
 
 link_shared:
 	shared->topo = installed;
+	/*
+	 * Log before publishing the new pin. Once the list node is visible,
+	 * a concurrent DEL_TOPO on this fd may remove the pin and free @installed.
+	 */
+	topo_debug_log(inserted ? "register" : "pin", installed);
 	spin_lock(&list->lock);
 	list_add_tail(&shared->list, &list->head);
 	spin_unlock(&list->lock);
-	topo_debug_log(inserted ? "register" : "pin", installed);
 
 	if (candidate && installed != candidate)
 		topo_destroy_sync(candidate);
@@ -535,6 +539,7 @@ static void topo_pin_release(struct kref *ref)
 
 void topo_del(struct topo *topo)
 {
+	topo_debug_log("unpin", topo);
 	kref_put_lock(&topo->pin_refcnt, topo_pin_release, &topo_lock);
 }
 

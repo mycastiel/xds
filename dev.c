@@ -1776,6 +1776,36 @@ static int p2p_add_topo(struct p2p_batch *batch, void __user *arg)
 	return err;
 }
 
+static int p2p_del_topo(struct p2p_batch *batch, void __user *arg)
+{
+	struct topo_del_cfg param;
+	struct shared_topo *shared;
+	struct topo *topo = NULL;
+	dev_t top_dev;
+
+	if (copy_from_user(&param, arg, sizeof(param)))
+		return -EFAULT;
+	if (param.reserved)
+		return -EINVAL;
+
+	top_dev = new_decode_dev(param.top_dev);
+	spin_lock(&batch->shared_topos.lock);
+	list_for_each_entry(shared, &batch->shared_topos.head, list) {
+		if (shared->topo->top_dev != top_dev)
+			continue;
+		list_del(&shared->list);
+		topo = shared->topo;
+		break;
+	}
+	spin_unlock(&batch->shared_topos.lock);
+	if (!topo)
+		return -ENOENT;
+
+	topo_del(topo);
+	kfree(shared);
+	return 0;
+}
+
 static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct p2p_batch *batch = file->private_data;
@@ -1790,6 +1820,9 @@ static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 	case IOCTL_ADD_TOPO:
 		err = p2p_add_topo(batch, (void __user *)arg);
+		break;
+	case IOCTL_DEL_TOPO:
+		err = p2p_del_topo(batch, (void __user *)arg);
 		break;
 	case IOCTL_REGISTER_MEM:
 		err = p2p_register_mem(batch, (void __user *)arg);

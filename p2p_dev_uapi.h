@@ -101,6 +101,12 @@ struct topo_user_cfg {
 	struct topo_user_bdev bdevs[];
 };
 
+/* Delete one topology pin from the fd receiving IOCTL_DEL_TOPO. */
+struct topo_del_cfg {
+	__u32 top_dev;
+	__u32 reserved;
+};
+
 #define IOCTL_ADD_TOPO _IOW('k', 1, struct topo_user_cfg)
 #define IOCTL_SUBMIT_IO _IOWR('k', 2, struct p2p_io_batch_param)
 /*
@@ -111,5 +117,6 @@ struct topo_user_cfg {
 #define IOCTL_REGISTER_MEM _IOWR('k', 4, struct p2p_mem_register_param)
 #define IOCTL_UNREGISTER_MEM _IOW('k', 5, struct p2p_mem_unregister_param)
 #define IOCTL_GET_IO_EVENTS _IOWR('k', 6, struct p2p_getevents_param)
+#define IOCTL_DEL_TOPO _IOW('k', 7, struct topo_del_cfg)
 
 #endif
