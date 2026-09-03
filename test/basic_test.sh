@@ -318,7 +318,7 @@ run_write_pipeline()
 		die "$label $api HBM CRC32 mismatch: expected $expected_crc, got ${actual_crc[*]:-none}"
 	printf 'crc-pass case=read crc32=%s\n' "${actual_crc[0],,}" \
 		>>"$read_output"
-	check_stats
+	check_stats read
 
 	write_output="$WORK_DIR/$label.$suffix.rw-write.out"
 	write_log="$WORK_DIR/$label.$suffix.rw-write.dmesg"
@@ -337,7 +337,7 @@ run_write_pipeline()
 		cat "$write_log" >&2
 		die "$label $api write emitted read-only diagnostics"
 	fi
-	check_stats
+	check_stats write
 
 	"$SCRIPT_DIR/direct_io_test" --mode verify --device "$target" \
 		--source-offset "$source_offset" --target-offset "$target_offset" \
@@ -368,7 +368,7 @@ run_write_pipeline()
 		die "$label $api mixed read CRC32 mismatch: expected $expected_crc, got ${actual_crc[*]:-none}"
 	printf 'crc-pass case=mixed crc32=%s\n' "${actual_crc[0],,}" \
 		>>"$mixed_output"
-	check_stats
+	check_stats mixed
 	"$SCRIPT_DIR/direct_io_test" --mode verify --device "$target" \
 		--source-offset "$source_offset" --target-offset "$target_offset" \
 		--length "$length" --seed "$phase_seed"

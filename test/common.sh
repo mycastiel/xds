@@ -374,15 +374,44 @@ reset_p2p_stats()
 
 check_stats()
 {
+	local direction=${1:-read}
 	local summary=/sys/kernel/debug/p2p_device/summary
+	local op
+	local -a active inactive
 
-	awk '$1 == "io_issued:" { found = 1; if ($2 > 0) ok = 1 } END { exit !(found && ok) }' \
-		"$summary" || die "p2p issued no NVMe requests"
-	awk '$1 == "io_bytes:" { found = 1; if ($2 > 0) ok = 1 } END { exit !(found && ok) }' \
-		"$summary" || die "p2p transferred no bytes"
-	grep -Eq '^io_inflight: 0$' "$summary" || die "p2p I/O remains inflight"
-	grep -Eq '^io_failed: 0$' "$summary" || die "p2p completion failure recorded"
-	grep -Eq '^io_issue_failed: 0$' "$summary" || die "p2p submission failure recorded"
+	case $direction in
+		read)
+			active=(read)
+			inactive=(write)
+			;;
+		write)
+			active=(write)
+			inactive=(read)
+			;;
+		mixed)
+			active=(read write)
+			inactive=()
+			;;
+		*) die "invalid p2p statistics direction '$direction'" ;;
+	esac
+
+	for op in "${active[@]}"; do
+		awk -v field="${op}_io_issued:" \
+			'$1 == field { found = 1; if ($2 > 0) ok = 1 } END { exit !(found && ok) }' \
+			"$summary" || die "p2p issued no $op NVMe requests"
+		awk -v field="${op}_io_bytes:" \
+			'$1 == field { found = 1; if ($2 > 0) ok = 1 } END { exit !(found && ok) }' \
+			"$summary" || die "p2p transferred no $op bytes"
+	done
+	for op in "${inactive[@]}"; do
+		grep -Eq "^${op}_io_issued: 0$" "$summary" || die "p2p unexpectedly issued $op NVMe requests"
+		grep -Eq "^${op}_io_bytes: 0$" "$summary" || die "p2p unexpectedly transferred $op bytes"
+	done
+	for op in read write; do
+		grep -Eq "^${op}_io_inflight: 0$" "$summary" || die "p2p $op I/O remains inflight"
+		grep -Eq "^${op}_io_failed: 0$" "$summary" || die "p2p $op completion failure recorded"
+		grep -Eq "^${op}_io_issue_failed: 0$" "$summary" || die "p2p $op submission failure recorded"
+	done
 }
 
 run_manifest()
