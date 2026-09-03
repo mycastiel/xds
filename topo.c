@@ -9,9 +9,11 @@
 #include <linux/overflow.h>
 #include <linux/radix-tree.h>
 #include <linux/rcupdate.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include "debugfs.h"
 #include "topo.h"
 
 #define P2P_SYSFS_BDEV_PATH_MAX 48
@@ -19,6 +21,51 @@
 static RADIX_TREE(topo_tree, GFP_ATOMIC);
 static DEFINE_SPINLOCK(topo_lock);
 static struct workqueue_struct *topo_release_wq;
+
+static void topo_debugfs_show_one(struct seq_file *seq, const struct topo *topo)
+{
+	const struct topo_bdev *bdev;
+	u32 i;
+
+	seq_printf(seq,
+		   "name: %s top_dev: %u:%u size_sector: 0x%llx nr_bdevs: %u pin_count: %u\n",
+		   topo->name, MAJOR(topo->top_dev), MINOR(topo->top_dev), topo->size_sector,
+		   topo->nr_bdevs, kref_read(&topo->pin_refcnt));
+	if (!strcmp(topo->name, "raid0"))
+		seq_printf(seq, "  chunk_sectors: 0x%llx\n",
+			   1ULL << topo->priv.chunk_sectors_shift);
+	for (i = 0; i < topo->nr_bdevs; i++) {
+		bdev = &topo->bdevs[i];
+		seq_printf(seq,
+			   "  bdev[%u]: dev: %u:%u nsid: %u start_sector: 0x%llx",
+			   i, MAJOR(bdev->id), MINOR(bdev->id), bdev->nsid,
+			   bdev->start_sector);
+		seq_printf(seq, " size_sector: 0x%llx\n", bdev->size_sector);
+	}
+	seq_putc(seq, '\n');
+}
+
+int p2p_debugfs_topo_show(struct seq_file *seq, void *unused)
+{
+	struct radix_tree_iter iter;
+	struct topo *topo;
+	void __rcu **slot;
+
+	rcu_read_lock();
+	radix_tree_for_each_slot(slot, &topo_tree, &iter, 0) {
+		topo = radix_tree_deref_slot(slot);
+		if (!topo)
+			continue;
+		if (radix_tree_deref_retry(topo)) {
+			slot = radix_tree_iter_retry(&iter);
+			continue;
+		}
+		topo_debugfs_show_one(seq, topo);
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
 
 static bool topo_sysfs_path_exists(dev_t devt, const char *suffix)
 {
