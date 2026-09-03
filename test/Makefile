@@ -20,7 +20,7 @@ c_api_test: c_api_test.c ../file_p2p/file_p2p_api.c ../file_p2p/p2p_common.c \
 
 mem_registration_test: mem_registration_test.c ../file_p2p/file_p2p_api.c \
 		../file_p2p/p2p_common.c ../file_p2p/file_p2p_api.h \
-		../file_p2p/p2p_common.h ../p2p_dev_uapi.h
+		../file_p2p/p2p_common.h ../p2p_dev_uapi.h debugfs_test.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread -o $@ \
 		mem_registration_test.c ../file_p2p/file_p2p_api.c \
 		../file_p2p/p2p_common.c
@@ -30,8 +30,8 @@ direct_io_test: direct_io_test.c
 
 topo_test: topo_test.c ../file_p2p/file_p2p_api.c ../file_p2p/p2p_common.c \
 		../file_p2p/file_p2p_api.h ../file_p2p/p2p_common.h \
-		../p2p_dev_uapi.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ \
+		../p2p_dev_uapi.h debugfs_test.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread -o $@ \
 		topo_test.c ../file_p2p/file_p2p_api.c ../file_p2p/p2p_common.c
 
 rw_api_test: rw_api_test.c ../file_p2p/file_p2p_api.c ../file_p2p/p2p_common.c \

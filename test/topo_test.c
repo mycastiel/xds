@@ -1,12 +1,20 @@
+#define _GNU_SOURCE
+
 #include <errno.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
+#include "debugfs_test.h"
 #include "file_p2p_api.h"
+
+#define TOPO_DEBUGFS_PATH "/sys/kernel/debug/p2p_device/topo"
+#define DEBUGFS_RACE_ITERATIONS 128
 
 static int expect(const char *name, int actual, int expected)
 {
@@ -30,6 +38,60 @@ static int del_topo_reserved(int dev_fd, dev_t top_dev)
 	if (ioctl(dev_fd, IOCTL_DEL_TOPO, &cfg) < 0)
 		return -errno;
 	return 0;
+}
+
+static int test_debugfs_topo_race(int dev_fd, const char *topology, dev_t top_dev)
+{
+	struct debugfs_reader_context reader;
+	char expected[64];
+	bool added = false;
+	unsigned int i;
+	int reader_err;
+	int err;
+
+	err = add_topo(dev_fd, topology);
+	if (err)
+		return err;
+	added = true;
+	snprintf(expected, sizeof(expected), "top_dev: %u:%u", major(top_dev), minor(top_dev));
+	err = debugfs_read_file(TOPO_DEBUGFS_PATH, expected);
+	if (err)
+		goto out;
+	err = del_topo(dev_fd, topology);
+	if (err)
+		goto out;
+	added = false;
+	err = debugfs_read_file(TOPO_DEBUGFS_PATH, expected);
+	if (err != -ENOENT) {
+		if (!err)
+			err = -EEXIST;
+		goto out;
+	}
+	err = 0;
+
+	err = debugfs_reader_start(&reader, TOPO_DEBUGFS_PATH);
+	if (err)
+		return err;
+	for (i = 0; i < DEBUGFS_RACE_ITERATIONS; i++) {
+		err = add_topo(dev_fd, topology);
+		if (err)
+			break;
+		added = true;
+		sched_yield();
+		err = del_topo(dev_fd, topology);
+		if (err)
+			break;
+		added = false;
+		sched_yield();
+	}
+	reader_err = debugfs_reader_stop(&reader);
+	if (!err)
+		err = reader_err;
+
+out:
+	if (added)
+		del_topo(dev_fd, topology);
+	return err;
 }
 
 int main(int argc, char **argv)
@@ -112,6 +174,10 @@ int main(int argc, char **argv)
 		goto out;
 	err = expect("del topology duplicate stale", del_topo(owner_fd, topology),
 		     -ENOENT);
+	if (err)
+		goto out;
+	err = expect("debugfs topology add/delete race",
+		     test_debugfs_topo_race(owner_fd, topology, st.st_rdev), 0);
 
 out:
 	if (other_fd >= 0)

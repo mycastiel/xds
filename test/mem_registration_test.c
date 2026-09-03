@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,6 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "debugfs_test.h"
 #include "file_p2p_api.h"
 
 #define TEST_REG_ADDR 512UL
@@ -21,6 +23,8 @@
 #define TEST_SECOND_REG_SIZE ((4UL << 20) - 512)
 #define TEST_RACE_THREADS 8
 #define TEST_UNREGISTER_TIMEOUT_SEC 30
+#define MEMORY_DEBUGFS_PATH "/sys/kernel/debug/p2p_device/memory"
+#define DEBUGFS_RACE_ITERATIONS 128
 
 struct race_context {
 	pthread_mutex_t lock;
@@ -120,6 +124,63 @@ static int unregister_handle(int dev_fd, uint64_t handle)
 	};
 
 	return unregister_mem(dev_fd, &param);
+}
+
+static int test_debugfs_memory_race(int dev_fd)
+{
+	struct debugfs_reader_context reader;
+	uint64_t handle = 0;
+	char expected[64];
+	bool registered = false;
+	unsigned int i;
+	int reader_err;
+	int err;
+
+	err = register_range_at(dev_fd, TEST_SECOND_REG_ADDR,
+				TEST_SECOND_REG_SIZE, &handle);
+	if (err)
+		return err;
+	registered = true;
+	snprintf(expected, sizeof(expected), "handle: 0x%llx", (unsigned long long)handle);
+	err = debugfs_read_file(MEMORY_DEBUGFS_PATH, expected);
+	if (err)
+		goto out;
+	err = unregister_handle(dev_fd, handle);
+	if (err)
+		goto out;
+	registered = false;
+	err = debugfs_read_file(MEMORY_DEBUGFS_PATH, expected);
+	if (err != -ENOENT) {
+		if (!err)
+			err = -EEXIST;
+		goto out;
+	}
+	err = 0;
+
+	err = debugfs_reader_start(&reader, MEMORY_DEBUGFS_PATH);
+	if (err)
+		return err;
+	for (i = 0; i < DEBUGFS_RACE_ITERATIONS; i++) {
+		err = register_range_at(dev_fd, TEST_SECOND_REG_ADDR,
+					TEST_SECOND_REG_SIZE, &handle);
+		if (err)
+			break;
+		registered = true;
+		sched_yield();
+		err = unregister_handle(dev_fd, handle);
+		if (err)
+			break;
+		registered = false;
+		sched_yield();
+	}
+	reader_err = debugfs_reader_stop(&reader);
+	if (!err)
+		err = reader_err;
+
+out:
+	if (registered)
+		unregister_handle(dev_fd, handle);
+	return err;
 }
 
 static void *race_unregister(void *argument)
@@ -537,6 +598,10 @@ int main(int argc, char **argv)
 	err = expect("multiple registered memories",
 		     test_multiple_registered_mem(dev_fd, other_fd, topology,
 						  handle), 0);
+	if (err)
+		goto unregister;
+	err = expect("debugfs memory register/unregister race",
+		     test_debugfs_memory_race(dev_fd), 0);
 	if (err)
 		goto unregister;
 	err = expect("process scope", test_process_scope(dev_fd, topology, handle),
