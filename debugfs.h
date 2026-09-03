@@ -9,8 +9,11 @@
 #define P2P_IO_STATS_WRITE 1U
 #define P2P_IO_STATS_NR 2U
 
+struct seq_file;
+
 void p2p_debugfs_init(void);
 void p2p_debugfs_exit(void);
+int p2p_debugfs_memory_show(struct seq_file *seq, void *unused);
 
 void p2p_stats_io_issued(u32 op, u64 bytes);
 void p2p_stats_io_issue_failed(u32 op);

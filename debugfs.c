@@ -162,6 +162,19 @@ static const struct file_operations p2p_summary_fops = {
 	.release = single_release,
 };
 
+static int p2p_memory_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, p2p_debugfs_memory_show, NULL);
+}
+
+static const struct file_operations p2p_memory_fops = {
+	.owner = THIS_MODULE,
+	.open = p2p_memory_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 void p2p_debugfs_init(void)
 {
 	struct dentry *root;
@@ -183,6 +196,7 @@ void p2p_debugfs_init(void)
 		return;
 	}
 
+	debugfs_create_file("memory", 0400, root, NULL, &p2p_memory_fops);
 	p2p_debugfs_root = root;
 }
 

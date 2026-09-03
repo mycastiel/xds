@@ -21,6 +21,7 @@
 #include <linux/pid.h>
 #include <linux/random.h>
 #include <linux/rcupdate.h>
+#include <linux/seq_file.h>
 #include <linux/workqueue.h>
 #include <linux/xarray.h>
 #include <linux/wait.h>
@@ -189,6 +190,20 @@ static struct file_operations fops = {
 	.unlocked_ioctl = p2p_ioctl,
 	.compat_ioctl = compat_ptr_ioctl,
 };
+
+int p2p_debugfs_memory_show(struct seq_file *seq, void *unused)
+{
+	struct p2p_registered_mem *mem;
+	unsigned long index;
+
+	rcu_read_lock();
+	xa_for_each(&registered_mems, index, mem)
+		seq_printf(seq, "handle: 0x%llx addr: 0x%llx size: 0x%llx\n",
+			   mem->handle, mem->addr, mem->size);
+	rcu_read_unlock();
+
+	return 0;
+}
 
 static int p2p_open(struct inode *inode, struct file *file)
 {
