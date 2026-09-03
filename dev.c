@@ -1110,7 +1110,7 @@ void p2p_complete_io(struct request *req, blk_status_t status)
 {
 	struct p2p_io_context *io_ctx = req->end_io_data;
 
-	p2p_stats_io_complete(status);
+	p2p_stats_io_complete(io_ctx->op, status);
 	if (status)
 		cmpxchg(&io_ctx->io_err, 0, status);
 
@@ -1155,7 +1155,7 @@ static int do_io(struct p2p_io_context *io_ctx, struct block_device *bdev, unsig
 	req->end_io_data = io_ctx;
 	req->end_io = p2p_end_io;
 	atomic_inc(&io_ctx->io_ref);
-	p2p_stats_io_issued((u64)sector_nr << SECTOR_SHIFT);
+	p2p_stats_io_issued(io_ctx->op, (u64)sector_nr << SECTOR_SHIFT);
 
 	p2p_execute_rq_nowait(req, disk);
 
@@ -1547,7 +1547,7 @@ static int p2p_submit_one(struct p2p_batch *batch, const struct p2p_io_param *pa
 
 	io_ctx->issue_err = do_ios(io_ctx, topo, extents, param->ext_nr);
 	if (io_ctx->issue_err)
-		p2p_stats_io_issue_failed();
+		p2p_stats_io_issue_failed(io_ctx->op);
 	p2p_io_ctx_put(io_ctx);
 	err = 0;
 
