@@ -26,10 +26,12 @@ def round_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
-def choose_file_sizes(rng: random.Random, workers: int) -> List[int]:
+def choose_file_sizes(
+    rng: random.Random, workers: int, max_total_file_size: int
+) -> List[int]:
     while True:
         sizes = [rng.randint(4, 4096) * KIB for _ in range(workers)]
-        if 4 * MIB < sum(sizes) <= MAX_TOTAL_FILE_SIZE:
+        if 4 * MIB < sum(sizes) <= max_total_file_size:
             return sizes
 
 
@@ -81,15 +83,20 @@ def main() -> int:
     parser.add_argument("--seed", required=True, type=integer)
     parser.add_argument("--mode", required=True, choices=("raid0", "dm", "nvme"))
     parser.add_argument("--topology", required=True)
+    parser.add_argument(
+        "--max-total-file-size", type=integer, default=MAX_TOTAL_FILE_SIZE
+    )
     args = parser.parse_args()
 
     if args.workers < 2:
         parser.error("--workers must be at least 2")
     if args.iterations <= 0:
         parser.error("--iterations must be positive")
+    if args.max_total_file_size <= 4 * MIB:
+        parser.error("--max-total-file-size must be greater than 4 MiB")
 
     rng = random.Random(args.seed)
-    file_sizes = choose_file_sizes(rng, args.workers)
+    file_sizes = choose_file_sizes(rng, args.workers, args.max_total_file_size)
     total_file_size = sum(file_sizes)
     args.directory.mkdir(parents=True, exist_ok=True)
     args.manifest.parent.mkdir(parents=True, exist_ok=True)

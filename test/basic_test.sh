@@ -457,7 +457,7 @@ test_direct_nvme()
 			"$((SEED + 200))" 0 "$api" registered
 	done
 	log "Registered-memory API and lifetime"
-	run_logged_mem_registration_case c 5 \
+	run_logged_mem_registration_case c 134 \
 		"$SCRIPT_DIR/mem_registration_test" --topology "$DEV1"
 	run_logged_mem_registration_case python 3 env \
 		"PYTHONPATH=$REPO_ROOT/file_p2p" python3 \

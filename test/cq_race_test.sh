@@ -140,6 +140,7 @@ main()
 	local workload
 	local api
 	local memory_mode
+	local max_total_file_size=$((96 << 20))
 
 	(( $# == 0 )) || die "cq_race_test.sh does not accept positional arguments"
 	validate_options
@@ -147,10 +148,11 @@ main()
 	trap cleanup EXIT
 
 	preflight
-	build_all
+	build_all normal
 	save_kernel_identity
 	load_modules
 	prepare_topology
+	[[ $STRESS_MODE != nvme ]] || max_total_file_size=$((48 << 20))
 
 	log "$STRESS_MODE: creating ext4 with 4 KiB blocks"
 	mkfs.ext4 -F -q -b 4096 "$TARGET"
@@ -164,7 +166,8 @@ main()
 	python3 "$SCRIPT_DIR/generate_stress_workload.py" \
 		--directory "$data_dir" --manifest "$workload" \
 		--workers "$CQ_RACE_WORKERS" --iterations "$CQ_RACE_ITERATIONS" \
-		--seed "$CQ_RACE_SEED" --mode "$STRESS_MODE" --topology "$TARGET"
+		--seed "$CQ_RACE_SEED" --mode "$STRESS_MODE" --topology "$TARGET" \
+		--max-total-file-size "$max_total_file_size"
 	sync
 
 	log "live stress: workers=$CQ_RACE_WORKERS iterations=$CQ_RACE_ITERATIONS overlap_ms=$CQ_RACE_OVERLAP_MS rounds=$CQ_RACE_ROUNDS"

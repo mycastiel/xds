@@ -250,11 +250,29 @@ preflight()
 
 build_all()
 {
-	log "Building normal and CRC-enabled modules plus both userspace APIs (-j$BUILD_JOBS)"
+	local final_variant=${1:-crc}
+	local -a first_flags second_flags
+
+	case $final_variant in
+	crc)
+		first_flags=()
+		second_flags=(KCFLAGS=-DCALC_CRC32)
+		;;
+	normal)
+		first_flags=(KCFLAGS=-DCALC_CRC32)
+		second_flags=()
+		;;
+	*)
+		die "build_all variant must be normal or crc"
+		;;
+	esac
+
+	log "Building normal and CRC-enabled modules plus both userspace APIs" \
+		"(-j$BUILD_JOBS, final=$final_variant)"
 	make -C "$REPO_ROOT" clean
-	make -C "$REPO_ROOT" -j"$BUILD_JOBS" W=1
+	make -C "$REPO_ROOT" -j"$BUILD_JOBS" W=1 "${first_flags[@]}"
 	make -C "$REPO_ROOT" clean
-	make -C "$REPO_ROOT" -j"$BUILD_JOBS" W=1 KCFLAGS=-DCALC_CRC32
+	make -C "$REPO_ROOT" -j"$BUILD_JOBS" W=1 "${second_flags[@]}"
 	make -C "$REPO_ROOT" -j"$BUILD_JOBS" test
 	(
 		cd "$REPO_ROOT/file_p2p"
@@ -280,7 +298,7 @@ save_kernel_identity()
 {
 	local info="$WORK_DIR/kernel.info"
 	local kernel_variant=${XDS_KERNEL_VARIANT:-}
-	local kernel_version kasan_config kasan_dmesg
+	local kernel_version kasan_config
 
 	kernel_version=$(uname -r)
 	if [[ -n $kernel_variant ]]; then
@@ -293,9 +311,8 @@ save_kernel_identity()
 	elif [[ $kernel_version == *xds-nokasan ]]; then
 		kernel_variant=nokasan
 	fi
-	kasan_dmesg=$(
-		dmesg 2>/dev/null |
-			grep -i 'KernelAddressSanitizer initialized' || true
+	kasan_config=$(
+		grep -E '^#?[[:space:]]*CONFIG_KASAN=' "$KSRC/.config" || true
 	)
 
 	{
@@ -305,23 +322,17 @@ save_kernel_identity()
 			printf 'VARIANT=%s\n' "$kernel_variant"
 		fi
 		printf 'CMDLINE=%s\n' "$(tr '\n' ' ' </proc/cmdline)"
-		if [[ -n $kasan_dmesg ]]; then
+		if [[ $kasan_config == CONFIG_KASAN=y ]]; then
 			printf 'KASAN_ENABLED=true\n'
 			printf 'KASAN_MODE=generic\n'
 		else
 			printf 'KASAN_ENABLED=false\n'
 			printf 'KASAN_MODE=none\n'
 		fi
-		if [[ -n ${KSRC:-} && -f $KSRC/.config ]]; then
-			kasan_config=$(
-				grep -E '^#?[[:space:]]*CONFIG_KASAN=' \
-					"$KSRC/.config" || true
-			)
-			if [[ -n $kasan_config ]]; then
-				printf 'KASAN_CONFIG=%s\n' "$kasan_config"
-			else
-				printf 'KASAN_CONFIG=# CONFIG_KASAN is not set\n'
-			fi
+		if [[ -n $kasan_config ]]; then
+			printf 'KASAN_CONFIG=%s\n' "$kasan_config"
+		else
+			printf 'KASAN_CONFIG=# CONFIG_KASAN is not set\n'
 		fi
 	} >"$info"
 }
