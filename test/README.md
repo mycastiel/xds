@@ -53,6 +53,18 @@ e2fsprogs, util-linux, and udev tools.
 
 ## Running
 
+To verify topology registration without issuing NPU I/O, build and run:
+
+```sh
+make -C test nds_topology_test
+sudo ./test/nds_topology_test /dev/loop1
+```
+
+Loop devices are supported when direct I/O is enabled (`losetup --direct-io=on`)
+and the backing file is fully allocated on a supported NVMe, dm-linear, or MD
+RAID0 topology. Sparse, shared/reflinked, encrypted, inline-data, or otherwise
+unstable FIEMAP extents are rejected.
+
 The two variables are mandatory. There is intentionally no additional
 destructive confirmation because the devices are required to belong to a
 disposable VM:

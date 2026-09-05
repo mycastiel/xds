@@ -10,7 +10,7 @@
 /* Open /dev/p2p_device O_RDWR|O_CLOEXEC. Returns fd or -errno. */
 int p2p_open_dev(void);
 
-/* Discover nvme/linear/raid0 topology for block device ID @dev_id and
+/* Discover nvme/linear/raid0/loop topology for block device ID @dev_id and
  * IOCTL_ADD_TOPO on @dev_fd. Requires sysfs and, for dm-linear,
  * /dev/mapper/control, but no target block device node. Returns 0 or -errno. */
 int p2p_add_topo(int dev_fd, dev_t dev_id);

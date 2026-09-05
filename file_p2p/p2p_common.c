@@ -28,6 +28,12 @@
 #define P2P_DM_CONTROL "/dev/mapper/control"
 #define P2P_DM_BUFFER_SIZE (16U << 10)
 
+#define P2P_LOOP_UNSUPPORTED_FIEMAP_FLAGS \
+       (FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC | \
+        FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED | \
+        FIEMAP_EXTENT_NOT_ALIGNED | FIEMAP_EXTENT_DATA_INLINE | \
+        FIEMAP_EXTENT_DATA_TAIL | FIEMAP_EXTENT_SHARED)
+
 struct raid0_member {
 	int slot;
 	struct topo_user_bdev bdev;
@@ -583,6 +589,315 @@ static int discover_raid0(dev_t top_dev, struct topo_user_cfg *cfg)
 	return err;
 }
 
+typedef int (*topo_discover_fn)(dev_t,
+				struct topo_user_cfg *);
+
+static topo_discover_fn select_discover(dev_t devt)
+{
+	if (path_exists(devt, "partition") ||
+	    path_exists(devt, "device/subsysnqn"))
+		return discover_nvme;
+	if (path_exists(devt, "dm"))
+		return discover_linear;
+	if (path_exists(devt, "md"))
+		return discover_raid0;
+	return NULL;
+}
+
+static int devt_to_bdev(dev_t devt, char *bdev, size_t bdev_size)
+{
+	char sys[64];
+	char link[PATH_MAX];
+	const char *base;
+	ssize_t len;
+
+	if (snprintf(sys, sizeof(sys), "/sys/dev/block/%u:%u",
+		     major(devt), minor(devt)) >= (int)sizeof(sys))
+		return -ENAMETOOLONG;
+	len = readlink(sys, link, sizeof(link) - 1);
+	if (len < 0)
+		return -errno;
+	link[len] = '\0';
+	base = strrchr(link, '/');
+	base = base ? base + 1 : link;
+	if (snprintf(bdev, bdev_size, "/dev/%s", base) >= (int)bdev_size)
+		return -ENAMETOOLONG;
+	return 0;
+}
+
+static int map_topology_sector(const struct topo_user_cfg *topology,
+			       uint64_t from_sector, uint64_t requested,
+			       uint32_t *dev_index,
+			       uint64_t *component_sector,
+			       uint64_t *mapped)
+{
+	uint64_t available;
+
+	if (!strcmp(topology->name, "nvme")) {
+		if (from_sector >= topology->bdevs[0].size_sector)
+			return -EINVAL;
+		*dev_index = 0;
+		*component_sector = from_sector;
+		available = topology->bdevs[0].size_sector - from_sector;
+	} else if (!strcmp(topology->name, "linear")) {
+		uint64_t logical_start = 0;
+		uint32_t i;
+
+		for (i = 0; i < topology->nr_devs; i++) {
+			uint64_t size = topology->bdevs[i].size_sector;
+
+			if (from_sector - logical_start >= size) {
+				logical_start += size;
+				continue;
+			}
+			*dev_index = i;
+			*component_sector = from_sector - logical_start;
+			available = size - *component_sector;
+			goto found;
+		}
+		return -EINVAL;
+	} else if (!strcmp(topology->name, "raid0")) {
+		uint64_t chunk = 1ULL << topology->extra[0];
+		uint64_t chunk_index = from_sector >> topology->extra[0];
+		uint64_t chunk_offset = from_sector & (chunk - 1);
+
+		*dev_index = chunk_index % topology->nr_devs;
+		*component_sector =
+			(chunk_index / topology->nr_devs) * chunk + chunk_offset;
+		available = chunk - chunk_offset;
+	} else {
+		return -EOPNOTSUPP;
+	}
+
+found:
+	*mapped = requested < available ? requested : available;
+	return 0;
+}
+
+static int append_loop_extent(struct topo_user_cfg *cfg, uint32_t dev_index,
+			      uint64_t start_sector, uint64_t size_sector)
+{
+	struct topo_user_extent *extents = topo_user_loop_extents(cfg);
+	struct topo_user_extent *previous;
+	uint64_t previous_end;
+	uint64_t count = cfg->extra[0];
+
+	if (count) {
+		previous = &extents[count - 1];
+		if (!__builtin_add_overflow(previous->start_sector,
+					    previous->size_sector,
+					    &previous_end) &&
+		    previous->dev_index == dev_index &&
+		    previous_end == start_sector) {
+			if (__builtin_add_overflow(previous->size_sector,
+					   size_sector,
+					   &previous->size_sector))
+				return -EOVERFLOW;
+			return 0;
+		}
+	}
+	if (count >= P2P_TOPO_MAX_EXTENTS)
+		return -E2BIG;
+	extents[count].dev_index = dev_index;
+	extents[count].size_sector = size_sector;
+	extents[count].start_sector = start_sector;
+	cfg->extra[0]++;
+	return 0;
+}
+
+static int flatten_loop_extent(struct topo_user_cfg *cfg,
+			       const struct topo_user_cfg *underlying,
+			       uint64_t physical_sector,
+			       uint64_t size_sector)
+{
+	while (size_sector) {
+		uint64_t component_sector;
+		uint64_t mapped;
+		uint32_t dev_index;
+		int err;
+
+		err = map_topology_sector(underlying, physical_sector, size_sector,
+					  &dev_index, &component_sector, &mapped);
+		if (err)
+			return err;
+		err = append_loop_extent(cfg, dev_index, component_sector, mapped);
+		if (err)
+			return err;
+		physical_sector += mapped;
+		size_sector -= mapped;
+	}
+	return 0;
+}
+
+static int discover_loop_extents(int backing_fd, uint64_t backing_offset,
+				 uint64_t loop_size,
+				 const struct topo_user_cfg *underlying,
+				 struct topo_user_cfg *cfg)
+{
+	struct fiemap *fiemap;
+	uint64_t backing_end;
+	uint64_t expected;
+	size_t size;
+	uint32_t i;
+	int err = 0;
+
+	if (__builtin_add_overflow(backing_offset, loop_size, &backing_end))
+		return -EOVERFLOW;
+	size = sizeof(*fiemap) + P2P_TOPO_MAX_EXTENTS *
+				 sizeof(fiemap->fm_extents[0]);
+	fiemap = calloc(1, size);
+	if (!fiemap)
+		return -ENOMEM;
+	fiemap->fm_start = backing_offset;
+	fiemap->fm_length = loop_size;
+	fiemap->fm_flags = FIEMAP_FLAG_SYNC;
+	fiemap->fm_extent_count = P2P_TOPO_MAX_EXTENTS;
+	if (ioctl(backing_fd, FS_IOC_FIEMAP, fiemap) < 0) {
+		err = -errno;
+		goto out;
+	}
+	if (!fiemap->fm_mapped_extents) {
+		err = -ENODATA;
+		goto out;
+	}
+	if (fiemap->fm_mapped_extents == P2P_TOPO_MAX_EXTENTS &&
+	    !(fiemap->fm_extents[fiemap->fm_mapped_extents - 1].fe_flags &
+	      FIEMAP_EXTENT_LAST)) {
+		err = -E2BIG;
+		goto out;
+	}
+
+	expected = backing_offset;
+	for (i = 0; i < fiemap->fm_mapped_extents && expected < backing_end; i++) {
+		const struct fiemap_extent *extent = &fiemap->fm_extents[i];
+		uint64_t logical_start = extent->fe_logical;
+		uint64_t logical_end;
+		uint64_t physical;
+		uint64_t length;
+
+		if (extent->fe_flags & P2P_LOOP_UNSUPPORTED_FIEMAP_FLAGS ||
+		    __builtin_add_overflow(extent->fe_logical, extent->fe_length,
+					   &logical_end)) {
+			err = -EOPNOTSUPP;
+			goto out;
+		}
+		if (logical_end <= backing_offset || logical_start >= backing_end)
+			continue;
+		if (logical_start < backing_offset)
+			logical_start = backing_offset;
+		if (logical_end > backing_end)
+			logical_end = backing_end;
+		if (logical_start != expected) {
+			err = -ENODATA;
+			goto out;
+		}
+		physical = extent->fe_physical +
+			   logical_start - extent->fe_logical;
+		length = logical_end - logical_start;
+		if ((physical | length) & (P2P_SECTOR_SIZE - 1)) {
+			err = -EINVAL;
+			goto out;
+		}
+		err = flatten_loop_extent(cfg, underlying,
+					  physical / P2P_SECTOR_SIZE,
+					  length / P2P_SECTOR_SIZE);
+		if (err)
+			goto out;
+		expected = logical_end;
+	}
+	if (expected != backing_end)
+		err = -ENODATA;
+out:
+	free(fiemap);
+	return err;
+}
+
+static int discover_loop(dev_t top_dev,
+			 struct topo_user_cfg *cfg)
+{
+	struct topo_user_cfg *underlying = NULL;
+	topo_discover_fn discover;
+	unsigned long long backing_offset;
+	unsigned long long dio;
+	uint64_t loop_sectors;
+	uint64_t loop_size;
+	char backing_path[PATH_MAX];
+	char backing_bdev[PATH_MAX];
+	struct stat backing_stat;
+	int backing_fd = -1;
+	int err;
+
+	err = read_sysfs_u64(top_dev, "loop/dio", &dio);
+	if (err || dio != 1)
+		return err ? err : -EOPNOTSUPP;
+	err = read_sysfs_u64(top_dev, "loop/offset", &backing_offset);
+	if (err)
+		return err;
+	if (backing_offset & (P2P_SECTOR_SIZE - 1))
+		return -EINVAL;
+	err = read_sysfs_text(top_dev, "loop/backing_file", backing_path,
+			      sizeof(backing_path));
+	if (err)
+		return err;
+	backing_path[strcspn(backing_path, "\r\n")] = '\0';
+	if (!backing_path[0])
+		return -EINVAL;
+
+	err = get_block_size_sectors(top_dev, &loop_sectors);
+	if (err)
+		return err;
+	if (__builtin_mul_overflow(loop_sectors, (uint64_t)P2P_SECTOR_SIZE,
+				   &loop_size))
+		return -EOVERFLOW;
+	backing_fd = open(backing_path, O_RDONLY | O_CLOEXEC);
+	if (backing_fd < 0)
+		return -errno;
+	if (fstat(backing_fd, &backing_stat) < 0) {
+		err = -errno;
+		goto out;
+	}
+	if (!S_ISREG(backing_stat.st_mode) || backing_stat.st_size < 0 ||
+	    backing_offset > (uint64_t)backing_stat.st_size ||
+	    loop_size > (uint64_t)backing_stat.st_size - backing_offset) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	discover = select_discover(backing_stat.st_dev);
+	if (!discover) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+	err = devt_to_bdev(backing_stat.st_dev, backing_bdev,
+			   sizeof(backing_bdev));
+	if (err)
+		goto out;
+	underlying = calloc(1, sizeof(*underlying) +
+				P2P_TOPO_MAX_BDEVS * sizeof(underlying->bdevs[0]));
+	if (!underlying) {
+		err = -ENOMEM;
+		goto out;
+	}
+	err = discover(backing_stat.st_dev, underlying);
+	if (err)
+		goto out;
+
+	memcpy(cfg->bdevs, underlying->bdevs,
+	       underlying->nr_devs * sizeof(cfg->bdevs[0]));
+	memcpy(cfg->name, "loop", sizeof("loop"));
+	cfg->top_dev = top_dev;
+	cfg->nr_devs = underlying->nr_devs;
+	cfg->extra[0] = 0;
+	cfg->extra[1] = 0;
+	err = discover_loop_extents(backing_fd, backing_offset, loop_size,
+				    underlying, cfg);
+out:
+	free(underlying);
+	if (backing_fd >= 0)
+		close(backing_fd);
+	return err;
+}
+
 static void print_topo_cfg(const struct topo_user_cfg *cfg)
 {
 	unsigned int i;
@@ -600,27 +915,33 @@ static void print_topo_cfg(const struct topo_user_cfg *cfg)
 		       (unsigned long long)bdev->start_sector,
 		       (unsigned long long)bdev->size_sector);
 	}
+	if (!strcmp(cfg->name, "loop"))
+               printf("  loop extents: %llu\n",
+                      (unsigned long long)cfg->extra[0]);
 }
 
 int p2p_add_topo(int dev_fd, dev_t dev_id)
 {
 	struct topo_user_cfg *cfg = NULL;
+	struct stat st;
 	size_t cfg_size;
-	int (*discover)(dev_t, struct topo_user_cfg *);
+	topo_discover_fn discover;
 	int err;
 
-	if (path_exists(dev_id, "partition") ||
-	    path_exists(dev_id, "device/subsysnqn"))
-		discover = discover_nvme;
-	else if (path_exists(dev_id, "dm"))
-		discover = discover_linear;
-	else if (path_exists(dev_id, "md"))
-		discover = discover_raid0;
-	else
+	if (fstat(dev_fd, &st) < 0)
+                return -errno;
+        if (!S_ISBLK(st.st_mode))
+                return -EINVAL;
+	if (path_exists(st.st_rdev, "loop/backing_file"))
+               discover = discover_loop;
+        else
+               discover = select_discover(st.st_rdev);
+        if (!discover)
 		return -EOPNOTSUPP;
 
 	cfg_size = sizeof(*cfg) +
-		   P2P_TOPO_MAX_BDEVS * sizeof(cfg->bdevs[0]);
+		   P2P_TOPO_MAX_BDEVS * sizeof(cfg->bdevs[0]) +
+		   P2P_TOPO_MAX_EXTENTS * sizeof(struct topo_user_extent);
 	cfg = calloc(1, cfg_size);
 	if (!cfg) {
 		err = -ENOMEM;
@@ -805,7 +1126,7 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat, unsigned i
 	    (sizeof(off_t) < sizeof(int64_t) && (offset > INT32_MAX || size > INT32_MAX - offset)))
 		return -EOVERFLOW;
 
-	if (file_stat->st_blksize <= 0 || file_stat->st_blksize > UINT_MAX ||
+	if (file_stat->st_blksize <= 0 || file_stat->st_blksize > INT32_MAX ||
 	    (file_stat->st_blksize & (file_stat->st_blksize - 1)))
 		return -EINVAL;
 	block_size = file_stat->st_blksize;

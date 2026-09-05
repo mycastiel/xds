@@ -22,6 +22,12 @@ struct topo_bdev {
 	p2p_bdev_handle *handle;
 };
 
+struct topo_extent {
+	u32 dev_index;
+	u64 size_sector;
+	u64 start_sector;
+};
+
 union topo_priv {
 	u32 chunk_sectors_shift;
 };
@@ -39,6 +45,8 @@ struct topo {
 	u64 size_sector;
 	u32 nr_bdevs;
 	struct topo_bdev *bdevs;
+	u32 nr_extents;
+	struct topo_extent *extents;
 	p2p_bdev_handle *top_handle;
 	union topo_priv priv;
 

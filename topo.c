@@ -248,6 +248,39 @@ static int raid0_map_sector(struct topo *topo, u64 from_sector,
 	return 0;
 }
 
+static int loop_map_sector(struct topo *topo, u64 from_sector,
+			   u32 in_nr_sectors, struct topo_bdev **to_bdev,
+			   u64 *to_sector, u32 *out_nr_sectors)
+{
+	u64 logical_start = 0;
+	u64 offset;
+	u64 available;
+	u32 i;
+
+	for (i = 0; i < topo->nr_extents; i++) {
+		struct topo_extent *extent = &topo->extents[i];
+
+		if (from_sector - logical_start >= extent->size_sector) {
+			logical_start += extent->size_sector;
+			continue;
+		}
+
+		offset = from_sector - logical_start;
+		available = extent->size_sector - offset;
+		*to_bdev = &topo->bdevs[extent->dev_index];
+		*to_sector = (*to_bdev)->start_sector +
+			     extent->start_sector + offset;
+		*out_nr_sectors = min_t(u64, in_nr_sectors, available);
+		pr_debug("loop from 0x%llx+0x%x to %u:%u nsid %u 0x%llx+0x%x\n",
+			 from_sector, in_nr_sectors, MAJOR((*to_bdev)->id),
+			 MINOR((*to_bdev)->id), (*to_bdev)->nsid, *to_sector,
+			 *out_nr_sectors);
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 static const struct topo_ops linear_ops = {
 	.map_sector = linear_map_sector,
 };
@@ -260,6 +293,10 @@ static const struct topo_ops raid0_ops = {
 	.map_sector = raid0_map_sector,
 };
 
+static const struct topo_ops loop_ops = {
+	.map_sector = loop_map_sector,
+};
+
 static void topo_release_handles(struct topo *topo)
 {
 	u32 i;
@@ -270,6 +307,7 @@ static void topo_release_handles(struct topo *topo)
 				p2p_bdev_release(topo->bdevs[i].handle);
 		}
 	}
+	kfree(topo->extents);
 	if (topo->top_handle)
 		p2p_bdev_release(topo->top_handle);
 }
@@ -386,17 +424,55 @@ static int topo_validate_raid0(struct topo *topo,
 	return 0;
 }
 
+static int topo_validate_loop(struct topo *topo,
+			      const struct topo_user_cfg *cfg)
+{
+	const struct topo_user_extent *extents =
+		(const struct topo_user_extent *)&cfg->bdevs[cfg->nr_devs];
+	u64 size = 0;
+	u32 i;
+
+	if (!cfg->extra[0] || cfg->extra[0] > P2P_TOPO_MAX_EXTENTS ||
+	    cfg->extra[1])
+		return -EINVAL;
+
+	for (i = 0; i < topo->nr_extents; i++) {
+		const struct topo_user_extent *extent = &extents[i];
+		u64 end;
+
+		if (extent->reserved || extent->dev_index >= topo->nr_bdevs ||
+		    !extent->size_sector ||
+		    check_add_overflow(extent->start_sector,
+				       extent->size_sector, &end) ||
+		    end > cfg->bdevs[extent->dev_index].size_sector ||
+		    check_add_overflow(size, extent->size_sector, &size))
+			return -EINVAL;
+
+		topo->extents[i].dev_index = extent->dev_index;
+		topo->extents[i].size_sector = extent->size_sector;
+		topo->extents[i].start_sector = extent->start_sector;
+	}
+	if (size != p2p_bdev_nr_sectors(p2p_handle_to_bdev(topo->top_handle)))
+		return -EINVAL;
+
+	topo->size_sector = size;
+	topo->ops = &loop_ops;
+	return 0;
+}
+
 static int topo_validate_cfg(const struct topo_user_cfg *cfg)
 {
+	bool loop;
 	bool nvme;
 	u32 i;
 	u32 j;
 
 	if (!memchr(cfg->name, '\0', sizeof(cfg->name)) ||
 	    (strcmp(cfg->name, "nvme") && strcmp(cfg->name, "linear") &&
-	     strcmp(cfg->name, "raid0")))
+	     strcmp(cfg->name, "raid0") && strcmp(cfg->name, "loop")))
 		return -EINVAL;
 	nvme = !strcmp(cfg->name, "nvme");
+	loop = !strcmp(cfg->name, "loop");
 	if (!cfg->nr_devs || cfg->nr_devs > P2P_TOPO_MAX_BDEVS ||
 	    (nvme && cfg->nr_devs != 1))
 		return -EINVAL;
@@ -405,7 +481,7 @@ static int topo_validate_cfg(const struct topo_user_cfg *cfg)
 		if (cfg->bdevs[i].reserved || !cfg->bdevs[i].size_sector ||
 		    (!nvme && cfg->bdevs[i].dev_id == cfg->top_dev))
 			return -EINVAL;
-		for (j = 0; j < i; j++) {
+		for (j = 0; !loop && j < i; j++) {
 			if (cfg->bdevs[i].dev_id == cfg->bdevs[j].dev_id)
 				return -EINVAL;
 		}
@@ -425,6 +501,8 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 
 	topo->top_dev = new_decode_dev(cfg->top_dev);
 	topo->nr_bdevs = cfg->nr_devs;
+	if (!strcmp(cfg->name, "loop"))
+		topo->nr_extents = cfg->extra[0];
 	err = topo_validate_cfg(cfg);
 	if (err)
 		goto free_topo;
@@ -434,6 +512,14 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 	if (!topo->bdevs) {
 		err = -ENOMEM;
 		goto free_topo;
+	}
+	if (topo->nr_extents) {
+		topo->extents = kcalloc(topo->nr_extents,
+					 sizeof(*topo->extents), GFP_KERNEL);
+		if (!topo->extents) {
+			err = -ENOMEM;
+			goto free_topo;
+		}
 	}
 	strscpy(topo->name, cfg->name, sizeof(topo->name));
 	INIT_RCU_WORK(&topo->rcu_work, topo_release_work);
@@ -449,7 +535,9 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 	if ((!strcmp(topo->name, "linear") &&
 	     !topo_sysfs_path_exists(topo->top_dev, "dm")) ||
 	    (!strcmp(topo->name, "raid0") &&
-	     !topo_sysfs_path_exists(topo->top_dev, "md"))) {
+	     !topo_sysfs_path_exists(topo->top_dev, "md")) ||
+	    (!strcmp(topo->name, "loop") &&
+	     !topo_sysfs_path_exists(topo->top_dev, "loop/backing_file"))) {
 		err = -EOPNOTSUPP;
 		goto free_topo;
 	}
@@ -466,8 +554,10 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 		err = topo_validate_nvme(topo, cfg);
 	else if (!strcmp(topo->name, "linear"))
 		err = topo_validate_linear(topo, cfg);
-	else
+	else if (!strcmp(topo->name, "raid0"))
 		err = topo_validate_raid0(topo, cfg);
+	else
+		err = topo_validate_loop(topo, cfg);
 	if (err) {
 		pr_err("invalid %s topology for %u:%u: %d\n", topo->name,
 		       MAJOR(topo->top_dev), MINOR(topo->top_dev), err);

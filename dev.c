@@ -1771,6 +1771,7 @@ static int p2p_add_topo(struct p2p_batch *batch, void __user *arg)
 {
 	struct topo_user_cfg header;
 	struct topo_user_cfg *cfg;
+	size_t extent_size = 0;
 	size_t size;
 	int err;
 
@@ -1780,13 +1781,31 @@ static int p2p_add_topo(struct p2p_batch *batch, void __user *arg)
 		return -EINVAL;
 	if (header.nr_devs > P2P_TOPO_MAX_BDEVS)
 		return -E2BIG;
+	if (!memchr(header.name, '\0', sizeof(header.name)))
+		return -EINVAL;
+	if (!strcmp(header.name, "loop")) {
+		if (!header.extra[0])
+			return -EINVAL;
+		if (header.extra[0] > P2P_TOPO_MAX_EXTENTS)
+			return -E2BIG;
+		if (header.extra[1] ||
+		    check_mul_overflow((size_t)header.extra[0],
+				       sizeof(struct topo_user_extent),
+				       &extent_size))
+			return -EINVAL;
+	}
 	size = sizeof(header) +
 	       header.nr_devs * sizeof(header.bdevs[0]);
+	if (check_add_overflow(size, extent_size, &size))
+		return -EINVAL;
 
 	cfg = memdup_user(arg, size);
 	if (IS_ERR(cfg))
 		return PTR_ERR(cfg);
-	if (cfg->nr_devs != header.nr_devs) {
+	if (cfg->nr_devs != header.nr_devs ||
+	    memcmp(cfg->name, header.name, sizeof(cfg->name)) ||
+	    cfg->extra[0] != header.extra[0] ||
+	    cfg->extra[1] != header.extra[1]) {
 		kfree(cfg);
 		return -EINVAL;
 	}
