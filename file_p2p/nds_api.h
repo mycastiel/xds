@@ -131,7 +131,7 @@ struct nds_io_cb {
 	const struct nds_io_vec *iov;
 	uint32_t iov_cnt;
 	/*
-	 * Owner of one-shot HBM VAs. 0 = current process.
+	 * Owner of one-shot HBM VAs. Only 0/current process is supported.
 	 * Must be 0 when NDS_IO_F_REGISTERED_MEM is set.
 	 */
 	int32_t host_pid;

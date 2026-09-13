@@ -221,7 +221,7 @@ static PyMethodDef FileP2PMethods[] = {
 	  "    mem_handle (int): Registered-memory handle, or zero.\n"
 	  "    flags (int): P2P I/O flags.\n"
 	  "    host_pid (int, optional): PID owning unregistered IOV addresses;\n"
-	  "        zero or omitted selects the current process. Must be zero for\n"
+	  "        only zero/current process is supported. Must be zero for\n"
 	  "        registered memory.\n"
 	  "\n"
 	  "Returns:\n"

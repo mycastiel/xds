@@ -27,7 +27,7 @@ struct p2p_io_param {
 	unsigned int op;
 	unsigned int flags;
 	int file_fd;
-	int host_pid;
+	int host_pid;              /* calling process TGID; zero with registered memory */
 	__u64 mem_handle;
 	__u64 user_data;          /* echo'd in the completion event */
 	__u64 iov;                /* userspace pointer to struct p2p_iov[] */

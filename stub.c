@@ -4,6 +4,7 @@
 #include <linux/module.h>
 #include <linux/overflow.h>
 #include <linux/sizes.h>
+#include <linux/slab.h>
 
 #include "mem_abi.h"
 
@@ -53,63 +54,70 @@ static int stub_validate_range(u64 addr, u64 size)
 	return 0;
 }
 
-int devmm_get_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
-			  u64 size, u64 *pa_list, u32 pa_num)
+int hal_kernel_p2p_get_pages(u64 addr, u64 size, void (*free_callback)(void *data), void *data,
+			     struct p2p_page_table **page_table)
 {
-	u64 expected_pa_num;
+	struct p2p_page_table *table;
+	u64 aligned_addr;
+	u64 aligned_end;
+	u64 end;
 	u64 pa;
-	unsigned int i;
+	u64 i;
 	int err;
 
 	atomic_inc(&get_pa_calls);
-	(void)process_id;
-	if (!pa_list)
+	(void)data;
+	if (!free_callback || !page_table)
 		return -EINVAL;
 	err = stub_validate_range(addr, size);
 	if (err)
 		return err;
-	if (!IS_ALIGNED(addr, STUB_PAGE_SIZE) ||
-	    !IS_ALIGNED(size, STUB_PAGE_SIZE))
-		return -EINVAL;
 
-	expected_pa_num = size / STUB_PAGE_SIZE;
-	if (!expected_pa_num || expected_pa_num > U32_MAX ||
-	    pa_num != expected_pa_num)
-		return -EINVAL;
-	if (check_add_overflow((u64)base_pa, addr, &pa))
+	if (check_add_overflow(addr, size, &end) ||
+	    check_add_overflow(end, (u64)STUB_PAGE_SIZE - 1, &aligned_end))
 		return -EOVERFLOW;
+	aligned_addr = round_down(addr, (u64)STUB_PAGE_SIZE);
+	aligned_end = round_down(aligned_end, (u64)STUB_PAGE_SIZE);
 
-	for (i = 0; i < pa_num; i++) {
-		pa_list[i] = pa;
+	table = kzalloc(sizeof(*table), GFP_KERNEL);
+	if (!table)
+		return -ENOMEM;
+	table->page_num = (aligned_end - aligned_addr) / STUB_PAGE_SIZE;
+	table->pages_info = kcalloc(table->page_num, sizeof(*table->pages_info), GFP_KERNEL);
+	if (!table->pages_info) {
+		kfree(table);
+		return -ENOMEM;
+	}
+	table->version = P2P_GET_PAGE_VERSION;
+	table->page_size = STUB_PAGE_SIZE;
+
+	if (check_add_overflow((u64)base_pa, aligned_addr, &pa)) {
+		kfree(table->pages_info);
+		kfree(table);
+		return -EOVERFLOW;
+	}
+
+	for (i = 0; i < table->page_num; i++) {
+		table->pages_info[i].pa = pa;
 		pa += STUB_PAGE_SIZE;
 	}
 
+	*page_table = table;
 	return 0;
 }
-EXPORT_SYMBOL_GPL(devmm_get_mem_pa_list);
+EXPORT_SYMBOL_GPL(hal_kernel_p2p_get_pages);
 
-void devmm_put_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
-			   u64 size, u64 *pa_list, u32 pa_num)
+int hal_kernel_p2p_put_pages(struct p2p_page_table *page_table)
 {
 	atomic_inc(&put_pa_calls);
-	(void)process_id;
-	(void)addr;
-	(void)size;
-	(void)pa_list;
-	(void)pa_num;
-}
-EXPORT_SYMBOL_GPL(devmm_put_mem_pa_list);
+	if (!page_table)
+		return -EINVAL;
 
-int devmm_get_mem_page_size(struct devmm_svm_process_id *process_id, u64 addr,
-			    u64 size)
-{
-	(void)process_id;
-	if (stub_validate_range(addr, size))
-		return -ERANGE;
-
-	return STUB_PAGE_SIZE;
+	kfree(page_table->pages_info);
+	kfree(page_table);
+	return 0;
 }
-EXPORT_SYMBOL_GPL(devmm_get_mem_page_size);
+EXPORT_SYMBOL_GPL(hal_kernel_p2p_put_pages);
 
 static int __init stub_init(void)
 {
