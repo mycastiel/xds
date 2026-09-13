@@ -632,7 +632,7 @@ static void p2p_iov_iter_advance(struct p2p_iov_iter *iter, u64 bytes)
 	iter->iov_offset = 0;
 }
 
-static int get_pa_iov(int host_pid, const struct p2p_iov *iov, unsigned int iov_nr,
+static int get_pa_iov(const struct p2p_iov *iov, unsigned int iov_nr,
 		      struct p2p_pa_iov **pa_iov, unsigned int *pa_iov_nr,
 		      struct p2p_pinned_io_mem *pinned_mem)
 {
@@ -647,10 +647,6 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov, unsigned int iov_
 	pinned_pa = kzalloc(sizeof(*pinned_pa), GFP_KERNEL);
 	if (!pinned_pa)
 		return -ENOMEM;
-	if (host_pid != task_tgid_nr(current)) {
-		err = -EPERM;
-		goto put_pinned_pa;
-	}
 	pinned_pa->maps = kvcalloc(iov_nr, sizeof(*pinned_pa->maps), GFP_KERNEL);
 	if (!pinned_pa->maps) {
 		err = -ENOMEM;
@@ -1368,11 +1364,9 @@ static int validate_io_param(const struct p2p_io_param *param)
 	if (param->reserved[0] || param->reserved[1] || param->reserved[2])
 		return -EINVAL;
 	if (param->flags & P2P_IO_F_REGISTERED_MEM)
-		return !param->mem_handle || param->host_pid ? -EINVAL : 0;
+		return !param->mem_handle ? -EINVAL : 0;
 
-	if (param->host_pid <= 0)
-		return -EINVAL;
-	return param->host_pid == task_tgid_nr(current) ? 0 : -EPERM;
+	return 0;
 }
 
 static int validate_write_range(const struct p2p_io_param *param,
@@ -1499,7 +1493,7 @@ static int p2p_rw_file(struct p2p_batch *batch, void __user *arg)
 		err = get_registered_pa_iov(param.mem_handle, iov, param.iov_nr, &pa_iov,
 					    &pa_iov_nr, &pinned_mem);
 	else
-		err = get_pa_iov(param.host_pid, iov, param.iov_nr, &pa_iov, &pa_iov_nr,
+		err = get_pa_iov(iov, param.iov_nr, &pa_iov, &pa_iov_nr,
 				 &pinned_mem);
 	if (err)
 		goto put_topo;
