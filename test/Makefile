@@ -6,9 +6,12 @@ CPPFLAGS += -I../file_p2p -I..
 
 TEST_BINS := crc32_verify c_api_test mem_registration_test direct_io_test \
 	topo_test rw_api_test uapi_rw_test nds_api_test nds_example nds_bw_bench \
-	nds_crc_verify
+	nds_crc_verify coverage_errors
 
 all: $(TEST_BINS)
+
+coverage_errors: coverage_errors.c ../p2p_dev_uapi.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -D_GNU_SOURCE -o $@ $<
 
 crc32_verify: crc32_verify.c
 	$(CC) $(CFLAGS) -o $@ $<

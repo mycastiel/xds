@@ -250,6 +250,42 @@ run_logged_write_rejection_case()
 	fi
 }
 
+run_logged_coverage_errors()
+{
+	local mode=$1 target=$2
+	local label="coverage-errors-$mode.c.rejection"
+	local output="$WORK_DIR/$label.out"
+	local kernel_log="$WORK_DIR/$label.dmesg"
+	local status
+
+	log "Raw UAPI coverage errors: $mode"
+	dmesg -C
+	set +e
+	env -u XDS_INJECT "XDS_COMPONENT=$DEV1" \
+		"$SCRIPT_DIR/coverage_errors" "$target" "$mode" >"$output" 2>&1
+	status=$?
+	set -e
+	dmesg -c >"$kernel_log"
+	cat "$output"
+	if (( status != 0 )); then
+		cat "$kernel_log" >&2
+		die "coverage_errors $mode failed"
+	fi
+}
+
+run_coverage_errors()
+{
+	run_logged_coverage_errors easy "$DEV1"
+	# A small single-component mapping reaches submission-time range errors.
+	[[ ! -e $DM_PATH ]] || die "$DM_PATH already exists"
+	dmsetup create "$DM_NAME" --table "0 128 linear $DEV1 0"
+	DM_CREATED=1
+	udevadm settle
+	run_logged_coverage_errors range "$DM_PATH"
+	dmsetup remove --retry "$DM_NAME"
+	DM_CREATED=0
+}
+
 run_write_pipeline()
 {
 	local target=$1 label=$2 phase_seed=$3 topology_boundary=$4 api=$5
@@ -658,6 +694,7 @@ main()
 	crc_self_test
 	save_kernel_identity
 	load_modules
+	run_coverage_errors
 	log "Topology delete API"
 	"$SCRIPT_DIR/topo_test" --topology "$DEV1"
 	log "NDS rejection coverage"
