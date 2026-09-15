@@ -169,8 +169,8 @@ reserves the required CMB VA in 4 KiB units, and participates in a concurrent
 read. Live allocations must be non-overlapping while at least two files share
 a 2 MiB physical CMB page.
 
-Both the C and Python APIs run normal-memory and registered-memory variants
-against the same generated workload. A registered run pins the whole CMB once
+The file_p2p and NDS C and Python APIs run normal-memory and registered-memory
+variants against the same generated workload. A registered run pins the whole CMB once
 through a dedicated registration fd before starting the worker threads. Each
 worker issues I/O through its own distinct fd, and the run verifies one PA-list
 get and put. Each variant checks its runtime allocation manifest,
@@ -181,10 +181,59 @@ The common `XDS_TEST_WORKDIR`,
 `XDS_TEST_KEEP_WORKDIR`, `XDS_TEST_BUILD_JOBS`, and `KSRC` controls apply to
 both entry points. Shared prepared-VM and storage helpers live in `common.sh`.
 
-## Running the complete matrix inside the VM
+The default stress suite runs only the dynamic-VA workload. Fixed CQ checks
+are provided by `cq_check_test.sh`; the larger CRC-checked repetitions have
+been removed from `stress_test.sh`. Basic retains its short live CQ smoke.
+For sustained submit/getevents pressure followed by drain, run
+`cq_race_test.sh` explicitly. It retains both NDS frontends and both memory
+modes, with 32 workers, 30 seconds before drain and three rounds per
+combination by default.
 
-`run_all_tests_in_vm.sh` runs the basic suite and the RAID0, dm-linear, and
-direct-NVMe stress suites without SSH or rebooting the VM. Run it once after
+## Bounded CQ manifest and completion checks
+
+`cq_check_test.sh` runs `cq-race` and `cq-race-drain` without CRC, using the
+normal module (`build_all normal`). It runs both NDS C/Python APIs and both
+normal/registered memory modes. Each of the eight variants has 8 workers and
+16 iterations: 128 operations per variant, 1,024 operations total. There is
+no timed repetition. This replaces the fixed normal-memory CQ smoke cases
+previously in `basic_test.sh` and adds registered-memory coverage.
+
+The existing API runners reject duplicate/invalid events and incomplete
+submissions. Without drain, every submitted operation must be returned by
+getevents (`completed == submitted == 128`). Drain may consume completions,
+so drain mode permits fewer getevents returns. Both modes emit a full result
+manifest checked by `check_stress.py` for exact case IDs, counts, file ranges,
+VA alignment/bounds, non-overlap and shared backing pages. Registered runs
+also require exactly one PA-list get/put; all runs check failure/inflight
+counters. CRC checking is omitted.
+
+Use the same disposable-device and `KSRC` settings as the other VM tests:
+
+```sh
+sudo env XDS_DEV_1=/dev/nvme0n1 XDS_DEV_2=/dev/nvme0n2 \
+  XDS_STRESS_MODE=raid0 ./test/cq_check_test.sh
+```
+
+`XDS_STRESS_MODE` defaults to RAID0 and also accepts `dm` or `nvme` for
+standalone runs. `XDS_CQ_CHECK_SEED` changes the seed (default `0x584453`).
+Both default matrix runners execute RAID0 only. Reports require all eight
+CQ outputs, all 128 case IDs per output, a successful manifest-check marker,
+and valid completion summaries; no CRC markers are required for CQ checks.
+
+## Running the regression matrix inside the VM
+
+`run_all_tests_in_vm.sh` runs the basic suite, RAID0 dynamic-VA stress,
+and bounded RAID0 CQ checks without SSH or rebooting the VM. The default matrix follows the recorded
+[coverage and timing analysis](stress-trimming.md). Basic tests retain dm and
+NVMe functional coverage; their repeated stress suites can still be run with
+`XDS_STRESS_MODE=dm|nvme ./test/stress_test.sh`.
+
+Set `XDS_RUN_CQ_RACE=1` to also run the long live CQ-race suite on all three
+topologies. This optional suite requests 18 minutes of overlap per kernel,
+plus setup and teardown; the default run keeps the basic CQ smoke checks.
+The strict report requires all eight RAID0 dynamic-VA variants and all eight
+bounded CQ variants. It also accepts archived complete three-topology
+matrices that predate the separate CQ checks. Run it once after
 logging into each kernel. Select the report variant explicitly; it is not
 inferred from `uname -r`. Use a persistent result root so it remains available
 after switching kernels:
@@ -250,8 +299,8 @@ in the configuration file.
 
 ## Dual-kernel matrix and detailed report
 
-`run_dual_kernel_matrix.sh` runs `basic_test.sh` plus all three stress
-topologies under exact non-KASAN and KASAN kernel versions. The stress runs
+`run_dual_kernel_matrix.sh` runs `basic_test.sh` plus RAID0 dynamic-VA stress
+and bounded RAID0 CQ checks under exact non-KASAN and KASAN kernel versions. The stress runs
 always use 16 iterations. Before building the XDS modules, the runner restores
 the running kernel config from `/proc/config.gz`, with
 `/boot/config-$(uname -r)` as a fallback, and verifies the resulting module

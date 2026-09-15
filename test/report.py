@@ -28,9 +28,14 @@ KERNEL_BAD_RE = re.compile(
 EXPECTED_VARIANTS = {"kasan", "nokasan"}
 STRESS_APIS = ("c", "python", "nds-c", "nds-python")
 STRESS_MEMORY_MODES = ("normal", "registered")
-STRESS_TOPOLOGIES = ("dm", "nvme", "raid0")
+STRESS_TOPOLOGIES = ("raid0",)
+LEGACY_STRESS_TOPOLOGIES = ("dm", "nvme", "raid0")
 STRESS_ITERATIONS = 16
 STRESS_WORKERS = 16
+CQ_CHECK_WORKERS = 8
+CQ_CHECK_ITERATIONS = 16
+CQ_CHECK_MODES = ("cq-race", "cq-race-drain")
+CQ_CHECK_APIS = ("nds-c", "nds-python")
 
 
 @dataclass
@@ -195,6 +200,9 @@ def suite_dimensions(label: str) -> Tuple[str, str, str, str]:
     if label.startswith("stress-"):
         memory_mode = io_mode
         io_mode = "stress"
+    elif label.startswith("cq-check-"):
+        memory_mode = io_mode
+        io_mode = parts[1]
     elif label.startswith("mem-registration."):
         memory_mode = "registered"
         io_mode = "mixed"
@@ -222,6 +230,8 @@ def process_artifact_dir(
         text = output_path.read_text(
             encoding="utf-8", errors="replace"
         )
+        if label.startswith("cq-check-"):
+            errors.extend(validate_cq_check_output(label, text))
         cases = parse_cases(text)
         crc_results = parse_crc_results(text)
 
@@ -288,10 +298,12 @@ def discover_kernel_dirs(base: Path) -> List[Tuple[Path, Path]]:
     return result
 
 
-def expected_stress_labels() -> set[str]:
+def expected_stress_labels(
+    topologies: Iterable[str] = STRESS_TOPOLOGIES,
+) -> set[str]:
     return {
         f"stress-{topology}.{api}.{memory_mode}"
-        for topology in STRESS_TOPOLOGIES
+        for topology in topologies
         for api in STRESS_APIS
         for memory_mode in STRESS_MEMORY_MODES
     }
@@ -346,6 +358,11 @@ def validate_stress_suites(
     }
     expected_labels = expected_stress_labels()
     actual_labels = set(suites_by_label)
+    # Accept archived complete three-topology matrices as well as the new
+    # RAID0 matrix. Partial extra topologies must still fail validation.
+    legacy_labels = expected_stress_labels(LEGACY_STRESS_TOPOLOGIES)
+    if actual_labels == legacy_labels:
+        expected_labels = legacy_labels
 
     if actual_labels != expected_labels:
         errors.append(
@@ -376,6 +393,71 @@ def validate_stress_suites(
                 f"{variant}/{label}: {len(missing_crc)} cases lack "
                 "CRC verification"
             )
+    return errors
+
+
+def expected_cq_check_labels() -> set[str]:
+    return {
+        f"cq-check-raid0.{mode}.{api}.{memory_mode}"
+        for mode in CQ_CHECK_MODES
+        for api in CQ_CHECK_APIS
+        for memory_mode in STRESS_MEMORY_MODES
+    }
+
+
+def validate_cq_check_output(label: str, text: str) -> List[str]:
+    count = CQ_CHECK_WORKERS * CQ_CHECK_ITERATIONS
+    mode = label.split(".")[1]
+    summaries = re.findall(
+        r"^cq-race summary: submitted=(\d+) completed=(\d+) expected=(\d+) "
+        r"with_drain=(\d+) live_submit_drain=(\d+) drain_overlap_ms=(\d+)$",
+        text, re.MULTILINE,
+    )
+    if len(summaries) != 1:
+        return [f"{label}: expected one CQ completion summary"]
+    submitted, completed, expected, drain, live, overlap = map(int, summaries[0])
+    errors = []
+    if (
+        submitted != count or expected != count or completed > submitted
+        or drain != int(mode == "cq-race-drain") or live or overlap
+        or (mode == "cq-race" and completed != submitted)
+    ):
+        errors.append(f"{label}: invalid CQ completion accounting")
+    if not re.search(
+        rf"^stress-check-pass operations={count} total_file_size=\d+$",
+        text, re.MULTILINE,
+    ):
+        errors.append(f"{label}: missing successful CQ manifest check")
+    return errors
+
+
+def validate_cq_check_suites(
+    variant: str, suites: List[SuiteReport],
+) -> List[str]:
+    cq_suites = {s.label: s for s in suites if s.label.startswith("cq-check-")}
+    stress_labels = {s.label for s in suites if s.label.startswith("stress-")}
+    # Archived complete three-topology runs predate the separate CQ check.
+    if not cq_suites and stress_labels == expected_stress_labels(LEGACY_STRESS_TOPOLOGIES):
+        return []
+    errors = []
+    expected_labels = expected_cq_check_labels()
+    if set(cq_suites) != expected_labels:
+        errors.append(
+            f"{variant}: CQ check suites differ: "
+            f"missing={sorted(expected_labels - set(cq_suites))} "
+            f"extra={sorted(set(cq_suites) - expected_labels)}"
+        )
+    expected_ids = {
+        f"stress-i{iteration:04d}-w{worker:02d}"
+        for iteration in range(CQ_CHECK_ITERATIONS)
+        for worker in range(CQ_CHECK_WORKERS)
+    }
+    for label, suite in cq_suites.items():
+        if (
+            len(suite.cases) != len(expected_ids)
+            or {case.source_case_id for case in suite.cases} != expected_ids
+        ):
+            errors.append(f"{variant}/{label}: incomplete CQ workload results")
     return errors
 
 
@@ -416,6 +498,7 @@ def validate_report(report: FullReport) -> List[str]:
             errors.append(f"{variant}: no suites found")
             continue
         errors.extend(validate_stress_suites(variant, suites))
+        errors.extend(validate_cq_check_suites(variant, suites))
 
     if all(suites_by_variant.get(item) for item in EXPECTED_VARIANTS):
         kasan_suites = {

@@ -9,6 +9,7 @@ DEV1=${XDS_DEV_1:-/dev/nvme0n1}
 DEV2=${XDS_DEV_2:-/dev/nvme0n2}
 KSRC=${KSRC:-/home/xds/oe_knl}
 STRESS_ITERATIONS=16
+RUN_CQ_RACE=${XDS_RUN_CQ_RACE:-0}
 VARIANT_DIR=
 RAW_DIR=
 
@@ -19,7 +20,7 @@ Usage:
   XDS_KERNEL_VARIANT=kasan|nokasan [XDS_RESULT_ROOT=PATH] \\
     $0
 
-Run the complete XDS test suite directly in the current VM. The script is
+Run the XDS regression suite directly in the current VM. The script is
 destructive to XDS_DEV_1 and XDS_DEV_2.
 
 Required:
@@ -31,6 +32,7 @@ Optional:
   XDS_DEV_2           Second disposable NVMe namespace (default: /dev/nvme0n2)
   KSRC                 Matching kernel build tree (default: /home/xds/oe_knl)
   XDS_TEST_BUILD_JOBS Parallel build jobs passed to the test suites
+  XDS_RUN_CQ_RACE     Include long live CQ-race stress on all topologies (0|1; default: 0)
 EOF
 }
 
@@ -46,6 +48,10 @@ validate_options()
 		kasan | nokasan) ;;
 		"") die "set XDS_KERNEL_VARIANT to kasan or nokasan" ;;
 		*) die "XDS_KERNEL_VARIANT must be kasan or nokasan" ;;
+	esac
+	case $RUN_CQ_RACE in
+		0 | 1) ;;
+		*) die "XDS_RUN_CQ_RACE must be 0 or 1" ;;
 	esac
 	[[ -n $RESULT_ROOT ]] || die "XDS_RESULT_ROOT must not be empty"
 	[[ -d $KSRC ]] || die "kernel build tree does not exist: $KSRC"
@@ -153,17 +159,20 @@ main()
 	printf 'WARNING: %s and %s will be destroyed.\n' "$DEV1" "$DEV2"
 
 	run_suite basic 1 "$SCRIPT_DIR/basic_test.sh"
-	for mode in raid0 dm nvme; do
-		run_suite "stress-$mode" 0 \
-			"XDS_STRESS_MODE=$mode" \
-			"XDS_STRESS_ITERATIONS=$STRESS_ITERATIONS" \
-			"$SCRIPT_DIR/stress_test.sh"
-	done
-	for mode in raid0 dm nvme; do
-		run_suite "cq-race-$mode" 0 \
-			"XDS_STRESS_MODE=$mode" \
-			"$SCRIPT_DIR/cq_race_test.sh"
-	done
+	# The recorded basic + RAID0 stress union covers all full-matrix lines.
+	run_suite stress-raid0 0 \
+		"XDS_STRESS_MODE=raid0" \
+		"XDS_STRESS_ITERATIONS=$STRESS_ITERATIONS" \
+		"$SCRIPT_DIR/stress_test.sh"
+	run_suite cq-check-raid0 0 \
+		"XDS_STRESS_MODE=raid0" "$SCRIPT_DIR/cq_check_test.sh"
+	if [[ $RUN_CQ_RACE == 1 ]]; then
+		for mode in raid0 dm nvme; do
+			run_suite "cq-race-$mode" 0 \
+				"XDS_STRESS_MODE=$mode" \
+				"$SCRIPT_DIR/cq_race_test.sh"
+		done
+	fi
 
 	sudo chown -R "$(id -u):$(id -g)" "$VARIANT_DIR"
 	printf '\nAll %s tests passed.\n' "$KERNEL_VARIANT"

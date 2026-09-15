@@ -315,7 +315,6 @@ download_guest_artifacts()
 run_variant()
 {
 	local variant=$1
-	local mode
 
 	boot_kernel "$variant"
 	prepare_guest "$variant"
@@ -323,12 +322,14 @@ run_variant()
 	run_suite "$variant" basic basic_test.sh
 	download_guest_artifacts "$variant" basic
 
-	for mode in raid0 dm nvme; do
-		run_suite "$variant" "stress-$mode" stress_test.sh \
-			"XDS_STRESS_MODE=$mode" \
-			"XDS_STRESS_ITERATIONS=$MATRIX_STRESS_ITERATIONS"
-		download_guest_artifacts "$variant" "stress-$mode"
-	done
+	# Match the coverage-based default in run_all_tests_in_vm.sh.
+	run_suite "$variant" stress-raid0 stress_test.sh \
+		"XDS_STRESS_MODE=raid0" \
+		"XDS_STRESS_ITERATIONS=$MATRIX_STRESS_ITERATIONS"
+	download_guest_artifacts "$variant" stress-raid0
+	run_suite "$variant" cq-check-raid0 cq_check_test.sh \
+		"XDS_STRESS_MODE=raid0"
+	download_guest_artifacts "$variant" cq-check-raid0
 }
 
 generate_reports()
