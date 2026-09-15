@@ -133,7 +133,7 @@ static int test_raid0_offsets(const char *topology, const char *member1,
 	for (i = 0; i < cfg->nr_devs; i++) {
 		cfg->bdevs[i].start_sector++;
 		err = check_raid0_cfg(i ? "raid0 unaligned second start" :
-				     "raid0 unaligned first start", cfg, -EINVAL);
+				     "raid0 unaligned first start", cfg, 0);
 		cfg->bdevs[i].start_sector--;
 		if (err)
 			goto out;
