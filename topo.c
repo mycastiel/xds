@@ -369,9 +369,9 @@ static int topo_validate_raid0(struct topo *topo,
 		return -EINVAL;
 
 	chunk_sectors = 1ULL << cfg->extra[0];
-	/* Compare configured offsets before partition-start translation. */
+	/* Each namespace-relative data start must align to a chunk. */
 	for (i = 0; i < topo->nr_bdevs; i++) {
-		if (cfg->bdevs[i].start_sector != cfg->bdevs[0].start_sector ||
+		if (topo->bdevs[i].start_sector % chunk_sectors ||
 		    cfg->bdevs[i].size_sector != cfg->bdevs[0].size_sector ||
 		    topo->bdevs[i].size_sector % chunk_sectors)
 			return -EINVAL;
