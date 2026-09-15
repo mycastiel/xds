@@ -586,9 +586,35 @@ test_raid0_partitions()
 	log "MD RAID0 with NVMe partition members"
 	create_component_partitions
 	create_raid0 "$PART_DEV1" "$PART_DEV2"
+	"$SCRIPT_DIR/topo_test" --topology "$MD_DEV" \
+		--raid0-members "$PART_DEV1" "$PART_DEV2"
 	next_seed
 	run_block_matrix "$MD_DEV" raid0-part "$SEED" $((64 * 1024))
 	run_ext4_sizes "$MD_DEV" raid0-part
+	cleanup_storage
+}
+
+test_raid0_same_namespace()
+{
+	local -a partitions
+
+	log "MD RAID0 with two partitions on one NVMe namespace"
+	wipe_test_devices
+	# Two 28 MiB members, starting at 1 MiB and 32 MiB on a 64 MiB namespace.
+	printf '2048,57344,L\n65536,57344,L\n' |
+		sfdisk --quiet "$DEV1" >/dev/null
+	PARTITION_CREATED=1
+	udevadm settle
+	mapfile -t partitions < <(lsblk -nrpo NAME,TYPE "$DEV1" |
+		awk '$2 == "part" { print $1 }')
+	[[ ${#partitions[@]} -eq 2 ]] || die "expected two partitions on $DEV1"
+	PART_DEV1=${partitions[0]}
+	PART_DEV2=${partitions[1]}
+	create_raid0 "$PART_DEV1" "$PART_DEV2"
+	"$SCRIPT_DIR/topo_test" --topology "$MD_DEV" \
+		--raid0-members "$PART_DEV1" "$PART_DEV2"
+	next_seed
+	run_block_matrix "$MD_DEV" raid0-same-ns "$SEED" $((64 * 1024))
 	cleanup_storage
 }
 
@@ -711,6 +737,7 @@ main()
 	test_raid0
 	test_raid0_slot_order
 	test_raid0_partitions
+	test_raid0_same_namespace
 	log "All XDS C, Python, and NDS API tests passed"
 }
 
