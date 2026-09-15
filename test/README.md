@@ -95,10 +95,11 @@ The sequence is:
    enumeration order.
 7. The same RAID0 coverage with equal-sized partitions starting at different
    namespace sectors as its members. Registration checks accept unequal
-   chunk-aligned member offsets and reject unaligned starts or unequal sizes.
+   member offsets, including starts not aligned to a chunk, and reject unequal
+   sizes.
 8. Two partitions on the same NVMe namespace, with the same RAID0 registration
-   checks and raw read/write coverage. Component sizes remain equal; each
-   namespace-relative data start must align to the chunk size.
+   checks and raw read/write coverage. Component sizes remain equal and
+   chunk-aligned; data starts need not align to the chunk size.
 
 Every filesystem phase runs individual boundary cases, four queued reads of
 different files, and four simultaneous same-fd submissions. The C and Python
