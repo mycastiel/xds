@@ -16,6 +16,7 @@
 #include <linux/tracepoint.h>
 #include <linux/limits.h>
 #include <linux/overflow.h>
+#include <linux/completion.h>
 #include <linux/mutex.h>
 #include <linux/percpu-refcount.h>
 #include <linux/pid.h>
@@ -80,6 +81,13 @@ struct p2p_pinned_pa {
 	unsigned int pinned_map_nr;
 };
 
+struct p2p_oneshot_pin {
+	struct p2p_pinned_pa pa;
+	struct completion dma_done;
+	atomic_t in_callback;
+	wait_queue_head_t cb_wait;
+};
+
 struct p2p_batch;
 
 struct p2p_registered_mem {
@@ -91,16 +99,20 @@ struct p2p_registered_mem {
 	struct pid *owner_tgid;
 
 	struct percpu_ref io_refs;
-	struct work_struct destroy_work;
-	struct rcu_head rcu;
+	struct completion io_zero;
+	struct rcu_work destroy_work;
 	struct list_head owner_node;
+	wait_queue_head_t cb_wait;
+	atomic_t in_callback;
+	/* 1 after publish until the first kill (unregister, close, or HAL free). */
+	atomic_t live;
 };
 
 struct p2p_pinned_io_mem {
 	bool pinned;
 	bool reg_mem;
 	union {
-		struct p2p_pinned_pa *pinned_pa;
+		struct p2p_oneshot_pin *oneshot;
 		struct p2p_registered_mem *registered_mem;
 	};
 };
@@ -249,12 +261,65 @@ static int p2p_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static void p2p_mem_free_callback(void *data)
+static void p2p_kill_registered_mem(struct p2p_registered_mem *mem);
+static void p2p_unpublish_mem_locked(struct p2p_registered_mem *mem);
+
+static void p2p_hal_cb_enter(atomic_t *in_callback)
 {
-	(void)data;
+	atomic_inc(in_callback);
 }
 
-static int p2p_pin_map(struct p2p_pinned_pa *pinned_pa, struct p2p_iov_map *map, u64 addr, u64 size)
+static void p2p_hal_cb_leave(atomic_t *in_callback, wait_queue_head_t *wait)
+{
+	if (atomic_dec_and_test(in_callback))
+		wake_up(wait);
+}
+
+static void p2p_hal_cb_drain(atomic_t *in_callback, wait_queue_head_t *wait)
+{
+	wait_event(*wait, !atomic_read(in_callback));
+}
+
+static void p2p_oneshot_pin_init(struct p2p_oneshot_pin *pin)
+{
+	init_completion(&pin->dma_done);
+	init_waitqueue_head(&pin->cb_wait);
+}
+
+/*
+ * CANN recycle holds the PMA pipeline until this returns. Drain in-flight DMA
+ * only; never put_pages here (and do not wait for put_pages).
+ */
+static void p2p_registered_mem_free_callback(void *data)
+{
+	struct p2p_registered_mem *mem = data;
+
+	if (!mem)
+		return;
+
+	p2p_hal_cb_enter(&mem->in_callback);
+	mutex_lock(&registered_mem_lock);
+	p2p_unpublish_mem_locked(mem);
+	mutex_unlock(&registered_mem_lock);
+	p2p_kill_registered_mem(mem);
+	wait_for_completion(&mem->io_zero);
+	p2p_hal_cb_leave(&mem->in_callback, &mem->cb_wait);
+}
+
+static void p2p_oneshot_free_callback(void *data)
+{
+	struct p2p_oneshot_pin *pin = data;
+
+	if (!pin)
+		return;
+
+	p2p_hal_cb_enter(&pin->in_callback);
+	wait_for_completion(&pin->dma_done);
+	p2p_hal_cb_leave(&pin->in_callback, &pin->cb_wait);
+}
+
+static int p2p_pin_map(struct p2p_pinned_pa *pinned_pa, struct p2p_iov_map *map, u64 addr, u64 size,
+		       void (*free_callback)(void *data), void *cb_data)
 {
 	struct p2p_page_table *page_table = NULL;
 	u64 aligned_end;
@@ -275,7 +340,7 @@ static int p2p_pin_map(struct p2p_pinned_pa *pinned_pa, struct p2p_iov_map *map,
 	get_end = round_down(get_end, (u64)PAGE_SIZE);
 	get_size = get_end - get_addr;
 
-	err = p2p_mem_get_pages(get_addr, get_size, p2p_mem_free_callback, NULL, &page_table);
+	err = p2p_mem_get_pages(get_addr, get_size, free_callback, cb_data, &page_table);
 	if (err) {
 		pr_err("get page table addr 0x%llx size 0x%llx err %d\n", get_addr, get_size, err);
 		return err;
@@ -315,9 +380,12 @@ put_pages:
 	return err;
 }
 
-static void p2p_put_pinned_pa(struct p2p_pinned_pa *pinned_pa)
+static void p2p_unpin_maps(struct p2p_pinned_pa *pinned_pa)
 {
 	unsigned int i;
+
+	if (!pinned_pa)
+		return;
 
 	for (i = 0; i < pinned_pa->pinned_map_nr; i++) {
 		struct p2p_iov_map *map = &pinned_pa->maps[i];
@@ -329,30 +397,41 @@ static void p2p_put_pinned_pa(struct p2p_pinned_pa *pinned_pa)
 	}
 
 	kvfree(pinned_pa->maps);
+	pinned_pa->maps = NULL;
+	pinned_pa->pinned_map_nr = 0;
+}
+
+static void p2p_put_pinned_pa(struct p2p_pinned_pa *pinned_pa)
+{
+	if (!pinned_pa)
+		return;
+	p2p_unpin_maps(pinned_pa);
 	kfree(pinned_pa);
 }
 
-static void p2p_free_registered_mem_rcu(struct rcu_head *rcu)
+static void p2p_put_oneshot_pin(struct p2p_oneshot_pin *pin)
 {
-	struct p2p_registered_mem *mem;
+	if (!pin)
+		return;
 
-	mem = container_of(rcu, struct p2p_registered_mem, rcu);
-	percpu_ref_exit(&mem->io_refs);
-	kfree(mem);
-}
-
-static void p2p_finish_registered_mem(struct p2p_registered_mem *mem)
-{
-	p2p_put_pinned_pa(mem->pinned_pa);
-	put_pid(mem->owner_tgid);
-	call_rcu(&mem->rcu, p2p_free_registered_mem_rcu);
-	module_put(THIS_MODULE);
+	complete_all(&pin->dma_done);
+	p2p_hal_cb_drain(&pin->in_callback, &pin->cb_wait);
+	p2p_unpin_maps(&pin->pa);
+	kfree(pin);
 }
 
 static void p2p_destroy_registered_mem_work(struct work_struct *work)
 {
-	p2p_finish_registered_mem(container_of(work, struct p2p_registered_mem,
-					       destroy_work));
+	struct rcu_work *rcu_work = to_rcu_work(work);
+	struct p2p_registered_mem *mem =
+		container_of(rcu_work, struct p2p_registered_mem, destroy_work);
+
+	p2p_hal_cb_drain(&mem->in_callback, &mem->cb_wait);
+	p2p_put_pinned_pa(mem->pinned_pa);
+	put_pid(mem->owner_tgid);
+	percpu_ref_exit(&mem->io_refs);
+	kfree(mem);
+	module_put(THIS_MODULE);
 }
 
 static void p2p_registered_mem_release(struct percpu_ref *ref)
@@ -361,21 +440,25 @@ static void p2p_registered_mem_release(struct percpu_ref *ref)
 
 	mem = container_of(ref, struct p2p_registered_mem, io_refs);
 	pr_debug("registered memory handle 0x%llx released\n", mem->handle);
+	complete(&mem->io_zero);
 	/*
 	 * Confirm can run from RCU, NVMe softirq, or harvest while ring_lock
-	 * is held. put_pages sleeps, so always bounce to system_unbound_wq.
-	 * No dedicated wq and no extra lock; I/O tryget/put stays lock-free.
+	 * is held. Lookup is already unpublished; one RCU grace then a
+	 * sleepable wq does put_pages and frees the object.
 	 */
-	queue_work(system_unbound_wq, &mem->destroy_work);
+	if (WARN_ON_ONCE(!queue_rcu_work(system_unbound_wq, &mem->destroy_work)))
+		return;
 }
 
 static void p2p_kill_registered_mem(struct p2p_registered_mem *mem)
 {
+	if (!atomic_xchg(&mem->live, 0))
+		return;
 	__module_get(THIS_MODULE);
 	percpu_ref_kill(&mem->io_refs);
 }
 
-static int p2p_pin_registered_pa(u64 addr, u64 size,
+static int p2p_pin_registered_pa(struct p2p_registered_mem *mem, u64 addr, u64 size,
 				 struct p2p_pinned_pa **pinned_pa_out)
 {
 	struct p2p_pinned_pa *pinned_pa;
@@ -389,19 +472,22 @@ static int p2p_pin_registered_pa(u64 addr, u64 size,
 	pinned_pa->maps = kzalloc(sizeof(*pinned_pa->maps), GFP_KERNEL);
 	if (!pinned_pa->maps) {
 		err = -ENOMEM;
-		goto put_pinned_pa;
+		goto abort_pin;
 	}
 	map = pinned_pa->maps;
-	err = p2p_pin_map(pinned_pa, map, addr, size);
+	err = p2p_pin_map(pinned_pa, map, addr, size,
+			  p2p_registered_mem_free_callback, mem);
 	if (err) {
 		pr_err("registered page table addr 0x%llx size 0x%llx err %d\n", addr, size, err);
-		goto put_pinned_pa;
+		goto abort_pin;
 	}
 
 	*pinned_pa_out = pinned_pa;
 	return 0;
 
-put_pinned_pa:
+abort_pin:
+	complete(&mem->io_zero);
+	p2p_hal_cb_drain(&mem->in_callback, &mem->cb_wait);
 	p2p_put_pinned_pa(pinned_pa);
 	return err;
 }
@@ -425,12 +511,22 @@ static int p2p_publish_registered_mem(struct p2p_batch *batch,
 	if (!err) {
 		list_add_tail(&mem->owner_node, &batch->owned_mems);
 		percpu_ref_reinit(&mem->io_refs);
+		atomic_set(&mem->live, 1);
 	} else {
 		pr_err("publish registered memory handle 0x%llx err %d\n", mem->handle, err);
 	}
 	mutex_unlock(&registered_mem_lock);
 
 	return err;
+}
+
+static void p2p_unpublish_mem_locked(struct p2p_registered_mem *mem)
+{
+	if (list_empty(&mem->owner_node))
+		return;
+	xa_erase(&registered_mems, mem->handle);
+	list_del_init(&mem->owner_node);
+	mem->owner = NULL;
 }
 
 static int p2p_unpublish_registered_mem(struct p2p_batch *batch, u64 handle,
@@ -458,9 +554,7 @@ static int p2p_unpublish_registered_mem(struct p2p_batch *batch, u64 handle,
 	}
 	rcu_read_unlock();
 
-	xa_erase(&registered_mems, handle);
-	list_del_init(&mem->owner_node);
-	mem->owner = NULL;
+	p2p_unpublish_mem_locked(mem);
 	*mem_out = mem;
 	mutex_unlock(&registered_mem_lock);
 	return 0;
@@ -515,15 +609,17 @@ static int p2p_register_mem(struct p2p_batch *batch, void __user *arg)
 	mem->addr = param.addr;
 	mem->size = param.size;
 	mem->owner_tgid = get_task_pid(current, PIDTYPE_TGID);
-	INIT_WORK(&mem->destroy_work, p2p_destroy_registered_mem_work);
+	INIT_RCU_WORK(&mem->destroy_work, p2p_destroy_registered_mem_work);
 	INIT_LIST_HEAD(&mem->owner_node);
+	init_completion(&mem->io_zero);
+	init_waitqueue_head(&mem->cb_wait);
 
 	err = percpu_ref_init(&mem->io_refs, p2p_registered_mem_release,
 			      PERCPU_REF_INIT_DEAD, GFP_KERNEL);
 	if (err)
 		goto put_owner_tgid;
 
-	err = p2p_pin_registered_pa(mem->addr, mem->size, &mem->pinned_pa);
+	err = p2p_pin_registered_pa(mem, mem->addr, mem->size, &mem->pinned_pa);
 	if (err)
 		goto exit_io_refs;
 
@@ -542,6 +638,8 @@ static int p2p_register_mem(struct p2p_batch *batch, void __user *arg)
 	return 0;
 
 put_pinned_pa:
+	complete(&mem->io_zero);
+	p2p_hal_cb_drain(&mem->in_callback, &mem->cb_wait);
 	p2p_put_pinned_pa(mem->pinned_pa);
 exit_io_refs:
 	percpu_ref_exit(&mem->io_refs);
@@ -649,7 +747,7 @@ static int get_pa_iov(const struct p2p_iov *iov, unsigned int iov_nr,
 		      struct p2p_pa_iov **pa_iov, unsigned int *pa_iov_nr,
 		      struct p2p_pinned_io_mem *pinned_mem)
 {
-	struct p2p_pinned_pa *pinned_pa;
+	struct p2p_oneshot_pin *pin;
 	struct p2p_pa_iov *new_pa_iov;
 	struct p2p_iov_map *maps;
 	unsigned int new_pa_iov_nr;
@@ -657,27 +755,29 @@ static int get_pa_iov(const struct p2p_iov *iov, unsigned int iov_nr,
 	unsigned int i;
 	int err;
 
-	pinned_pa = kzalloc(sizeof(*pinned_pa), GFP_KERNEL);
-	if (!pinned_pa)
+	pin = kzalloc(sizeof(*pin), GFP_KERNEL);
+	if (!pin)
 		return -ENOMEM;
-	pinned_pa->maps = kvcalloc(iov_nr, sizeof(*pinned_pa->maps), GFP_KERNEL);
-	if (!pinned_pa->maps) {
+	p2p_oneshot_pin_init(pin);
+	pin->pa.maps = kvcalloc(iov_nr, sizeof(*pin->pa.maps), GFP_KERNEL);
+	if (!pin->pa.maps) {
 		err = -ENOMEM;
-		goto put_pinned_pa;
+		goto put_pin;
 	}
-	maps = pinned_pa->maps;
+	maps = pin->pa.maps;
 
 	new_pa_iov_nr = 0;
 	for (i = 0; i < iov_nr; i++) {
-		err = p2p_pin_map(pinned_pa, &maps[i], iov[i].addr, iov[i].size);
+		err = p2p_pin_map(&pin->pa, &maps[i], iov[i].addr, iov[i].size,
+				  p2p_oneshot_free_callback, pin);
 		if (err) {
 			pr_err("get page table addr 0x%llx size 0x%x iov %u err %d\n",
 			       iov[i].addr, iov[i].size, i, err);
-			goto put_pinned_pa;
+			goto put_pin;
 		}
 		if (maps[i].pa_num > UINT_MAX - new_pa_iov_nr) {
 			err = -E2BIG;
-			goto put_pinned_pa;
+			goto put_pin;
 		}
 		new_pa_iov_nr += maps[i].pa_num;
 	}
@@ -685,7 +785,7 @@ static int get_pa_iov(const struct p2p_iov *iov, unsigned int iov_nr,
 	new_pa_iov = kvmalloc_array(new_pa_iov_nr, sizeof(*new_pa_iov), GFP_KERNEL);
 	if (!new_pa_iov) {
 		err = -ENOMEM;
-		goto put_pinned_pa;
+		goto put_pin;
 	}
 
 	new_pa_iov_idx = 0;
@@ -725,14 +825,14 @@ static int get_pa_iov(const struct p2p_iov *iov, unsigned int iov_nr,
 	*pa_iov_nr = new_pa_iov_nr;
 	*pinned_mem = (struct p2p_pinned_io_mem) {
 		.pinned = true,
-		.pinned_pa = pinned_pa,
+		.oneshot = pin,
 	};
 	return 0;
 
 free_pa_iov:
 	kvfree(new_pa_iov);
-put_pinned_pa:
-	p2p_put_pinned_pa(pinned_pa);
+put_pin:
+	p2p_put_oneshot_pin(pin);
 	return err;
 }
 
@@ -850,6 +950,23 @@ put_mem:
 	return err;
 }
 
+static void p2p_pin_dma_idle(struct p2p_pinned_io_mem *pinned_mem)
+{
+	if (!pinned_mem->pinned)
+		return;
+	/*
+	 * Drop the live pin once DMA (and CRC finalize, when enabled) is done
+	 * so HAL free_callback can return and CANN may recycle the PA.
+	 * One-shot put_pages still waits for harvest: it sleeps.
+	 */
+	if (pinned_mem->reg_mem) {
+		percpu_ref_put(&pinned_mem->registered_mem->io_refs);
+		pinned_mem->pinned = false;
+	} else if (pinned_mem->oneshot) {
+		complete_all(&pinned_mem->oneshot->dma_done);
+	}
+}
+
 static void p2p_unpin_io_mem(struct p2p_pinned_io_mem *pinned_mem)
 {
 	if (!pinned_mem->pinned)
@@ -858,7 +975,7 @@ static void p2p_unpin_io_mem(struct p2p_pinned_io_mem *pinned_mem)
 	if (pinned_mem->reg_mem)
 		percpu_ref_put(&pinned_mem->registered_mem->io_refs);
 	else
-		p2p_put_pinned_pa(pinned_mem->pinned_pa);
+		p2p_put_oneshot_pin(pinned_mem->oneshot);
 	pinned_mem->pinned = false;
 }
 
@@ -1254,12 +1371,7 @@ static void p2p_finalize_io_work(struct work_struct *work)
 	dump_io_ctx_crc32(io_ctx);
 	dump_pa_content(io_ctx->pa_iov[0].addr,
 			min_t(u64, io_ctx->data_size, io_ctx->pa_iov[0].len));
-	/*
-	 * Registered unpin here (process context). One-shot stays pinned until
-	 * retire; pinned_mem itself is an embedded field and remains valid.
-	 */
-	if (io_ctx->pinned_mem.reg_mem)
-		p2p_unpin_io_mem(&io_ctx->pinned_mem);
+	p2p_pin_dma_idle(&io_ctx->pinned_mem);
 	p2p_publish_io_done(io_ctx);
 }
 #endif
@@ -1286,13 +1398,7 @@ static void p2p_io_ctx_put(struct p2p_io_context *io_ctx)
 	}
 #endif
 
-	/*
-	 * Registered: drop the percpu_ref on the completion path (safe).
-	 * One-shot: leave pinned until p2p_retire_cq_head so
-	 * hal_kernel_p2p_put_pages never runs in softirq.
-	 */
-	if (io_ctx->pinned_mem.reg_mem)
-		p2p_unpin_io_mem(&io_ctx->pinned_mem);
+	p2p_pin_dma_idle(&io_ctx->pinned_mem);
 
 	/* Log once per io_ctx when NVMe completion carried a blk error. */
 	if (io_ctx->io_err && !io_ctx->issue_err)
