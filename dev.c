@@ -177,6 +177,7 @@ static struct module *p2p_tp_mod;
 static DEFINE_XARRAY(registered_mems);
 static DEFINE_MUTEX(registered_mem_lock);
 static atomic64_t registered_mem_id = ATOMIC64_INIT(0);
+static struct workqueue_struct *p2p_mem_release_wq;
 
 static int p2p_open(struct inode *inode, struct file *file);
 static int p2p_release(struct inode *inode, struct file *file);
@@ -431,7 +432,6 @@ static void p2p_destroy_registered_mem_work(struct work_struct *work)
 	put_pid(mem->owner_tgid);
 	percpu_ref_exit(&mem->io_refs);
 	kfree(mem);
-	module_put(THIS_MODULE);
 }
 
 static void p2p_registered_mem_release(struct percpu_ref *ref)
@@ -443,10 +443,11 @@ static void p2p_registered_mem_release(struct percpu_ref *ref)
 	complete(&mem->io_zero);
 	/*
 	 * Confirm can run from RCU, NVMe softirq, or harvest while ring_lock
-	 * is held. Lookup is already unpublished; one RCU grace then a
-	 * sleepable wq does put_pages and frees the object.
+	 * is held. Lookup is already unpublished; one RCU grace then the
+	 * dedicated wq does put_pages and frees the object. module_exit
+	 * rcu_barrier()s then destroy_workqueue()s this queue.
 	 */
-	if (WARN_ON_ONCE(!queue_rcu_work(system_unbound_wq, &mem->destroy_work)))
+	if (WARN_ON_ONCE(!queue_rcu_work(p2p_mem_release_wq, &mem->destroy_work)))
 		return;
 }
 
@@ -454,7 +455,6 @@ static void p2p_kill_registered_mem(struct p2p_registered_mem *mem)
 {
 	if (!atomic_xchg(&mem->live, 0))
 		return;
-	__module_get(THIS_MODULE);
 	percpu_ref_kill(&mem->io_refs);
 }
 
@@ -1871,10 +1871,17 @@ static int __init p2p_drv_init(void)
 	if (err)
 		return err;
 
+	p2p_mem_release_wq = alloc_workqueue("p2p_mem_release",
+					     WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+	if (!p2p_mem_release_wq) {
+		err = -ENOMEM;
+		goto exit_mem;
+	}
+
 	err = topo_init();
 	if (err) {
 		pr_err("initialize topology release workqueue err %d\n", err);
-		goto exit_mem;
+		goto exit_mem_wq;
 	}
 
 	err = p2p_tp_hook_init();
@@ -1928,6 +1935,8 @@ exit_debugfs:
 	p2p_tp_hook_exit();
 exit_topo:
 	topo_exit();
+exit_mem_wq:
+	destroy_workqueue(p2p_mem_release_wq);
 exit_mem:
 	p2p_mem_exit();
 	return err;
@@ -1944,10 +1953,12 @@ static void __exit p2p_drv_exit(void)
 	WARN_ON_ONCE(!xa_empty(&registered_mems));
 	xa_destroy(&registered_mems);
 	/*
-	 * Drain registered-memory RCU frees and queue all topology release work
-	 * before topo_exit() flushes and destroys the topology workqueue.
+	 * queue_rcu_work() only schedules after a grace period. rcu_barrier()
+	 * waits until those callbacks have queued work; destroy_workqueue()
+	 * then flushes put_pages / kfree before p2p_mem_exit().
 	 */
 	rcu_barrier();
+	destroy_workqueue(p2p_mem_release_wq);
 	topo_exit();
 	p2p_mem_exit();
 	pr_info("driver removed done\n");
