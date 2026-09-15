@@ -491,9 +491,9 @@ orders entries by MD slot.  The kernel requires:
 - `nr_devs >= 2`;
 - a nonzero power-of-two chunk size represented by
   `1U << chunk_sectors_shift` sectors, with `chunk_sectors_shift < 32`;
-- identical configured member offsets and `size_sector` values for every
-  member;
-- `size_sector` is a multiple of the chunk size; and
+- identical `size_sector` values for every member;
+- each namespace-relative `start_sector` and `size_sector` is a multiple
+  of the chunk size; and
 - the top bdev size equals `nr_devs * size_sector`.
 
 For a logical `from_sector`:
@@ -516,8 +516,9 @@ The returned length never crosses a RAID0 chunk boundary.  Equal member sizes
 exclude the multiple-strip-zone behavior used by RAID0 arrays with unequal
 members.  A member offset is relative to its configured member device.  For a
 partition member, the kernel adds that partition's start only to the internal
-namespace-relative mapping offset.  Partition starts may differ without
-relaxing the requirement that the MD-reported member offsets and sizes match.
+namespace-relative mapping offset. Member offsets and partition starts may
+differ, including for two partitions on the same namespace. Each resulting
+namespace-relative start must be chunk-aligned; member sizes must still match.
 
 ## 8. Read-path integration
 
@@ -662,7 +663,8 @@ Read `/sys/dev/block/<major>:<minor>/md/level`, `chunk_size`, `raid_disks`,
   sector count can be represented by the kernel shift field;
 - there is exactly one active member for every slot from zero through
   `raid_disks - 1`;
-- all member offsets are equal;
+- member offsets may differ; the kernel requires each start, including any
+  partition offset, to align to the chunk size;
 - all member sizes are equal and are multiples of the chunk size; and
 - every member is a whole NVMe namespace or a partition whose parent is a
   whole NVMe namespace according to sysfs.
@@ -671,9 +673,9 @@ Read each member's `slot`, `offset`, and `size`, sort by slot, and fill the
 component array in that order.  Set `name = "raid0"`, set `extra[0]` to
 `ilog2(chunk_size / 512)`, and set `extra[1]` to zero.
 
-Member offsets and sizes are compared before partition translation and retain
-the existing equality requirements.  The kernel independently adds each
-partition start when building the internal whole-namespace mapping.
+Member sizes must remain equal. The kernel independently adds each partition
+start when building the internal whole-namespace mapping, then checks each
+resolved start for chunk alignment without comparing member offsets.
 
 Userspace takes one snapshot while assembling the structure.  It does not
 repeat the full discovery because a second snapshot cannot close the remaining
@@ -765,8 +767,8 @@ If no topology is registered for the resolved bdev, the read returns
 - dm-linear with two to four NVMe components, including reads crossing target
   boundaries, and with whole-namespace or partition components;
 - uniform two- to four-member MD RAID0, including reads crossing chunk and
-  stripe boundaries, and with whole-namespace or partition members whose raw
-  MD offsets and sizes remain equal;
+  stripe boundaries, and with whole-namespace or partition members whose
+  offsets may differ but whose sizes remain equal;
 - mixed component queue limits;
 - enough small RAID0 chunks to produce more requests than the old `* 10`
   command estimate; and
@@ -778,7 +780,7 @@ If no topology is registered for the resolved bdev, the read returns
 - read without a registered topology;
 - non-linear dm target, discontinuous dm table, and nested dm/MD component;
 - RAID level other than RAID0, degraded/missing member, duplicate slot,
-  unequal member offset or size, and invalid chunk size;
+  unaligned member start, unequal member size, and invalid chunk size;
 - `nvme` with a partition top and a component from another disk, or a
   mismatched partition start or size;
 - NVMe multipath head, non-NVMe component, invalid NSID ioctl, component range
