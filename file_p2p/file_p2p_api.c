@@ -27,12 +27,24 @@ int new_p2p_fd(void)
 
 int add_topo(int dev_fd, const char *dev)
 {
-	return p2p_add_topo(dev_fd, dev);
+	struct stat st;
+
+	if (stat(dev, &st) < 0)
+		return -errno;
+	if (!S_ISBLK(st.st_mode))
+		return -EINVAL;
+	return p2p_add_topo(dev_fd, st.st_rdev);
 }
 
 int del_topo(int dev_fd, const char *dev)
 {
-	return p2p_del_topo(dev_fd, dev);
+	struct stat st;
+
+	if (stat(dev, &st) < 0)
+		return -errno;
+	if (!S_ISBLK(st.st_mode))
+		return -EINVAL;
+	return p2p_del_topo(dev_fd, st.st_rdev);
 }
 
 int register_mem(int dev_fd, struct p2p_mem_register_param *param)

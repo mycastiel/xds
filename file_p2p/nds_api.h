@@ -76,6 +76,8 @@ struct nds_init_param {
  * v1: fs_fd_cnt must be at least 1. Every entry is a regular-file or
  * block-device fd whose underlying block device is registered via add_topo
  * for the process. Additional descriptors may be registered after nds_init.
+ * Discovery uses the fd device ID and sysfs; no target /dev node is needed.
+ * dm-linear discovery also requires access to /dev/mapper/control.
  */
 struct nds_fs_desc {
 	int32_t *fs_fd;

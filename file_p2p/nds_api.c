@@ -14,7 +14,6 @@
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -78,34 +77,18 @@ static int is_init(void)
 	return g_state.book_fd >= 0 && g_state.topo_fd >= 0;
 }
 
-static int topo_fd_to_bdev(int32_t topo_fd, char *bdev, size_t bdev_size)
+static int topo_fd_to_devt(int32_t topo_fd, dev_t *dev_id)
 {
-	char sys[64];
-	char link[PATH_MAX];
-	const char *base;
 	struct stat st;
-	dev_t target;
-	ssize_t n;
 
 	if (fstat(topo_fd, &st) < 0)
 		return -errno;
 	if (S_ISBLK(st.st_mode))
-		target = st.st_rdev;
+		*dev_id = st.st_rdev;
 	else if (S_ISREG(st.st_mode))
-		target = st.st_dev;
+		*dev_id = st.st_dev;
 	else
 		return -EINVAL;
-
-	snprintf(sys, sizeof(sys), "/sys/dev/block/%u:%u",
-		 major(target), minor(target));
-	n = readlink(sys, link, sizeof(link) - 1);
-	if (n < 0)
-		return -errno;
-	link[n] = '\0';
-	base = strrchr(link, '/');
-	base = base ? base + 1 : link;
-	if (snprintf(bdev, bdev_size, "/dev/%s", base) >= (int)bdev_size)
-		return -ENAMETOOLONG;
 	return 0;
 }
 
@@ -139,7 +122,7 @@ int nds_init(struct nds_init_param *param)
 
 int nds_register_fs(const struct nds_fs_desc *desc)
 {
-	char bdev[PATH_MAX];
+	dev_t dev_id = 0;
 	uint32_t i;
 	int ret;
 
@@ -148,9 +131,9 @@ int nds_register_fs(const struct nds_fs_desc *desc)
 
 	/* Register every supplied topology for the lifetime of topo_fd. */
 	for (i = 0; i < desc->fs_fd_cnt; i++) {
-		ret = topo_fd_to_bdev(desc->fs_fd[i], bdev, sizeof(bdev));
+		ret = topo_fd_to_devt(desc->fs_fd[i], &dev_id);
 		if (!ret)
-			ret = p2p_add_topo(g_state.topo_fd, bdev);
+			ret = p2p_add_topo(g_state.topo_fd, dev_id);
 		if (ret) {
 			fprintf(stderr, "nds: add topology for fd %d failed %d\n",
 				desc->fs_fd[i], ret);
