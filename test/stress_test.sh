@@ -111,10 +111,11 @@ run_stress_api()
 	fi
 	if [[ $memory_mode == registered ]]; then
 		get_after=$(<"$get_param")
-		put_after=$(<"$put_param")
 		(( get_after - get_before == 1 )) ||
 			die "$api registered stress used \
 $((get_after - get_before)) PA-list gets"
+		put_after=$(wait_stub_pa_delta 1 "$put_before") ||
+			die "$api registered stress PA puts did not complete"
 		(( put_after - put_before == 1 )) ||
 			die "$api registered stress used \
 $((put_after - put_before)) PA-list puts"
@@ -186,10 +187,11 @@ run_cq_race_api()
 	fi
 	if [[ $memory_mode == registered ]]; then
 		get_after=$(<"$get_param")
-		put_after=$(<"$put_param")
 		(( get_after - get_before == 1 )) ||
 			die "$api registered $mode used \
 $((get_after - get_before)) PA-list gets"
+		put_after=$(wait_stub_pa_delta 1 "$put_before") ||
+			die "$api registered $mode PA puts did not complete"
 		(( put_after - put_before == 1 )) ||
 			die "$api registered $mode used \
 $((put_after - put_before)) PA-list puts"
@@ -220,6 +222,7 @@ main()
 
 	(( $# == 0 )) || die "stress_test.sh does not accept positional arguments"
 	validate_stress_options
+	TEST_PASS_MSG="$STRESS_MODE normal and registered dynamic-VA stress tests passed"
 	init_work_dir "xds-stress-$STRESS_MODE"
 	trap cleanup EXIT
 
@@ -264,7 +267,6 @@ main()
 			done
 		done
 	done
-	log "$STRESS_MODE normal and registered dynamic-VA stress tests passed"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

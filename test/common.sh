@@ -22,6 +22,9 @@ WORK_BASE=${XDS_TEST_WORKDIR:-}
 WORK_DIR=
 KEEP_WORK_DIR=${XDS_TEST_KEEP_WORKDIR:-0}
 BUILD_JOBS=${XDS_TEST_BUILD_JOBS:-8}
+TEST_PASS_MSG=
+SKIP_RMMOD=0
+PA_PUT_WAIT_SEC=${XDS_PA_PUT_WAIT_SEC:-15}
 DEV1=
 DEV2=
 CTRL_NAME=
@@ -90,16 +93,37 @@ cleanup_storage()
 cleanup()
 {
 	local status=$?
+	local rmmod_err=0
 
 	trap - EXIT
 	cleanup_storage
 	set +e
-	rmmod p2p_dev >/dev/null 2>&1
-	rmmod stub >/dev/null 2>&1
+	if (( !SKIP_RMMOD )) && lsmod | grep -q '^p2p_dev'; then
+		rmmod p2p_dev
+		rmmod_err=$?
+		if (( rmmod_err )); then
+			printf '%s: rmmod p2p_dev failed (%d); module may be pinned\n' \
+				"${TEST_NAME:-xds_test}" "$rmmod_err" >&2
+			ps -eo pid,state,wchan:32,cmd | awk 'NR==1 || $2 ~ /D/' >&2
+		fi
+	fi
+	if (( !SKIP_RMMOD )); then
+		rmmod stub >/dev/null 2>&1
+	fi
 	if (( DEBUGFS_MOUNTED )); then
 		umount /sys/kernel/debug >/dev/null 2>&1
 	fi
 	set -e
+
+	if (( rmmod_err != 0 && status == 0 )); then
+		status=$rmmod_err
+	fi
+
+	# Report pass only after storage teardown and rmmod so a D-state hang
+	# in p2p_release cannot print success before cleanup fails.
+	if (( status == 0 )) && [[ -n ${TEST_PASS_MSG:-} ]]; then
+		log "$TEST_PASS_MSG"
+	fi
 
 	if (( status == 0 )) && [[ $KEEP_WORK_DIR != 1 ]]; then
 		rm -rf -- "$WORK_DIR"
@@ -116,8 +140,8 @@ require_commands()
 
 	for command in awk blockdev cat chmod dmesg dmsetup findmnt grep insmod \
 		lsblk make mdadm mkdir mkfs.ext4 mktemp modinfo mount mountpoint \
-		python3 readlink rm rmmod sed sfdisk stat sync swapon tr udevadm umount \
-		wipefs; do
+		python3 readlink rm rmmod sed sfdisk stat sync swapon timeout tr \
+		udevadm umount wipefs; do
 		if ! command -v "$command" >/dev/null 2>&1; then
 			printf 'missing required command: %s\n' "$command" >&2
 			missing=1
@@ -248,13 +272,8 @@ preflight()
 		"$((BAR2_START + bar_size))"
 }
 
-build_all()
+build_userspace()
 {
-	log "Building normal and CRC-enabled modules plus both userspace APIs (-j$BUILD_JOBS)"
-	make -C "$REPO_ROOT" clean
-	make -C "$REPO_ROOT" -j"$BUILD_JOBS" W=1
-	make -C "$REPO_ROOT" clean
-	make -C "$REPO_ROOT" -j"$BUILD_JOBS" W=1 KCFLAGS=-DCALC_CRC32
 	make -C "$REPO_ROOT" -j"$BUILD_JOBS" test
 	(
 		cd "$REPO_ROOT/file_p2p"
@@ -262,6 +281,50 @@ build_all()
 	)
 	PYTHONPATH="$REPO_ROOT/file_p2p" python3 -c 'import file_p2p'
 	PYTHONPATH="$REPO_ROOT/file_p2p" python3 -c 'import nds'
+}
+
+build_all()
+{
+	if [[ ${XDS_SKIP_MODULE_BUILD:-0} == 1 ]]; then
+		[[ -f $REPO_ROOT/stub.ko && -f $REPO_ROOT/p2p_dev.ko ]] ||
+			die "XDS_SKIP_MODULE_BUILD requires prebuilt stub.ko and p2p_dev.ko"
+		log "Skipping kbuild; using prebuilt modules and rebuilding userspace (-j$BUILD_JOBS)"
+		build_userspace
+		return
+	fi
+
+	log "Building normal and CRC-enabled modules plus both userspace APIs (-j$BUILD_JOBS)"
+	make -C "$REPO_ROOT" clean
+	make -C "$REPO_ROOT" -j"$BUILD_JOBS" W=1
+	make -C "$REPO_ROOT" clean
+	make -C "$REPO_ROOT" -j"$BUILD_JOBS" W=1 KCFLAGS=-DCALC_CRC32
+	build_userspace
+}
+
+wait_stub_pa_delta()
+{
+	local expected_delta=$1
+	local put_before=$2
+	local timeout_s=${3:-$PA_PUT_WAIT_SEC}
+	local put_param=/sys/module/stub/parameters/put_pa_calls
+	local start puts now
+
+	[[ -r $put_param ]] || die "stub PA-list put counter is unavailable"
+	start=$(date +%s)
+	while :; do
+		puts=$(<"$put_param")
+		if (( puts - put_before >= expected_delta )); then
+			printf '%s\n' "$puts"
+			return 0
+		fi
+		now=$(date +%s)
+		if (( now - start >= timeout_s )); then
+			printf 'timeout waiting for %d PA puts (before=%d now=%d)\n' \
+				"$expected_delta" "$put_before" "$puts" >&2
+			return 1
+		fi
+		sleep 0.05
+	done
 }
 
 crc_self_test()

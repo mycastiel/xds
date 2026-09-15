@@ -4,8 +4,9 @@ KSRC ?= /lib/modules/$(shell uname -r)/build
 
 all: mod lib
 
+# GCC 15 defaults to C23; 5.15 kernel headers still use enum false/true.
 mod:
-	$(MAKE) M=$(shell pwd) -C $(KSRC) modules
+	$(MAKE) M=$(shell pwd) -C $(KSRC) KCFLAGS="$(KCFLAGS) -std=gnu11" modules
 
 lib:
 	$(MAKE) -C file_p2p

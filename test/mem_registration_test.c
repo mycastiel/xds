@@ -568,8 +568,6 @@ int main(int argc, char **argv)
 		goto out;
 	close_p2p_fd(close_fd);
 	close_fd = -1;
-
-	printf("memory registration tests passed\n");
 	err = 0;
 	goto out;
 
@@ -586,5 +584,6 @@ out:
 		fprintf(stderr, "memory registration test failed: %d\n", err);
 		return EXIT_FAILURE;
 	}
+	printf("memory registration tests passed\n");
 	return EXIT_SUCCESS;
 }

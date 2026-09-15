@@ -55,7 +55,7 @@ make_single_manifest()
 	append_case "$manifest" "$label-va-tail" "$directory/va_tail.dat" \
 		$((8 * block_size - tail_len)) "$tail_va" "$tail_len" 0
 	append_case "$manifest" "$label-invalid-va" "$directory/tiny.dat" 0 \
-		"$CMB_SIZE" 512 -22
+		"$CMB_SIZE" 512 -34
 	printf '%s\n' "$manifest"
 }
 
@@ -96,7 +96,7 @@ make_block_manifest()
 	fi
 	append_case "$manifest" "$label-va-tail" "$source" \
 		$((source_size - tail_len)) "$tail_va" "$tail_len" 0
-	append_case "$manifest" "$label-invalid-va" "$source" 0 "$CMB_SIZE" 512 -22
+	append_case "$manifest" "$label-invalid-va" "$source" 0 "$CMB_SIZE" 512 -34
 	printf '%s\n' "$manifest"
 }
 
@@ -192,12 +192,12 @@ run_mem_registration_case()
 	put_before=$(<"$put_param")
 	"$@"
 	get_after=$(<"$get_param")
-	put_after=$(<"$put_param")
 	if (( get_after - get_before != expected_calls )); then
 		printf '%s used %d PA-list gets, expected %d\n' \
 			"$label" "$((get_after - get_before))" "$expected_calls" >&2
 		return 1
 	fi
+	put_after=$(wait_stub_pa_delta "$expected_calls" "$put_before") || return 1
 	if (( put_after - put_before != expected_calls )); then
 		printf '%s used %d PA-list puts, expected %d\n' \
 			"$label" "$((put_after - put_before))" "$expected_calls" >&2
@@ -650,6 +650,7 @@ run_cq_race_smoke()
 main()
 {
 	(( $# == 0 )) || die "basic_test.sh does not accept positional arguments"
+	TEST_PASS_MSG="All XDS C, Python, and NDS API tests passed"
 	init_work_dir xds-basic-test
 	trap cleanup EXIT
 
@@ -670,7 +671,6 @@ main()
 	test_raid0
 	test_raid0_slot_order
 	test_raid0_partitions
-	log "All XDS C, Python, and NDS API tests passed"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

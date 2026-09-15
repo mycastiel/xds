@@ -106,6 +106,7 @@ run_suite()
 		"XDS_KERNEL_VARIANT=$KERNEL_VARIANT"
 		"XDS_TEST_KEEP_WORKDIR=1"
 		"XDS_TEST_WORKDIR=$RAW_DIR"
+		"XDS_SKIP_MODULE_BUILD=${XDS_SKIP_MODULE_BUILD:-0}"
 	)
 
 	if [[ -n ${XDS_TEST_BUILD_JOBS:-} ]]; then
@@ -114,7 +115,7 @@ run_suite()
 
 	printf '\n==> Running %s/%s\n' "$KERNEL_VARIANT" "$suite"
 	set +e
-	sudo env "${environment[@]}" "$@" 2>&1 | tee "$log_path"
+	sudo -n env "${environment[@]}" "$@" 2>&1 | tee "$log_path"
 	status=${PIPESTATUS[0]}
 	set -e
 	if (( status != 0 )); then
@@ -145,7 +146,7 @@ main()
 
 	validate_options
 	prepare_result_directories
-	sudo -v
+	sudo -n true
 
 	printf 'Kernel variant: %s\n' "$KERNEL_VARIANT"
 	printf 'Result root: %s\n' "$RESULT_ROOT"
@@ -153,6 +154,7 @@ main()
 	printf 'WARNING: %s and %s will be destroyed.\n' "$DEV1" "$DEV2"
 
 	run_suite basic 1 "$SCRIPT_DIR/basic_test.sh"
+	run_suite regmem-lifetime 0 "$SCRIPT_DIR/regmem_lifetime_test.sh"
 	for mode in raid0 dm nvme; do
 		run_suite "stress-$mode" 0 \
 			"XDS_STRESS_MODE=$mode" \
@@ -164,6 +166,7 @@ main()
 			"XDS_STRESS_MODE=$mode" \
 			"$SCRIPT_DIR/cq_race_test.sh"
 	done
+	run_suite release-dstate 0 "$SCRIPT_DIR/release_dstate_test.sh"
 
 	sudo chown -R "$(id -u):$(id -g)" "$VARIANT_DIR"
 	printf '\nAll %s tests passed.\n' "$KERNEL_VARIANT"

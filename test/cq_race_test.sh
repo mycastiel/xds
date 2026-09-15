@@ -121,10 +121,11 @@ run_cq_race_live_api()
 		fi
 		if [[ $memory_mode == registered ]]; then
 			get_after=$(<"$get_param")
-			put_after=$(<"$put_param")
 			(( get_after - get_before == 1 )) ||
 				die "$api registered $mode used \
 $((get_after - get_before)) PA-list gets"
+			put_after=$(wait_stub_pa_delta 1 "$put_before") ||
+				die "$api registered $mode PA puts did not complete"
 			(( put_after - put_before == 1 )) ||
 				die "$api registered $mode used \
 $((put_after - put_before)) PA-list puts"
@@ -143,6 +144,7 @@ main()
 
 	(( $# == 0 )) || die "cq_race_test.sh does not accept positional arguments"
 	validate_options
+	TEST_PASS_MSG="$STRESS_MODE cq-race-drain-live concurrency stress passed (rounds=$CQ_RACE_ROUNDS overlap_ms=$CQ_RACE_OVERLAP_MS)"
 	init_work_dir "xds-cq-race-$STRESS_MODE"
 	trap cleanup EXIT
 
@@ -174,7 +176,6 @@ main()
 			run_cq_race_live_api "$api" "$workload" "$memory_mode"
 		done
 	done
-	log "$STRESS_MODE cq-race-drain-live concurrency stress passed (rounds=$CQ_RACE_ROUNDS overlap_ms=$CQ_RACE_OVERLAP_MS)"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

@@ -6,7 +6,7 @@ CPPFLAGS += -I../file_p2p -I..
 
 TEST_BINS := crc32_verify c_api_test mem_registration_test direct_io_test \
 	rw_api_test uapi_rw_test nds_api_test nds_example nds_bw_bench \
-	nds_crc_verify
+	nds_crc_verify release_dstate_test regmem_lifetime_test
 
 all: $(TEST_BINS)
 
@@ -23,6 +23,20 @@ mem_registration_test: mem_registration_test.c ../file_p2p/file_p2p_api.c \
 		../file_p2p/p2p_common.h ../p2p_dev_uapi.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread -o $@ \
 		mem_registration_test.c ../file_p2p/file_p2p_api.c \
+		../file_p2p/p2p_common.c
+
+release_dstate_test: release_dstate_test.c ../file_p2p/file_p2p_api.c \
+		../file_p2p/p2p_common.c ../file_p2p/file_p2p_api.h \
+		../file_p2p/p2p_common.h ../p2p_dev_uapi.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ \
+		release_dstate_test.c ../file_p2p/file_p2p_api.c \
+		../file_p2p/p2p_common.c
+
+regmem_lifetime_test: regmem_lifetime_test.c ../file_p2p/file_p2p_api.c \
+		../file_p2p/p2p_common.c ../file_p2p/file_p2p_api.h \
+		../file_p2p/p2p_common.h ../p2p_dev_uapi.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread -o $@ \
+		regmem_lifetime_test.c ../file_p2p/file_p2p_api.c \
 		../file_p2p/p2p_common.c
 
 direct_io_test: direct_io_test.c

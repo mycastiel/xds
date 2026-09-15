@@ -5,6 +5,8 @@
 *.o
 *.o.d
 .*.cmd
+.*.d
+libnds.so*
 Module.symvers
 cscope.files
 cscope.out

@@ -2,7 +2,10 @@
 
 import argparse
 import csv
+import fcntl
+import os
 import random
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -26,10 +29,25 @@ def round_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
-def choose_file_sizes(rng: random.Random, workers: int) -> List[int]:
+def topology_capacity_bytes(path: str) -> int:
+    BLKGETSIZE64 = 0x80081272
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        buf = fcntl.ioctl(fd, BLKGETSIZE64, b"\0" * 8)
+    finally:
+        os.close(fd)
+    return struct.unpack("Q", buf)[0]
+
+
+def choose_file_sizes(
+    rng: random.Random, workers: int, max_total: int
+) -> List[int]:
+    max_each = min(MAX_FILE_SIZE, max(MIN_FILE_SIZE, max_total // workers))
+    max_each_kib = max_each // KIB
     while True:
-        sizes = [rng.randint(4, 4096) * KIB for _ in range(workers)]
-        if 4 * MIB < sum(sizes) <= MAX_TOTAL_FILE_SIZE:
+        sizes = [rng.randint(4, max_each_kib) * KIB for _ in range(workers)]
+        total = sum(sizes)
+        if total <= max_total and (workers < 8 or total > 4 * MIB):
             return sizes
 
 
@@ -89,7 +107,15 @@ def main() -> int:
         parser.error("--iterations must be positive")
 
     rng = random.Random(args.seed)
-    file_sizes = choose_file_sizes(rng, args.workers)
+    # Leave room for ext4 metadata on the topology device (nvme ns is 64 MiB).
+    device_cap = topology_capacity_bytes(args.topology)
+    max_total = min(MAX_TOTAL_FILE_SIZE, device_cap * 7 // 10)
+    if max_total <= 4 * MIB:
+        parser.error(
+            f"topology {args.topology} is too small for a stress workload "
+            f"({device_cap} bytes)"
+        )
+    file_sizes = choose_file_sizes(rng, args.workers, max_total)
     total_file_size = sum(file_sizes)
     args.directory.mkdir(parents=True, exist_ok=True)
     args.manifest.parent.mkdir(parents=True, exist_ok=True)

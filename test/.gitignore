@@ -3,6 +3,8 @@
 /crc32_verify
 /direct_io_test
 /mem_registration_test
+/release_dstate_test
+/regmem_lifetime_test
 /nds_api_test
 /nds_example
 /rw_api_test
