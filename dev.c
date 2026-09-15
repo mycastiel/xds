@@ -91,7 +91,7 @@ struct p2p_registered_mem {
 	struct pid *owner_tgid;
 
 	struct percpu_ref io_refs;
-	struct completion io_zero;
+	struct work_struct destroy_work;
 	struct rcu_head rcu;
 	struct list_head owner_node;
 };
@@ -171,9 +171,7 @@ static int p2p_release(struct inode *inode, struct file *file);
 static long p2p_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 static int p2p_drain_io(struct p2p_batch *batch);
 static void p2p_tp_hook_exit(void);
-static void p2p_revoke_all_registered_mem(struct p2p_batch *batch,
-					  struct list_head *revoked);
-static void p2p_destroy_registered_mem_list(struct list_head *revoked);
+static void p2p_revoke_all_registered_mem(struct p2p_batch *batch);
 static void p2p_io_ctx_put(struct p2p_io_context *io_ctx);
 static void p2p_publish_io_done(struct p2p_io_context *io_ctx);
 #if defined(CALC_CRC32) || defined(DUMP_CONTENT)
@@ -223,14 +221,16 @@ static int p2p_release(struct inode *inode, struct file *file)
 	struct p2p_batch *batch = file->private_data;
 	struct shared_topo *shared, *next;
 	LIST_HEAD(topos);
-	LIST_HEAD(revoked_mems);
 
-	p2p_revoke_all_registered_mem(batch, &revoked_mems);
+	/*
+	 * Drop this fd from the handle table and kill its mem refs without
+	 * waiting for I/O on other p2p fds. Waiting here blocks close_files()
+	 * during do_exit, so those fds never drain the refs we would wait on.
+	 */
+	p2p_revoke_all_registered_mem(batch);
 
 	if (atomic_read(&batch->io_cnt) > 0)
 		p2p_drain_io(batch);
-
-	p2p_destroy_registered_mem_list(&revoked_mems);
 
 	spin_lock(&batch->shared_topos.lock);
 	list_splice_init(&batch->shared_topos.head, &topos);
@@ -332,15 +332,6 @@ static void p2p_put_pinned_pa(struct p2p_pinned_pa *pinned_pa)
 	kfree(pinned_pa);
 }
 
-static void p2p_registered_mem_release(struct percpu_ref *ref)
-{
-	struct p2p_registered_mem *mem;
-
-	mem = container_of(ref, struct p2p_registered_mem, io_refs);
-	pr_debug("registered memory handle 0x%llx released\n", mem->handle);
-	complete(&mem->io_zero);
-}
-
 static void p2p_free_registered_mem_rcu(struct rcu_head *rcu)
 {
 	struct p2p_registered_mem *mem;
@@ -350,12 +341,38 @@ static void p2p_free_registered_mem_rcu(struct rcu_head *rcu)
 	kfree(mem);
 }
 
-static void p2p_destroy_registered_mem(struct p2p_registered_mem *mem)
+static void p2p_finish_registered_mem(struct p2p_registered_mem *mem)
 {
-	wait_for_completion(&mem->io_zero);
 	p2p_put_pinned_pa(mem->pinned_pa);
 	put_pid(mem->owner_tgid);
 	call_rcu(&mem->rcu, p2p_free_registered_mem_rcu);
+	module_put(THIS_MODULE);
+}
+
+static void p2p_destroy_registered_mem_work(struct work_struct *work)
+{
+	p2p_finish_registered_mem(container_of(work, struct p2p_registered_mem,
+					       destroy_work));
+}
+
+static void p2p_registered_mem_release(struct percpu_ref *ref)
+{
+	struct p2p_registered_mem *mem;
+
+	mem = container_of(ref, struct p2p_registered_mem, io_refs);
+	pr_debug("registered memory handle 0x%llx released\n", mem->handle);
+	/*
+	 * Confirm can run from RCU, NVMe softirq, or harvest while ring_lock
+	 * is held. put_pages sleeps, so always bounce to system_unbound_wq.
+	 * No dedicated wq and no extra lock; I/O tryget/put stays lock-free.
+	 */
+	queue_work(system_unbound_wq, &mem->destroy_work);
+}
+
+static void p2p_kill_registered_mem(struct p2p_registered_mem *mem)
+{
+	__module_get(THIS_MODULE);
+	percpu_ref_kill(&mem->io_refs);
 }
 
 static int p2p_pin_registered_pa(u64 addr, u64 size,
@@ -443,6 +460,7 @@ static int p2p_unpublish_registered_mem(struct p2p_batch *batch, u64 handle,
 
 	xa_erase(&registered_mems, handle);
 	list_del_init(&mem->owner_node);
+	mem->owner = NULL;
 	*mem_out = mem;
 	mutex_unlock(&registered_mem_lock);
 	return 0;
@@ -453,33 +471,29 @@ unlock_rcu:
 	return err;
 }
 
-static void p2p_revoke_all_registered_mem(struct p2p_batch *batch,
-					  struct list_head *revoked)
+static void p2p_revoke_all_registered_mem(struct p2p_batch *batch)
 {
 	struct p2p_registered_mem *mem, *next;
+	LIST_HEAD(revoked);
 
-	if (list_empty(&batch->owned_mems))
+	mutex_lock(&registered_mem_lock);
+	if (list_empty(&batch->owned_mems)) {
+		mutex_unlock(&registered_mem_lock);
 		return;
+	}
 
 	list_for_each_entry_safe(mem, next, &batch->owned_mems, owner_node) {
 		xa_erase(&registered_mems, mem->handle);
-		list_move_tail(&mem->owner_node, revoked);
+		mem->owner = NULL;
+		list_move_tail(&mem->owner_node, &revoked);
 		pr_info("unregister memory handle 0x%llx through p2p fd release\n",
 			mem->handle);
 	}
+	mutex_unlock(&registered_mem_lock);
 
-	list_for_each_entry(mem, revoked, owner_node)
-		percpu_ref_kill(&mem->io_refs);
-}
-
-static void p2p_destroy_registered_mem_list(struct list_head *revoked)
-{
-	struct p2p_registered_mem *mem;
-	struct p2p_registered_mem *next;
-
-	list_for_each_entry_safe(mem, next, revoked, owner_node) {
+	list_for_each_entry_safe(mem, next, &revoked, owner_node) {
 		list_del_init(&mem->owner_node);
-		p2p_destroy_registered_mem(mem);
+		p2p_kill_registered_mem(mem);
 	}
 }
 
@@ -501,7 +515,7 @@ static int p2p_register_mem(struct p2p_batch *batch, void __user *arg)
 	mem->addr = param.addr;
 	mem->size = param.size;
 	mem->owner_tgid = get_task_pid(current, PIDTYPE_TGID);
-	init_completion(&mem->io_zero);
+	INIT_WORK(&mem->destroy_work, p2p_destroy_registered_mem_work);
 	INIT_LIST_HEAD(&mem->owner_node);
 
 	err = percpu_ref_init(&mem->io_refs, p2p_registered_mem_release,
@@ -554,8 +568,7 @@ static int p2p_unregister_mem(struct p2p_batch *batch, void __user *arg)
 		return err;
 	}
 
-	percpu_ref_kill(&mem->io_refs);
-	p2p_destroy_registered_mem(mem);
+	p2p_kill_registered_mem(mem);
 
 	pr_info("unregistered memory handle 0x%llx\n", param.mem_handle);
 	return 0;
