@@ -691,6 +691,8 @@ main()
 
 	preflight
 	build_all
+	log "Checking topology discovery without target device nodes"
+	"$SCRIPT_DIR/topo_devt_test"
 	crc_self_test
 	save_kernel_identity
 	load_modules
