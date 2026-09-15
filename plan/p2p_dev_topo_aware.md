@@ -586,10 +586,14 @@ The library adds:
 
 ```c
 int add_topo(int dev_fd, const char *dev);
+int del_topo(int dev_fd, const char *dev);
 ```
 
-`dev` must name the top block device.  The helper obtains its `dev_t` with
-`stat()` and probes `/sys/dev/block/<major>:<minor>/`:
+`dev` names the top block device. These compatibility wrappers resolve
+`st_rdev` with `stat()` and pass it to the internal `p2p_add_topo()` or
+`p2p_del_topo()` helper. The NDS C API uses fd-derived device IDs directly
+(`st_dev` for regular files, `st_rdev` for block devices), without requiring
+a target `/dev` node. Discovery probes `/sys/dev/block/<major>:<minor>/`:
 
 - `partition` identifies a partition.  The helper resolves its parent whole
   namespace and returns an `nvme` configuration;
@@ -601,11 +605,14 @@ int add_topo(int dev_fd, const char *dev);
 Unknown devices and unsupported stacks return `-EOPNOTSUPP`.  System-call and
 library failures are returned as negative errno values.
 
+`p2p_del_topo()` takes the device ID and issues `IOCTL_DEL_TOPO` directly;
+the internal helper requires neither a target device node nor a sysfs lookup.
+
 ### 9.1 NVMe discovery
 
-Open the supplied block-device path and issue `BLKGETSIZE64`, rejecting a zero
-or non-512-byte-aligned result.  Set `name = "nvme"`, `nr_devs = 1`, and
-`top_dev` to the supplied device.  Convert the returned byte size to
+Read `/sys/dev/block/<major>:<minor>/size`, which is already in 512-byte
+sectors, rejecting a zero size. Set `name = "nvme"`, `nr_devs = 1`, and
+`top_dev` to the supplied device. Store the size directly in
 `bdevs[0].size_sector`; both `extra` values remain zero.
 
 For a whole namespace, validate it as a non-multipath NVMe namespace, set

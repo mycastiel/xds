@@ -1,5 +1,17 @@
 # XDS prepared-VM tests
 
+## Host-only topology regression
+
+`basic_test.sh` runs `topo_devt_test` after building the test binaries.
+The build itself only compiles it. To run this regression alone without
+hardware or a loaded driver, use `./test/topo_devt_test` after building.
+It mocks sysfs and ioctls to check `dev_t` discovery without target `/dev`
+nodes, namespace and partition sizes in sectors, NDS regular-file and
+block-device registration/deletion, the device-name `add_topo` and `del_topo`
+wrappers, internal deletion without sysfs lookups, and errors.
+
+## VM tests
+
 `basic_test.sh` is a destructive end-to-end test for the XDS direct read/write
 path. It builds the kernel modules and both userspace APIs, uses a QEMU NVMe
 Controller Memory Buffer as the read destination and write source, verifies
