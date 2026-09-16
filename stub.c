@@ -53,8 +53,8 @@ static int stub_validate_range(u64 addr, u64 size)
 	return 0;
 }
 
-int devmm_get_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
-			  u64 size, u64 *pa_list, u32 pa_num)
+int hal_kernel_get_mem_pa_list(u32 devid, int tgid, struct ka_mem_attr *mem,
+			       u64 *pa_num, struct ka_pa_wraper *pa_list)
 {
 	u64 expected_pa_num;
 	u64 pa;
@@ -62,54 +62,57 @@ int devmm_get_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
 	int err;
 
 	atomic_inc(&get_pa_calls);
-	(void)process_id;
-	if (!pa_list)
+	(void)devid;
+	(void)tgid;
+	if (!mem || !pa_num || !pa_list)
 		return -EINVAL;
-	err = stub_validate_range(addr, size);
+	err = stub_validate_range(mem->addr, mem->size);
 	if (err)
 		return err;
-	if (!IS_ALIGNED(addr, STUB_PAGE_SIZE) ||
-	    !IS_ALIGNED(size, STUB_PAGE_SIZE))
+	if (!IS_ALIGNED(mem->addr, STUB_PAGE_SIZE) ||
+	    !IS_ALIGNED(mem->size, STUB_PAGE_SIZE))
 		return -EINVAL;
 
-	expected_pa_num = size / STUB_PAGE_SIZE;
+	expected_pa_num = mem->size / STUB_PAGE_SIZE;
 	if (!expected_pa_num || expected_pa_num > U32_MAX ||
-	    pa_num != expected_pa_num)
+	    *pa_num != expected_pa_num)
 		return -EINVAL;
-	if (check_add_overflow((u64)base_pa, addr, &pa))
+	if (check_add_overflow((u64)base_pa, mem->addr, &pa))
 		return -EOVERFLOW;
 
-	for (i = 0; i < pa_num; i++) {
-		pa_list[i] = pa;
+	for (i = 0; i < *pa_num; i++) {
+		pa_list[i].pa = pa;
+		pa_list[i].size = STUB_PAGE_SIZE;
 		pa += STUB_PAGE_SIZE;
 	}
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(devmm_get_mem_pa_list);
+EXPORT_SYMBOL_GPL(hal_kernel_get_mem_pa_list);
 
-void devmm_put_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
-			   u64 size, u64 *pa_list, u32 pa_num)
+int hal_kernel_put_mem_pa_list(u32 devid, int tgid, struct ka_mem_attr *mem,
+			       u64 pa_num, struct ka_pa_wraper *pa_list)
 {
 	atomic_inc(&put_pa_calls);
-	(void)process_id;
-	(void)addr;
-	(void)size;
-	(void)pa_list;
+	(void)devid;
+	(void)tgid;
+	(void)mem;
 	(void)pa_num;
+	(void)pa_list;
+	return 0;
 }
-EXPORT_SYMBOL_GPL(devmm_put_mem_pa_list);
+EXPORT_SYMBOL_GPL(hal_kernel_put_mem_pa_list);
 
-int devmm_get_mem_page_size(struct devmm_svm_process_id *process_id, u64 addr,
-			    u64 size)
+u32 hal_kernel_get_mem_page_size(u32 devid, int tgid, struct ka_mem_attr *mem)
 {
-	(void)process_id;
-	if (stub_validate_range(addr, size))
-		return -ERANGE;
+	(void)devid;
+	(void)tgid;
+	if (!mem || stub_validate_range(mem->addr, mem->size))
+		return 0;
 
 	return STUB_PAGE_SIZE;
 }
-EXPORT_SYMBOL_GPL(devmm_get_mem_page_size);
+EXPORT_SYMBOL_GPL(hal_kernel_get_mem_page_size);
 
 static int __init stub_init(void)
 {

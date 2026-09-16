@@ -12,11 +12,22 @@ struct devmm_svm_process_id {
 	uint16_t vfid;
 };
 
-int devmm_get_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
-			  u64 size, u64 *pa_list, u32 pa_num);
-void devmm_put_mem_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
-			   u64 size, u64 *pa_list, u32 pa_num);
-int devmm_get_mem_page_size(struct devmm_svm_process_id *process_id, u64 addr,
-			    u64 size);
+struct ka_pa_wraper {
+	u64 pa;
+	u64 size;
+};
+
+struct ka_mem_attr {
+	u64 addr;
+	u64 size;
+	bool cp_only_flag;
+	bool raw_pa_flag;
+};
+
+int hal_kernel_get_mem_pa_list(u32 devid, int tgid, struct ka_mem_attr *mem,
+			       u64 *pa_num, struct ka_pa_wraper *pa_list);
+int hal_kernel_put_mem_pa_list(u32 devid, int tgid, struct ka_mem_attr *mem,
+			       u64 pa_num, struct ka_pa_wraper *pa_list);
+u32 hal_kernel_get_mem_page_size(u32 devid, int tgid, struct ka_mem_attr *mem);
 
 #endif
