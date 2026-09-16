@@ -86,6 +86,7 @@ guest_exec sudo -n env \
 	"XDS_DEV_1=$GUEST_DEV_1" \
 	"XDS_DEV_2=$GUEST_DEV_2" \
 	"KSRC=$GUEST_KSRC" \
+	"XDS_BASIC_PROFILE=${XDS_BASIC_PROFILE:-quick}" \
 	"XDS_TEST_KEEP_WORKDIR=$KEEP_WORKDIR" \
 	"$GUEST_REPO/test/basic_test.sh" 2>&1 | tee "$TEST_LOG"
 test_status=${PIPESTATUS[0]}

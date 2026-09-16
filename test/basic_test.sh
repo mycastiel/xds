@@ -5,6 +5,52 @@ set -Eeuo pipefail
 TEST_NAME=basic_test
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
+readonly BASIC_PROFILE=${XDS_BASIC_PROFILE:-quick}
+
+validate_basic_profile()
+{
+	case $BASIC_PROFILE in
+		quick | full) ;;
+		*) die "XDS_BASIC_PROFILE must be quick or full" ;;
+	esac
+}
+
+basic_block_apis()
+{
+	if [[ $BASIC_PROFILE == full || $1 == direct-nsid-1 || $1 == raid0 ]]; then
+		printf '%s\n' c python nds-c nds-python
+	else
+		printf '%s\n' c nds-c
+	fi
+}
+
+basic_fs_sizes()
+{
+	if [[ $BASIC_PROFILE == full || $1 == direct ]]; then
+		printf '%s\n' 1024 2048 4096
+	else
+		printf '%s\n' 4096
+	fi
+}
+
+basic_fs_apis()
+{
+	if [[ $BASIC_PROFILE == full || $1 == direct-ext4-4096 ]]; then
+		printf '%s\n' c python nds-c nds-python
+	else
+		printf '%s\n' c nds-c
+	fi
+}
+
+basic_fs_modes()
+{
+	if [[ $BASIC_PROFILE == full || $1 == direct-ext4-4096 ]]; then
+		printf '%s\n' single queued threaded
+	else
+		printf '%s\n' single
+	fi
+}
+
 # Map NDS APIs onto the same CMB VA windows as file_p2p c/python (phases are sequential).
 api_va_family()
 {
@@ -162,7 +208,7 @@ make_concurrent_manifest()
 
 prepare_fs_files()
 {
-	local directory=$1 block_size=$2 phase_seed=$3
+	local directory=$1 block_size=$2 phase_seed=$3 mode_count=$4
 	local i
 
 	generate_pattern "$directory/tiny.dat" 512 $((phase_seed + 1))
@@ -171,10 +217,12 @@ prepare_fs_files()
 	generate_pattern "$directory/page_cross.dat" $((4 * 1024 * 1024)) $((phase_seed + 4))
 	generate_pattern "$directory/large.dat" $((16 * 1024 * 1024)) $((phase_seed + 5))
 	generate_pattern "$directory/va_tail.dat" $((8 * block_size)) $((phase_seed + 6))
-	for i in 0 1 2 3; do
-		generate_pattern "$directory/concurrent_$i.dat" \
-			$(((i + 2) * 1024 * 1024)) $((phase_seed + 10 + i))
-	done
+	if (( mode_count > 1 )); then
+		for i in 0 1 2 3; do
+			generate_pattern "$directory/concurrent_$i.dat" \
+				$(((i + 2) * 1024 * 1024)) $((phase_seed + 10 + i))
+		done
+	fi
 	sync
 }
 
@@ -414,12 +462,14 @@ run_block_matrix()
 {
 	local target=$1 label=$2 phase_seed=$3 topology_boundary=${4:-0}
 	local size api manifest
+	local -a apis
 
 	size=$(blockdev --getsize64 "$target")
 	log "$label: writing deterministic block-device pattern"
 	generate_pattern "$target" "$size" "$phase_seed"
 	blockdev --flushbufs "$target"
-	for api in c python nds-c nds-python; do
+	mapfile -t apis < <(basic_block_apis "$label")
+	for api in "${apis[@]}"; do
 		manifest=$(make_block_manifest "$api" "$target" "$size" "$label" \
 			"$topology_boundary")
 		run_manifest "$api" "$target" single "$manifest" "$label"
@@ -438,16 +488,21 @@ run_filesystem_matrix()
 	local topology=$1 label=$2 block_size=$3 phase_seed=$4
 	local directory="$MOUNT_DIR/data"
 	local api mode manifest
+	local -a apis modes
 
 	mkdir -p "$directory"
-	prepare_fs_files "$directory" "$block_size" "$phase_seed"
-	for api in c python nds-c nds-python; do
-		manifest=$(make_single_manifest "$api" "$directory" "$label" \
-			"$block_size")
-		run_manifest "$api" "$topology" single "$manifest" "$label"
-		for mode in queued threaded; do
-			manifest=$(make_concurrent_manifest "$api" "$mode" "$directory" \
-				"$block_size" "$label")
+	mapfile -t apis < <(basic_fs_apis "$label")
+	mapfile -t modes < <(basic_fs_modes "$label")
+	prepare_fs_files "$directory" "$block_size" "$phase_seed" "${#modes[@]}"
+	for api in "${apis[@]}"; do
+		for mode in "${modes[@]}"; do
+			if [[ $mode == single ]]; then
+				manifest=$(make_single_manifest "$api" "$directory" "$label" \
+					"$block_size")
+			else
+				manifest=$(make_concurrent_manifest "$api" "$mode" "$directory" \
+					"$block_size" "$label")
+			fi
 			run_manifest "$api" "$topology" "$mode" "$manifest" "$label"
 		done
 	done
@@ -457,8 +512,10 @@ run_ext4_sizes()
 {
 	local target=$1 label=$2
 	local actual_block_size block_size phase_seed
+	local -a sizes
 
-	for block_size in 1024 2048 4096; do
+	mapfile -t sizes < <(basic_fs_sizes "$label")
+	for block_size in "${sizes[@]}"; do
 		log "$label: ext4 block size $block_size"
 		mkfs.ext4 -F -q -b "$block_size" "$target"
 		mount -o noatime "$target" "$MOUNT_DIR"
@@ -672,9 +729,11 @@ run_cq_live_smoke()
 main()
 {
 	(( $# == 0 )) || die "basic_test.sh does not accept positional arguments"
+	validate_basic_profile
 	init_work_dir xds-basic-test
 	trap cleanup EXIT
 
+	log "Basic test profile: $BASIC_PROFILE"
 	preflight
 	build_all
 	log "Checking topology discovery without target device nodes"
@@ -689,7 +748,11 @@ main()
 	"$SCRIPT_DIR/nds_api_test" --topology "$DEV1" --mode reject
 	env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
 		"$SCRIPT_DIR/python_nds_api_test.py" --topology "$DEV1" --mode reject
-	run_cq_live_smoke
+	# Fixed CQ accounting has its own bounded suite; timed live pressure
+	# remains available in the full profile and cq_race_test.sh.
+	if [[ $BASIC_PROFILE == full ]]; then
+		run_cq_live_smoke
+	fi
 	test_direct_nvme
 	test_nvme_partition
 	test_linear_dm

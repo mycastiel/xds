@@ -32,6 +32,7 @@ Optional:
   XDS_DEV_2           Second disposable NVMe namespace (default: /dev/nvme0n2)
   KSRC                 Matching kernel build tree (default: /home/xds/oe_knl)
   XDS_TEST_BUILD_JOBS Parallel build jobs passed to the test suites
+  XDS_BASIC_PROFILE  Basic coverage profile: quick (default) or full
   XDS_RUN_CQ_RACE     Include long live CQ-race stress on all topologies (0|1; default: 0)
 EOF
 }
@@ -158,7 +159,8 @@ main()
 	printf 'Kernel build tree: %s\n' "$KSRC"
 	printf 'WARNING: %s and %s will be destroyed.\n' "$DEV1" "$DEV2"
 
-	run_suite basic 1 "$SCRIPT_DIR/basic_test.sh"
+	run_suite basic 1 "XDS_BASIC_PROFILE=${XDS_BASIC_PROFILE:-quick}" \
+		"$SCRIPT_DIR/basic_test.sh"
 	# The recorded basic + RAID0 stress union covers all full-matrix lines.
 	run_suite stress-raid0 0 \
 		"XDS_STRESS_MODE=raid0" \

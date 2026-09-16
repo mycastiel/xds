@@ -319,7 +319,8 @@ run_variant()
 	boot_kernel "$variant"
 	prepare_guest "$variant"
 	save_kernel_identity "$variant"
-	run_suite "$variant" basic basic_test.sh
+	run_suite "$variant" basic basic_test.sh \
+		"XDS_BASIC_PROFILE=${XDS_BASIC_PROFILE:-quick}"
 	download_guest_artifacts "$variant" basic
 
 	# Match the coverage-based default in run_all_tests_in_vm.sh.

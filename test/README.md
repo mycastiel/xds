@@ -74,22 +74,65 @@ directory. Set
 `XDS_TEST_KEEP_WORKDIR=1` to retain logs and generated manifests after a
 successful run. Failure artifacts are always retained.
 
-The sequence is:
+## Basic coverage profiles
+
+`XDS_BASIC_PROFILE=quick` is the default. `XDS_BASIC_PROFILE=full` restores
+all of the previous combinations and the CRC-enabled live CQ smoke. The
+remote, in-VM, and dual-kernel runners forward this variable to the basic
+suite. Both kernels in a report must use the same profile.
+
+| Coverage | Quick default | Full |
+| --- | --- | --- |
+| Raw topologies | All nine, C and NDS C | All nine, all four APIs |
+| Raw Python APIs | Direct namespace 1 and RAID0 | Every topology |
+| ext4 block sizes | 1/2/4 KiB on direct NVMe; 4 KiB elsewhere | 1/2/4 KiB everywhere |
+| Filesystem API/mode combinations | All four APIs and single/queued/threaded on direct 4 KiB; C and NDS C single elsewhere | Every combination |
+| Write/read-back pipelines | C on every topology; Python on direct namespace 1 and RAID0 | C and Python everywhere |
+| Registered memory and rejection checks | Unchanged | Unchanged |
+| Timed live CQ smoke | Separate opt-in live suite | Included |
+
+The quick profile retains each selected manifest without shrinking its I/O
+sizes or dropping boundary/error cases. Fixed CQ manifest/completion checks
+remain in `cq_check_test.sh`, included by both matrix runners. Standalone
+basic testing does not run that separate suite.
+
+The recorded full basic run took 33m 12s. Quick reduces the main read matrix
+from 252 manifests / 1,320 operations to 48 / 304, and read data from
+1,624,387,584 to 411,345,920 bytes. Registered-memory and error checks are
+additional to those counts. Removed outputs contributed about 17m 29s of
+kernel-log timestamp spans, which exclude setup and portions of execution;
+the measured quick-profile runtime is recorded below. Other topology/API/block-size
+interactions receive less routine coverage and remain available in full.
+
+The quick profile subsequently passed on the same non-KASAN GCOV VM in
+**9m 06s**, versus **33m 12s** for full (72.6% less time). The run recorded
+304 main cases plus 16 registered-memory cases, 306 CRC checks, and no
+serious signatures in 97 retained kernel logs. It includes build, setup and
+cleanup, but excludes source sync and artifact download. Evidence is in
+`test-results/basic-quick-9574eb0-20260915T134424Z/` in the validation checkout.
+Separate stress and bounded CQ suites were not part of this timing.
+
+```sh
+sudo env XDS_DEV_1=/dev/nvme0n1 XDS_DEV_2=/dev/nvme0n2 \
+  XDS_BASIC_PROFILE=full ./test/basic_test.sh
+```
+
+The topology sequence is:
 
 1. Direct block-device reads and writes on both namespaces, followed by ext4
    read coverage with 1K, 2K, and 4K blocks on the first namespace.
 2. A partition on the first NVMe namespace, tested for raw reads and writes
-   and with all three ext4 block sizes for reads, then removed before
+   and with 4 KiB ext4 blocks (all three sizes in full), then removed before
    stacked-device testing.
 3. A 126 MiB dm-linear device made from the 63 MiB usable region of each
    namespace. Each segment starts at a 1 MiB underlying-device offset to match
-   the real LVM data layout. It is tested for raw reads and writes and with all
-   three ext4 block sizes for reads, and is created and removed directly with
+   the real LVM data layout. It is tested for raw reads and writes and with
+   4 KiB ext4 blocks (all sizes in full), and is created and removed with
    `dmsetup`.
 4. The same dm-linear coverage with equal-sized partitions starting at
    different namespace sectors as its components.
 5. A two-member, 64 KiB-chunk MD RAID0, tested for raw reads and writes and
-   with all three ext4 block sizes for reads.
+   with 4 KiB ext4 blocks (all sizes in full).
 6. A two-member RAID0 created with the namespace arguments reversed, verifying
    topology discovery orders components by MD slot rather than sysfs directory
    enumeration order.
@@ -101,11 +144,12 @@ The sequence is:
    checks and raw read/write coverage. Component sizes remain equal and
    chunk-aligned; data starts need not align to the chunk size.
 
-Every filesystem phase runs individual boundary cases, four queued reads of
-different files, and four simultaneous same-fd submissions. The C and Python
-APIs use separate CMB ranges.
+Every filesystem phase runs individual boundary cases. Direct 4 KiB ext4
+also runs four queued reads and four simultaneous same-fd submissions for
+all APIs; full repeats these modes everywhere. The C and Python APIs use
+separate CMB ranges.
 
-For each raw topology, both APIs run a write pipeline that first places a
+For each selected raw API/topology pair, the write pipeline first places a
 deterministic pattern into a seed range with `O_DIRECT`, reads it into three
 HBM IOVs through XDS, drains and validates the read-side HBM CRC, then writes
 the unchanged IOVs to a distinct raw range. An `O_DIRECT` host read verifies
@@ -183,7 +227,8 @@ both entry points. Shared prepared-VM and storage helpers live in `common.sh`.
 
 The default stress suite runs only the dynamic-VA workload. Fixed CQ checks
 are provided by `cq_check_test.sh`; the larger CRC-checked repetitions have
-been removed from `stress_test.sh`. Basic retains its short live CQ smoke.
+been removed from `stress_test.sh`. The full basic profile retains live CQ
+smoke; quick omits that timed CRC-enabled workload.
 For sustained submit/getevents pressure followed by drain, run
 `cq_race_test.sh` explicitly. It retains both NDS frontends and both memory
 modes, with 32 workers, 30 seconds before drain and three rounds per
@@ -230,7 +275,7 @@ NVMe functional coverage; their repeated stress suites can still be run with
 
 Set `XDS_RUN_CQ_RACE=1` to also run the long live CQ-race suite on all three
 topologies. This optional suite requests 18 minutes of overlap per kernel,
-plus setup and teardown; the default run keeps the basic CQ smoke checks.
+plus setup and teardown; the default run keeps bounded CQ accounting checks.
 The strict report requires all eight RAID0 dynamic-VA variants and all eight
 bounded CQ variants. It also accepts archived complete three-topology
 matrices that predate the separate CQ checks. Run it once after

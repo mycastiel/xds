@@ -21,6 +21,7 @@ export XDS_GUEST_DEV_1=/dev/nvme0n1
 export XDS_GUEST_DEV_2=/dev/nvme0n2
 export XDS_RESULT_DIR=$WORK_DIR/results
 export XDS_SSH_CONFIG=/tmp/xds-ssh-config
+export XDS_BASIC_PROFILE=quick
 
 # shellcheck source=run_dual_kernel_matrix.sh
 source "$SCRIPT_DIR/run_dual_kernel_matrix.sh"
@@ -96,7 +97,7 @@ test_default_suite_selection()
     local actual expected
     actual=$(run_variant nokasan)
     expected=$(printf '%s\n' \
-        'nokasan basic basic_test.sh' \
+        'nokasan basic basic_test.sh XDS_BASIC_PROFILE=quick' \
         "nokasan stress-raid0 stress_test.sh XDS_STRESS_MODE=raid0 XDS_STRESS_ITERATIONS=16" \
         "nokasan cq-check-raid0 cq_check_test.sh XDS_STRESS_MODE=raid0")
     [[ $actual == "$expected" ]]

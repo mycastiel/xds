@@ -90,3 +90,21 @@ concurrently, but its coverage must be measured again to confirm those hits.
 The baseline predates this worktree, and no new VM run or coverage collection
 has been performed. The timing figures describe the recorded GCOV run, not a
 promised runtime for the trimmed suite or for KASAN.
+
+## Further basic-suite reduction
+
+After remote basic validation measured 32m 04s and 33m 12s, the basic runner
+added `XDS_BASIC_PROFILE=quick|full` (default quick). The earlier statements
+about unchanged basic coverage describe the first trimming change. See the
+README profile table for the current selection: all topologies and targeted
+errors remain, while full cross-products and CRC-enabled live smoke are
+opt-in. The selected manifests themselves are unchanged. Local profile tests
+check representative API/mode coverage and exact manifest preservation.
+The quick profile passed on the same non-KASAN GCOV VM in 9m 06s, down from
+33m 12s (72.6% less time). Retained artifacts contain 304 main cases plus 16
+registered-memory cases, 306 CRC checks, and 97 kernel logs with no serious
+signatures. See `test-results/basic-quick-9574eb0-20260915T134424Z/` in the
+validation checkout. The initial offline model overstated main case counts
+by adding topology-boundary cases to direct NVMe devices; the model and
+README now use the actual 1,320 full / 304 quick main cases. This correction
+changes only local test modeling and documentation, not the VM-tested runner.
