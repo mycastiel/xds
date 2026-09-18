@@ -6,7 +6,7 @@ CPPFLAGS += -I../file_p2p -I..
 
 TEST_BINS := crc32_verify c_api_test mem_registration_test direct_io_test \
 	rw_api_test uapi_rw_test nds_api_test nds_example nds_bw_bench \
-	nds_crc_verify
+	nds_crc_verify npu_d2d_bw
 
 all: $(TEST_BINS)
 
@@ -65,6 +65,9 @@ nds_crc_verify: nds_crc_verify.c hbm_acl.c hbm_acl.h ../file_p2p/nds_api.c \
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ \
 		nds_crc_verify.c hbm_acl.c ../file_p2p/nds_api.c \
 		../file_p2p/p2p_common.c -ldl
+
+npu_d2d_bw: npu_d2d_bw.c hbm_acl.c hbm_acl.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ npu_d2d_bw.c hbm_acl.c -ldl
 
 clean:
 	rm -f $(TEST_BINS)
