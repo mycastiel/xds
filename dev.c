@@ -48,7 +48,7 @@
 #define P2P_MAX_EXTENTS 1048576U
 #define P2P_MAX_IOV_SIZE (2U << 30)
 #define P2P_MAX_EXTENT_SIZE ((u64)U32_MAX << SECTOR_SHIFT)
-#define P2P_MIN_PAGE_SIZE (64U << 10)
+#define P2P_MIN_PAGE_SIZE (4U << 10)
 #define P2P_MEM_COOKIE_SHIFT 48
 #define P2P_MEM_ID_MASK GENMASK_ULL(P2P_MEM_COOKIE_SHIFT - 1, 0)
 /* Power-of-two CQ; caps outstanding I/Os per batch (in-flight + unharvested). */
