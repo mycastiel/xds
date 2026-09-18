@@ -58,7 +58,6 @@ int hal_kernel_get_mem_pa_list(u32 devid, int tgid, struct ka_mem_attr *mem,
 {
 	u64 expected_pa_num;
 	u64 pa;
-	unsigned int i;
 	int err;
 
 	atomic_inc(&get_pa_calls);
@@ -74,18 +73,19 @@ int hal_kernel_get_mem_pa_list(u32 devid, int tgid, struct ka_mem_attr *mem,
 		return -EINVAL;
 
 	expected_pa_num = mem->size / STUB_PAGE_SIZE;
-	if (!expected_pa_num || expected_pa_num > U32_MAX ||
-	    *pa_num != expected_pa_num)
+	if (!expected_pa_num || expected_pa_num > U32_MAX || *pa_num < 1)
 		return -EINVAL;
 	if (check_add_overflow((u64)base_pa, mem->addr, &pa))
 		return -EOVERFLOW;
 
-	for (i = 0; i < *pa_num; i++) {
-		pa_list[i].pa = pa;
-		pa_list[i].size = STUB_PAGE_SIZE;
-		pa += STUB_PAGE_SIZE;
-	}
-
+	/*
+	 * Same contract as the real HAL: one contiguous wraper covering the
+	 * whole range, not one entry per page. *pa_num is capacity in /
+	 * segment count out.
+	 */
+	pa_list[0].pa = pa;
+	pa_list[0].size = mem->size;
+	*pa_num = 1;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(hal_kernel_get_mem_pa_list);

@@ -2,8 +2,10 @@
 #define pr_fmt(fmt) "p2p: " fmt
 
 #include <linux/errno.h>
+#include <linux/log2.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/overflow.h>
 #include <linux/slab.h>
 
 #include "mem.h"
@@ -55,28 +57,68 @@ int p2p_mem_get_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
 	struct ka_mem_attr attr;
 	struct ka_pa_wraper *wrap;
 	u64 got = pa_num;
+	u64 covered = 0;
+	u32 page_size;
 	u32 i;
+	u32 out = 0;
 	int err;
+
+	if (!process_id || !pa_list || !pa_num || !size)
+		return -EINVAL;
+	if (size % pa_num)
+		return -EINVAL;
+	page_size = size / pa_num;
+	if (!page_size || !is_power_of_2(page_size))
+		return -EINVAL;
 
 	p2p_mem_fill_attr(&attr, addr, size);
 	wrap = kvmalloc_array(pa_num, sizeof(*wrap), GFP_KERNEL);
 	if (!wrap)
 		return -ENOMEM;
 
+	/*
+	 * *pa_num is in/out: capacity in, contiguous-segment count out.
+	 * A 2 MiB hugepage comes back as one wraper {pa, size=2MiB}, not
+	 * pa_num page entries. Expand into the caller's page-granular list.
+	 */
 	err = get_mem_pa_list(process_id->devid, process_id->host_pid, &attr,
 			      &got, wrap);
 	if (err)
 		goto out;
-	if (got != pa_num) {
-		put_mem_pa_list(process_id->devid, process_id->host_pid, &attr,
-				got, wrap);
+	if (!got || got > pa_num) {
 		err = -EINVAL;
-		goto out;
+		goto put;
 	}
 
-	for (i = 0; i < pa_num; i++)
-		pa_list[i] = wrap[i].pa;
+	for (i = 0; i < got; i++) {
+		u64 off;
 
+		if (!wrap[i].size || wrap[i].size % page_size) {
+			err = -EINVAL;
+			goto put;
+		}
+		if (check_add_overflow(covered, wrap[i].size, &covered)) {
+			err = -EOVERFLOW;
+			goto put;
+		}
+		for (off = 0; off < wrap[i].size; off += page_size) {
+			if (out >= pa_num) {
+				err = -EINVAL;
+				goto put;
+			}
+			pa_list[out++] = wrap[i].pa + off;
+		}
+	}
+	if (covered != size || out != pa_num) {
+		err = -EINVAL;
+		goto put;
+	}
+	err = 0;
+	goto out;
+
+put:
+	put_mem_pa_list(process_id->devid, process_id->host_pid, &attr, got,
+			wrap);
 out:
 	kvfree(wrap);
 	return err;
@@ -99,7 +141,7 @@ void p2p_mem_put_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
 
 	for (i = 0; i < pa_num; i++) {
 		wrap[i].pa = pa_list[i];
-		wrap[i].size = 0;
+		wrap[i].size = size / pa_num;
 	}
 
 	err = put_mem_pa_list(process_id->devid, process_id->host_pid, &attr,
