@@ -169,10 +169,13 @@ int nds_unregister_fs(const struct nds_fs_desc *desc);
 
 /*
  * Pin / unpin an HBM (or CMB) VA range for P2P I/O.
- * flags must be 0. No handle is returned — use NDS_IO_F_REGISTERED_MEM and
- * vectors within that range on later submits. Unregister by the same base
- * address and exact size. A size mismatch returns -EINVAL, and any unregister
- * failure keeps the registration tracked so it can be retried.
+ * flags is the NPU udevid that owns the VA (the id passed to
+ * aclrtSetDevice). 0 is a valid device and still probes other cards if
+ * that udevid has no smp_ctx. No handle is returned — use
+ * NDS_IO_F_REGISTERED_MEM and vectors within that range on later submits.
+ * Unregister by the same base address and exact size. A size mismatch
+ * returns -EINVAL, and any unregister failure keeps the registration
+ * tracked so it can be retried.
  */
 int nds_register_mem(void *addr, uint64_t size, int flags);
 int nds_unregister_mem(void *addr, uint64_t size, int flags);

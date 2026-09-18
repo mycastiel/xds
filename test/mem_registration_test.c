@@ -148,7 +148,7 @@ static int test_validation(int dev_fd, int other_fd, const char *source,
 	struct p2p_mem_register_param bad_register = {
 		.addr = TEST_REG_ADDR,
 		.size = TEST_REG_SIZE,
-		.reserved = 1,
+		.reserved = ~0ULL,
 	};
 	struct p2p_mem_register_param zero_register = {
 		.addr = TEST_REG_ADDR,

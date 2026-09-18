@@ -200,8 +200,11 @@ int nds_register_mem(void *addr, uint64_t size, int flags)
 	struct nds_reg_entry *r;
 	int ret;
 
-	/* addr may be 0 (stub CMB window starts at VA 0). */
-	if (!size || flags)
+	/* addr may be 0 (stub CMB window starts at VA 0).
+	 * flags is the NPU udevid that owns the VA; 0 is valid and still
+	 * probes other cards if that udevid has no smp_ctx.
+	 */
+	if (!size || flags < 0 || flags > 0xFFFF)
 		return -EINVAL;
 
 	r = calloc(1, sizeof(*r));
@@ -210,6 +213,7 @@ int nds_register_mem(void *addr, uint64_t size, int flags)
 
 	p.addr = (__u64)(uintptr_t)addr;
 	p.size = size;
+	p.reserved = (__u64)flags;
 	if (ioctl(g_state.book_fd, IOCTL_REGISTER_MEM, &p) < 0) {
 		ret = -errno;
 		fprintf(stderr,

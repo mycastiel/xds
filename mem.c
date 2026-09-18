@@ -11,15 +11,12 @@
 #include "mem.h"
 
 #define P2P_DEFAULT_PAGE_SIZE (4U << 10)
-#define P2P_MAX_NS_UDEVS 64
+#define P2P_MAX_PROBE_UDEVID 64
+#define P2P_HOST_UDEVID 65
 
 static typeof(hal_kernel_get_mem_pa_list) *get_mem_pa_list;
 static typeof(hal_kernel_put_mem_pa_list) *put_mem_pa_list;
 static typeof(hal_kernel_get_mem_page_size) *get_mem_page_size;
-static typeof(uda_devid_to_udevid) *devid_to_udevid;
-static typeof(uda_get_cur_ns_dev_num) *get_cur_ns_dev_num;
-static typeof(uda_get_cur_ns_udevids) *get_cur_ns_udevids;
-static typeof(uda_get_host_id) *get_host_id;
 
 static void p2p_mem_fill_attr(struct ka_mem_attr *attr, u64 addr, u64 size)
 {
@@ -29,53 +26,68 @@ static void p2p_mem_fill_attr(struct ka_mem_attr *attr, u64 addr, u64 size)
 	attr->raw_pa_flag = false;
 }
 
-static bool p2p_udevid_already(const u32 *udevids, u32 n, u32 udevid)
+static int p2p_try_get_pa_list(u32 udevid, int tgid, struct ka_mem_attr *attr,
+			       u64 pa_num, u64 *got, struct ka_pa_wraper *wrap)
 {
-	u32 i;
-
-	for (i = 0; i < n; i++) {
-		if (udevids[i] == udevid)
-			return true;
-	}
-	return false;
+	*got = pa_num;
+	return get_mem_pa_list(udevid, tgid, attr, got, wrap);
 }
 
-static u32 p2p_collect_udevids(u32 start, u32 *udevids, u32 max)
+static int p2p_hal_get_pa_list(struct devmm_svm_process_id *process_id,
+			       struct ka_mem_attr *attr, u64 pa_num, u64 *got,
+			       struct ka_pa_wraper *wrap)
 {
-	u32 n = 0;
-	u32 mapped;
-	u32 ns_n;
-	u32 ns[P2P_MAX_NS_UDEVS];
-	u32 i;
-	u32 host;
+	u32 udevid;
+	int err;
+	int last_err;
 
-	if (!max)
-		return 0;
-	udevids[n++] = start;
+	if (process_id->udevid_valid)
+		return p2p_try_get_pa_list(process_id->devid,
+					   process_id->host_pid, attr, pa_num,
+					   got, wrap);
 
-	if (devid_to_udevid && !devid_to_udevid(start, &mapped) &&
-	    !p2p_udevid_already(udevids, n, mapped) && n < max)
-		udevids[n++] = mapped;
+	/*
+	 * v3 HAL pin is keyed by udevid. Userspace may pass a hint in
+	 * process_id->devid; if that card has no smp_ctx (-ESRCH) or the VA
+	 * is not on that card (-EINVAL), walk 0..63 and host id 65.
+	 */
+	err = p2p_try_get_pa_list(process_id->devid, process_id->host_pid, attr,
+				  pa_num, got, wrap);
+	if (!err)
+		goto got_it;
+	if (err != -ESRCH && err != -EINVAL)
+		return err;
+	last_err = err;
 
-	if (get_cur_ns_dev_num && get_cur_ns_udevids) {
-		ns_n = get_cur_ns_dev_num();
-		if (ns_n > ARRAY_SIZE(ns))
-			ns_n = ARRAY_SIZE(ns);
-		if (ns_n && !get_cur_ns_udevids(ns, ns_n)) {
-			for (i = 0; i < ns_n && n < max; i++) {
-				if (!p2p_udevid_already(udevids, n, ns[i]))
-					udevids[n++] = ns[i];
-			}
+	for (udevid = 0; udevid < P2P_MAX_PROBE_UDEVID; udevid++) {
+		if (udevid == process_id->devid)
+			continue;
+		err = p2p_try_get_pa_list(udevid, process_id->host_pid, attr,
+					  pa_num, got, wrap);
+		if (!err) {
+			process_id->devid = udevid;
+			goto got_it;
 		}
+		last_err = err;
+		if (err != -ESRCH && err != -EINVAL)
+			return err;
 	}
 
-	if (get_host_id) {
-		host = get_host_id();
-		if (!p2p_udevid_already(udevids, n, host) && n < max)
-			udevids[n++] = host;
+	if (process_id->devid != P2P_HOST_UDEVID) {
+		err = p2p_try_get_pa_list(P2P_HOST_UDEVID,
+					  process_id->host_pid, attr, pa_num,
+					  got, wrap);
+		if (!err) {
+			process_id->devid = P2P_HOST_UDEVID;
+			goto got_it;
+		}
+		last_err = err;
 	}
+	return last_err;
 
-	return n;
+got_it:
+	process_id->udevid_valid = 1;
+	return 0;
 }
 
 int p2p_mem_init(void)
@@ -98,10 +110,6 @@ int p2p_mem_init(void)
 		goto put_put_mem_pa_list;
 	}
 
-	devid_to_udevid = symbol_get(uda_devid_to_udevid);
-	get_cur_ns_dev_num = symbol_get(uda_get_cur_ns_dev_num);
-	get_cur_ns_udevids = symbol_get(uda_get_cur_ns_udevids);
-	get_host_id = symbol_get(uda_get_host_id);
 	return 0;
 
 put_put_mem_pa_list:
@@ -116,14 +124,12 @@ int p2p_mem_get_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
 {
 	struct ka_mem_attr attr;
 	struct ka_pa_wraper *wrap;
-	u32 udevids[P2P_MAX_NS_UDEVS + 2];
 	u64 covered = 0;
 	u32 page_size;
-	u32 n;
 	u32 i;
 	u32 out = 0;
 	u64 got = 0;
-	int err = -ENODEV;
+	int err;
 
 	if (!process_id || !pa_list || !pa_num || !size)
 		return -EINVAL;
@@ -138,27 +144,9 @@ int p2p_mem_get_pa_list(struct devmm_svm_process_id *process_id, u64 addr,
 	if (!wrap)
 		return -ENOMEM;
 
-	/*
-	 * HAL v3 pin is keyed by udevid. process_id->devid is 0 unless the
-	 * caller filled a logical id; smp_ctx_get(0) then returns -ESRCH.
-	 */
-	n = p2p_collect_udevids(process_id->devid, udevids,
-				ARRAY_SIZE(udevids));
-	for (i = 0; i < n; i++) {
-		got = pa_num;
-		err = get_mem_pa_list(udevids[i], process_id->host_pid, &attr,
-				      &got, wrap);
-		if (!err)
-			break;
-	}
+	err = p2p_hal_get_pa_list(process_id, &attr, pa_num, &got, wrap);
 	if (err)
 		goto out;
-	if (udevids[i] > U16_MAX) {
-		err = -EINVAL;
-		goto put;
-	}
-	process_id->devid = udevids[i];
-
 	if (!got || got > pa_num) {
 		err = -EINVAL;
 		goto put;
@@ -252,14 +240,6 @@ int p2p_mem_get_page_size(struct devmm_svm_process_id *process_id, u64 addr,
 
 void p2p_mem_exit(void)
 {
-	if (get_host_id)
-		symbol_put(uda_get_host_id);
-	if (get_cur_ns_udevids)
-		symbol_put(uda_get_cur_ns_udevids);
-	if (get_cur_ns_dev_num)
-		symbol_put(uda_get_cur_ns_dev_num);
-	if (devid_to_udevid)
-		symbol_put(uda_devid_to_udevid);
 	symbol_put(hal_kernel_get_mem_page_size);
 	symbol_put(hal_kernel_put_mem_pa_list);
 	symbol_put(hal_kernel_get_mem_pa_list);

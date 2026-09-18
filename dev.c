@@ -306,7 +306,7 @@ static void p2p_destroy_registered_mem(struct p2p_registered_mem *mem)
 	call_rcu(&mem->rcu, p2p_free_registered_mem_rcu);
 }
 
-static int p2p_pin_registered_pa(u64 addr, u64 size,
+static int p2p_pin_registered_pa(u64 addr, u64 size, u16 udevid_hint,
 				 struct p2p_pinned_pa **pinned_pa_out)
 {
 	struct p2p_pinned_pa *pinned_pa;
@@ -326,6 +326,7 @@ static int p2p_pin_registered_pa(u64 addr, u64 size,
 	if (!pinned_pa)
 		return -ENOMEM;
 	init_current_process_id(&pinned_pa->process_id);
+	pinned_pa->process_id.devid = udevid_hint;
 
 	page_size = p2p_mem_get_page_size(&pinned_pa->process_id, addr, size);
 	if (page_size < 0) {
@@ -488,7 +489,7 @@ static int p2p_register_mem(struct p2p_batch *batch, void __user *arg)
 
 	if (copy_from_user(&param, arg, sizeof(param)))
 		return -EFAULT;
-	if (param.reserved)
+	if (param.reserved > U16_MAX)
 		return -EINVAL;
 
 	mem = kzalloc(sizeof(*mem), GFP_KERNEL);
@@ -505,7 +506,8 @@ static int p2p_register_mem(struct p2p_batch *batch, void __user *arg)
 	if (err)
 		goto put_owner_tgid;
 
-	err = p2p_pin_registered_pa(mem->addr, mem->size, &mem->pinned_pa);
+	err = p2p_pin_registered_pa(mem->addr, mem->size, param.reserved,
+				    &mem->pinned_pa);
 	if (err)
 		goto exit_io_refs;
 

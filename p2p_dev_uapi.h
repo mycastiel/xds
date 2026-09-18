@@ -53,7 +53,7 @@ struct p2p_getevents_param {
 struct p2p_mem_register_param {
 	__u64 addr;
 	__u64 size;
-	__u64 reserved;
+	__u64 reserved; /* NPU udevid hint; 0 still probes other cards */
 	__u64 mem_handle;
 };
 

@@ -190,7 +190,9 @@ def main() -> int:
             raise RuntimeError(f"nds.register_fs returned {ret}")
         try:
             if register_mem:
-                ret = nds.register_mem(cmb_va, buf_span)
+                ret = nds.register_mem(
+                    cmb_va, buf_span, max(args.npu_device, 0)
+                )
                 if ret:
                     raise RuntimeError(f"register_mem returned {ret}")
             ctx = nds.io_new_ctx(qd)

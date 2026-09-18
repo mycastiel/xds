@@ -639,7 +639,8 @@ int main(int argc, char **argv)
 		die("nds_register_fs", err);
 
 	if (register_mem) {
-		err = nds_register_mem((void *)(uintptr_t)cmb_va, buf_span, 0);
+		err = nds_register_mem((void *)(uintptr_t)cmb_va, buf_span,
+				       npu_device >= 0 ? npu_device : 0);
 		if (err)
 			die("nds_register_mem", err);
 	}

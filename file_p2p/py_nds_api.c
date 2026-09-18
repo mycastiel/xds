@@ -477,7 +477,7 @@ static PyMethodDef NdsMethods[] = {
 	  "unregister_fs(fs_fds) -> int\n"
 	  "Currently a no-op; topologies remain until exit().\n" },
 	{ "register_mem", py_nds_register_mem, METH_VARARGS,
-	  "register_mem(addr, size[, flags=0]) -> int\n" },
+	  "register_mem(addr, size[, udevid=0]) -> int\n" },
 	{ "unregister_mem", py_nds_unregister_mem, METH_VARARGS,
 	  "unregister_mem(addr, size[, flags=0]) -> int\n"
 	  "size must match the registered range.\n" },

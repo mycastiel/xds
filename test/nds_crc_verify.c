@@ -325,7 +325,7 @@ int main(int argc, char **argv)
 		die("nds_register_fs", err);
 
 	if (register_mem) {
-		err = nds_register_mem(hbm.addr, alloc_size, 0);
+		err = nds_register_mem(hbm.addr, alloc_size, npu_device);
 		if (err) {
 			fprintf(stderr,
 				"nds_register_mem failed (%d): need device "
