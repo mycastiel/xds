@@ -56,7 +56,6 @@ static int stub_validate_range(u64 addr, u64 size)
 int hal_kernel_get_mem_pa_list(u32 devid, int tgid, struct ka_mem_attr *mem,
 			       u64 *pa_num, struct ka_pa_wraper *pa_list)
 {
-	u64 expected_pa_num;
 	u64 pa;
 	int err;
 
@@ -68,12 +67,8 @@ int hal_kernel_get_mem_pa_list(u32 devid, int tgid, struct ka_mem_attr *mem,
 	err = stub_validate_range(mem->addr, mem->size);
 	if (err)
 		return err;
-	if (!IS_ALIGNED(mem->addr, STUB_PAGE_SIZE) ||
-	    !IS_ALIGNED(mem->size, STUB_PAGE_SIZE))
-		return -EINVAL;
-
-	expected_pa_num = mem->size / STUB_PAGE_SIZE;
-	if (!expected_pa_num || expected_pa_num > U32_MAX || *pa_num < 1)
+	if (!IS_ALIGNED(mem->addr, SZ_4K) || !IS_ALIGNED(mem->size, SZ_4K) ||
+	    *pa_num < 1)
 		return -EINVAL;
 	if (check_add_overflow((u64)base_pa, mem->addr, &pa))
 		return -EOVERFLOW;

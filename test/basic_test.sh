@@ -55,7 +55,7 @@ make_single_manifest()
 	append_case "$manifest" "$label-va-tail" "$directory/va_tail.dat" \
 		$((8 * block_size - tail_len)) "$tail_va" "$tail_len" 0
 	append_case "$manifest" "$label-invalid-va" "$directory/tiny.dat" 0 \
-		"$CMB_SIZE" 512 -22
+		"$CMB_SIZE" 512 -34
 	printf '%s\n' "$manifest"
 }
 
@@ -96,7 +96,7 @@ make_block_manifest()
 	fi
 	append_case "$manifest" "$label-va-tail" "$source" \
 		$((source_size - tail_len)) "$tail_va" "$tail_len" 0
-	append_case "$manifest" "$label-invalid-va" "$source" 0 "$CMB_SIZE" 512 -22
+	append_case "$manifest" "$label-invalid-va" "$source" 0 "$CMB_SIZE" 512 -34
 	printf '%s\n' "$manifest"
 }
 
