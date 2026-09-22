@@ -18,6 +18,10 @@ struct p2p_iov {
 #define P2P_IO_READ 0U
 #define P2P_IO_WRITE 1U
 
+/* Raw extent access; shared extents are permitted only for reads. */
+#define P2P_FIEMAP_SUPPORTED_FLAGS \
+	(FIEMAP_EXTENT_LAST | FIEMAP_EXTENT_MERGED | FIEMAP_EXTENT_UNWRITTEN | FIEMAP_EXTENT_SHARED)
+
 /*
  * Fixed-size request; iov and extents are userspace pointers.
  * One batch item is one logical I/O covering all iov/extents and completing

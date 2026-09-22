@@ -1376,9 +1376,7 @@ static struct block_device *p2p_bdev_from_file(struct file *file, u32 op)
 	struct super_block *sb;
 
 	if (op == P2P_IO_WRITE) {
-		if (S_ISREG(inode->i_mode))
-			return ERR_PTR(-EOPNOTSUPP);
-		if (!S_ISBLK(inode->i_mode))
+		if (!S_ISBLK(inode->i_mode) && !S_ISREG(inode->i_mode))
 			return ERR_PTR(-EINVAL);
 		if (!(file->f_mode & FMODE_WRITE))
 			return ERR_PTR(-EBADF);
@@ -1416,25 +1414,35 @@ static int validate_io_param(const struct p2p_io_param *param)
 	return param->host_pid <= 0 ? -EINVAL : 0;
 }
 
-static int validate_write_range(const struct p2p_io_param *param,
-				const struct fiemap_extent *extents, struct block_device *bdev)
+static int validate_io_extents(const struct p2p_io_param *param,
+			       const struct fiemap_extent *extents, struct block_device *bdev,
+			       struct file *file)
 {
-	const struct fiemap_extent *extent;
 	u64 capacity_sectors;
-	u64 length_sectors;
-	u64 start_sector;
+	u64 next = extents[0].fe_logical;
+	bool regular = S_ISREG(file_inode(file)->i_mode);
+	unsigned int i;
 
-	if (param->op != P2P_IO_WRITE)
-		return 0;
-	if (param->ext_nr != 1)
+	if (param->op == P2P_IO_WRITE && !regular && param->ext_nr != 1)
 		return -EINVAL;
 
-	extent = &extents[0];
-	start_sector = extent->fe_physical >> SECTOR_SHIFT;
-	length_sectors = extent->fe_length >> SECTOR_SHIFT;
 	capacity_sectors = p2p_bdev_nr_sectors(bdev);
-	if (start_sector > capacity_sectors || length_sectors > capacity_sectors - start_sector)
-		return -EFBIG;
+	for (i = 0; i < param->ext_nr; i++) {
+		const struct fiemap_extent *extent = &extents[i];
+		u64 start_sector = extent->fe_physical >> SECTOR_SHIFT;
+		u64 length_sectors = extent->fe_length >> SECTOR_SHIFT;
+
+		if ((extent->fe_flags & ~P2P_FIEMAP_SUPPORTED_FLAGS) ||
+		    (param->op == P2P_IO_WRITE && (extent->fe_flags & FIEMAP_EXTENT_SHARED)))
+			return -EOPNOTSUPP;
+		if (regular &&
+		    ((extent->fe_logical & (SECTOR_SIZE - 1)) || extent->fe_logical != next ||
+		     check_add_overflow(next, extent->fe_length, &next) || next > S64_MAX))
+			return -EINVAL;
+		if (param->op == P2P_IO_WRITE && (start_sector > capacity_sectors ||
+						  length_sectors > capacity_sectors - start_sector))
+			return -EFBIG;
+	}
 
 	return 0;
 }
@@ -1517,7 +1525,7 @@ static int p2p_submit_one(struct p2p_batch *batch, const struct p2p_io_param *pa
 		err = PTR_ERR(bdev);
 		goto put_reg_file;
 	}
-	err = validate_write_range(param, extents, bdev);
+	err = validate_io_extents(param, extents, bdev, reg_file);
 	if (err)
 		goto put_reg_file;
 	topo = topo_get(bdev);
