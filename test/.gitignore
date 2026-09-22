@@ -11,3 +11,6 @@
 /nds_bw_bench
 /nds_crc_verify
 /topo_devt_test
+/prepare_extents_test
+/file_raw_write_test
+/nds_file_prepare_test

@@ -276,10 +276,9 @@ run_logged_mem_registration_case()
 	fi
 }
 
-run_logged_write_rejection_case()
+run_logged_rw_case()
 {
-	local api=$1
-	local label="rw-rejection.$api.rejection"
+	local label=$1
 	local output="$WORK_DIR/$label.out"
 	local kernel_log="$WORK_DIR/$label.dmesg"
 	local status
@@ -294,8 +293,16 @@ run_logged_write_rejection_case()
 	cat "$output"
 	if (( status != 0 )); then
 		cat "$kernel_log" >&2
-		die "$api unified read/write rejection tests failed"
+		die "$label read/write tests failed"
 	fi
+}
+
+run_logged_write_rejection_case()
+{
+	local api=$1
+
+	shift
+	run_logged_rw_case "rw-rejection.$api.rejection" "$@"
 }
 
 run_logged_coverage_errors()
@@ -526,6 +533,14 @@ run_ext4_sizes()
 		phase_seed=$SEED
 		run_filesystem_matrix "$target" "$label-ext4-$block_size" \
 			"$block_size" "$phase_seed"
+		# DEV2 must be independent scratch, never a mounted DM/MD component.
+		if [[ $label == direct ]]; then
+			log "Regular-file raw write coverage"
+			run_logged_rw_case "file-raw-$block_size.c.rw-write" \
+				"$SCRIPT_DIR/file_raw_write_test" --topology "$target" \
+				--scratch "$DEV2" --directory "$MOUNT_DIR/data" \
+				--cmb-va $((96 * 1024 * 1024 - 512))
+		fi
 		umount "$MOUNT_DIR"
 	done
 }
@@ -539,12 +554,20 @@ test_direct_nvme()
 	next_seed
 	run_block_matrix "$DEV1" direct-nsid-1 "$SEED"
 	log "Unified read/write API rejection coverage"
-	run_logged_write_rejection_case c \
-		"$SCRIPT_DIR/uapi_rw_test" --target "$DEV1"
-	run_logged_write_rejection_case python env \
-		"PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
-		"$SCRIPT_DIR/python_rw_rejection_test.py" \
-		--regular-file "$WORK_DIR/python-regular-write.dat"
+	# The checkout may be on Btrfs, which has no s_bdev for raw file I/O.
+	# Keep the regular fixture on ext4, with only DEV1 registered by the test.
+	mkfs.ext4 -F -q -b 4096 "$DEV2"
+	mount -o noatime "$DEV2" "$MOUNT_DIR"
+	(
+		cd "$MOUNT_DIR"
+		run_logged_write_rejection_case c \
+			"$SCRIPT_DIR/uapi_rw_test" --target "$DEV1"
+		run_logged_write_rejection_case python env \
+			"PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
+			"$SCRIPT_DIR/python_rw_rejection_test.py" \
+			--regular-file "$MOUNT_DIR/python-regular-write.dat"
+	)
+	umount "$MOUNT_DIR"
 	for api in c python; do
 		run_write_pipeline "$DEV1" direct-nsid-1-registered \
 			"$((SEED + 200))" 0 "$api" registered
@@ -734,8 +757,12 @@ main()
 	trap cleanup EXIT
 
 	log "Basic test profile: $BASIC_PROFILE"
+	cd "$REPO_ROOT"
 	preflight
 	build_all
+	log "Host-only regular-write extent preparation tests"
+	"$SCRIPT_DIR/prepare_extents_test"
+	"$SCRIPT_DIR/nds_file_prepare_test"
 	log "Checking topology discovery without target device nodes"
 	"$SCRIPT_DIR/topo_devt_test"
 	crc_self_test

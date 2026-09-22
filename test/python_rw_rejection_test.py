@@ -21,7 +21,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--regular-file", required=True, type=Path)
     args = parser.parse_args()
-    args.regular_file.write_bytes(b"\0" * 4096)
+    # Leave the file empty so the write path's fallocate, not buffered
+    # delayed-allocation writes, creates the extents before FIEMAP.
+    args.regular_file.write_bytes(b"")
     iovs = [(0, 512)]
 
     require(
@@ -30,11 +32,14 @@ def main() -> int:
                          str(args.regular_file), 0, iovs, 0, 0),
         -errno.EINVAL,
     )
+    # Regular-file writes are no longer rejected with EOPNOTSUPP. Extent
+    # preparation (fallocate + FIEMAP) runs first and the invalid device fd
+    # fails the submit ioctl with EBADF.
     require(
         "regular file write",
         file_p2p.rw_file(-1, file_p2p.P2P_IO_WRITE,
                          str(args.regular_file), 0, iovs, 0, 0),
-        -errno.EOPNOTSUPP,
+        -errno.EBADF,
     )
     require(
         "negative host pid",

@@ -20,6 +20,36 @@ sys.modules[SPEC.name] = REPORT
 SPEC.loader.exec_module(REPORT)
 
 
+REJECTION_CASES = {
+    "c": (
+        ("unknown operation", -22),
+        ("unknown flags", -95),
+        ("regular file write without topology", -19),
+        ("read-only regular fd", -9),
+        ("read-only block fd", -9),
+        ("shared write extent", -95),
+        ("delalloc write extent", -95),
+        ("block multi-extent write", -22),
+        ("regular logical gap", -22),
+        ("regular multi-extent write without topo", -19),
+        ("regular second extent capacity", -27),
+        ("rejection-left-no-event", 0),
+        ("insufficient extent coverage", -7),
+        ("out-of-capacity range", -27),
+        ("batch invalid first", -22),
+        ("batch-reject-left-no-event", 0),
+        ("userspace unknown operation", -22),
+        ("userspace regular file write", -9),
+    ),
+    "python": (
+        ("unknown operation", -22),
+        ("regular file write", -9),
+        ("negative host pid", -22),
+        ("registered host pid", -22),
+    ),
+}
+
+
 def write_identity(directory: Path, variant: str) -> None:
     kasan = variant == "kasan"
     config = "CONFIG_KASAN=y" if kasan else "# CONFIG_KASAN is not set"
@@ -102,22 +132,7 @@ def create_complete_fixture(base: Path) -> None:
                     (directory / f"{label}.dmesg").write_text(
                         "", encoding="utf-8"
                     )
-        rejection_cases = {
-            "c": (
-                ("unknown operation", -22),
-                ("unknown flags", -95),
-                ("regular file write", -95),
-                ("read-only block fd", -9),
-                ("insufficient extent coverage", -7),
-                ("out-of-capacity range", -27),
-                ("userspace unknown operation", -22),
-                ("userspace regular file write", -95),
-            ),
-            "python": (
-                ("unknown operation", -22),
-                ("regular file write", -95),
-            ),
-        }
+        rejection_cases = REJECTION_CASES
         for api, cases in rejection_cases.items():
             label = f"rw-rejection.{api}.rejection"
             output = "".join(
@@ -179,12 +194,15 @@ class ReportTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             report = json.loads(json_path.read_text(encoding="utf-8"))
+            rejection_count = sum(
+                len(cases) for cases in REJECTION_CASES.values()
+            )
             expected_per_kernel = (
                 1
                 + len(REPORT.STRESS_APIS)
                 * len(REPORT.STRESS_MEMORY_MODES)
                 * 3
-                + 10
+                + rejection_count
                 + len(REPORT.expected_cq_check_labels())
                 * REPORT.CQ_CHECK_WORKERS * REPORT.CQ_CHECK_ITERATIONS
                 + len(REPORT.expected_stress_labels())

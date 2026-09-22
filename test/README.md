@@ -160,8 +160,28 @@ were not emitted.
 
 The first namespace also runs the write pipeline with registered memory for
 both APIs. Separate rejection tests cover invalid operations, registration
-reserved fields, unknown flags, regular-file writes, read-only block-device
-descriptors, insufficient extent coverage, and ranges beyond device capacity.
+reserved fields, unknown flags, read-only file/device descriptors, shared
+write extents, logical gaps, insufficient coverage, and device capacity.
+
+Regular-file writes run on direct-NVMe ext4 filesystems with 1/2/4 KiB
+blocks, using the independent second namespace as raw seed/scratch storage.
+`file_raw_write_test` checks empty-file growth, unwritten readback,
+fragmented mappings, nonzero overwrites with guards, and registered memory.
+It verifies payload through independent FIEMAP-based block-device reads
+and poisoned XDS readback. It also checks that unwritten metadata remains
+unwritten. Ordinary file reads are not the oracle for these raw writes.
+This phase never uses a mounted DM/MD component as scratch storage.
+
+The rejection tests temporarily mount ext4 on the second namespace for
+their regular-file fixtures. Only the first namespace is registered in
+the UAPI test context, so valid file extents stop at topology lookup.
+This avoids relying on the checkout filesystem to expose a block device.
+
+`prepare_extents_test` runs locally without XDS devices and covers real
+allocation plus controlled FIEMAP errors, flags, and coverage.
+`nds_file_prepare_test` checks batch preparation side effects using real
+files and mocked submission. Both are built by `make -C test` and run
+before the VM data-transfer phases.
 
 The direct first-namespace phase also runs the C and Python registered-memory
 tests. They register one sector-aligned but device-page-unaligned CMB range,
