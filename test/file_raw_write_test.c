@@ -543,6 +543,23 @@ static void test_library_errors(const char *dir)
 static void test_raw_bdev_regression(int dev_fd, const char *target, unsigned long cmb_va)
 {
 	unsigned char pattern[4096];
+	unsigned char expected[12288];
+	unsigned long destination = RAW_BASE + (8U << 20);
+	struct p2p_iov iov = { .addr = cmb_va, .size = sizeof(pattern) };
+	struct fiemap_extent extents[2] = {
+		{ .fe_physical = destination + 8192, .fe_length = 2048 },
+		{ .fe_physical = destination, .fe_length = 2048 },
+	};
+	struct p2p_io_param io = {
+		.op = P2P_IO_WRITE,
+		.host_pid = getpid(),
+		.iov = (uint64_t)(uintptr_t)&iov,
+		.iov_nr = 1,
+		.extents = (uint64_t)(uintptr_t)extents,
+		.ext_nr = 2,
+	};
+	struct p2p_io_batch_param batch = { .items = (uint64_t)(uintptr_t)&io, .nr = 1 };
+	int fd;
 	int err;
 
 	fill_pattern(pattern, sizeof(pattern), 0x4444);
@@ -558,6 +575,34 @@ static void test_raw_bdev_regression(int dev_fd, const char *target, unsigned lo
 	pass("raw-bdev-write", err, 0);
 	if (!err)
 		verify_direct(target, pattern, 4096, RAW_BASE + (8U << 20), "raw-bdev-verify");
+	if (err)
+		return;
+
+	/* Scatter source halves in reverse disk order, preserving the gap and tail. */
+	memset(expected, 0xa5, sizeof(expected));
+	err = odirect_write(target, expected, sizeof(expected), destination);
+	pass("raw-multi-extent-guards", err, 0);
+	if (err)
+		return;
+	fd = open(target, O_WRONLY | O_CLOEXEC);
+	if (fd < 0) {
+		pass("raw-multi-extent-open", -errno, 0);
+		return;
+	}
+	io.file_fd = fd;
+	err = ioctl(dev_fd, IOCTL_SUBMIT_IO, &batch);
+	pass("raw-multi-extent-submit", err < 0 ? -errno : err, 1);
+	if (err == 1) {
+		err = drain_io(dev_fd);
+		pass("raw-multi-extent-drain", err, 0);
+		if (!err) {
+			memcpy(expected + 8192, pattern, 2048);
+			memcpy(expected, pattern + 2048, 2048);
+			verify_direct(target, expected, sizeof(expected), destination,
+				      "raw-multi-extent-readback");
+		}
+	}
+	close(fd);
 }
 
 int main(int argc, char **argv)

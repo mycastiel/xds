@@ -173,9 +173,13 @@ unwritten. Ordinary file reads are not the oracle for these raw writes.
 This phase never uses a mounted DM/MD component as scratch storage.
 
 The rejection tests temporarily mount ext4 on the second namespace for
-their regular-file fixtures. Only the first namespace is registered in
-the UAPI test context, so valid file extents stop at topology lookup.
+their regular-file fixtures. The UAPI rejection test registers no
+topology, so valid file and block-device extents stop at topology lookup.
 This avoids relying on the checkout filesystem to expose a block device.
+
+Raw block-device coverage also submits multiple extents directly through
+the ioctl, checking source mapping in reverse disk order and untouched
+gaps. The library continues to construct one extent per block request.
 
 `prepare_extents_test` runs locally without XDS devices and covers real
 allocation plus controlled FIEMAP errors, flags, and coverage.

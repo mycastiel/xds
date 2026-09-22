@@ -153,10 +153,6 @@ int main(int argc, char **argv)
 		err = dev_fd;
 		goto out;
 	}
-	err = add_topo(dev_fd, target);
-	if (err)
-		goto out;
-
 	items[0].op = P2P_IO_WRITE;
 	items[0].host_pid = getpid();
 	items[0].file_fd = write_fd;
@@ -267,7 +263,7 @@ int main(int argc, char **argv)
 		goto out;
 	extent.fe_flags = 0;
 
-	/* Block-device writes still require exactly one extent. */
+	/* Multiple block-device extents pass validation without issuing I/O. */
 	extents[0].fe_logical = 0;
 	extents[0].fe_physical = capacity - 4096;
 	extents[0].fe_length = 512;
@@ -277,7 +273,11 @@ int main(int argc, char **argv)
 	items[0].ext_nr = 2;
 	items[0].extents = (uint64_t)(uintptr_t)extents;
 	iov.size = 1024;
-	err = expect("block multi-extent write", issue(dev_fd, &items[0]), -EINVAL);
+	err = expect("block multi-extent write without topo", issue(dev_fd, &items[0]), -ENODEV);
+	if (err)
+		goto out;
+	extents[1].fe_physical = capacity;
+	err = expect("block second extent capacity", issue(dev_fd, &items[0]), -EFBIG);
 	if (err)
 		goto out;
 

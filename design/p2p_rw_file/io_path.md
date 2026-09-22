@@ -100,8 +100,9 @@ Only LAST, MERGED, UNWRITTEN, and SHARED extent flags are understood.
 SHARED is accepted for reads but rejected for writes to avoid bypassing
 COW. Unknown, delayed, encrypted, compressed, inline, tail-packed, and
 unaligned extents are rejected. The kernel repeats flag and file-range
-structural checks and checks capacity for every write extent. Raw
-block-device writes still use one synthetic extent. The ioctl does not
+structural checks and checks capacity for every write extent. The library
+uses one synthetic extent for block devices; the kernel accepts multiple
+extents for both reads and writes. The ioctl does not
 allocate space or prove ownership of caller-supplied physical addresses; it
 remains a trusted raw-I/O interface.
 

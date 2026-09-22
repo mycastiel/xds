@@ -555,7 +555,7 @@ test_direct_nvme()
 	run_block_matrix "$DEV1" direct-nsid-1 "$SEED"
 	log "Unified read/write API rejection coverage"
 	# The checkout may be on Btrfs, which has no s_bdev for raw file I/O.
-	# Keep the regular fixture on ext4, with only DEV1 registered by the test.
+	# Keep the regular fixture on ext4; rejection tests register no topology.
 	mkfs.ext4 -F -q -b 4096 "$DEV2"
 	mount -o noatime "$DEV2" "$MOUNT_DIR"
 	(

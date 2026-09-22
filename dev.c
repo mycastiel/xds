@@ -1423,9 +1423,6 @@ static int validate_io_extents(const struct p2p_io_param *param,
 	bool regular = S_ISREG(file_inode(file)->i_mode);
 	unsigned int i;
 
-	if (param->op == P2P_IO_WRITE && !regular && param->ext_nr != 1)
-		return -EINVAL;
-
 	capacity_sectors = p2p_bdev_nr_sectors(bdev);
 	for (i = 0; i < param->ext_nr; i++) {
 		const struct fiemap_extent *extent = &extents[i];

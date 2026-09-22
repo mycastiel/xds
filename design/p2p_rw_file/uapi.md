@@ -81,6 +81,12 @@ fe_physical = file_offset
 fe_length   = sum(iov[].size)
 ```
 
+The library emits one synthetic extent for its contiguous block-device
+requests. Direct ioctl callers may supply multiple extents for either
+direction. IOV bytes are mapped to physical extents in array order;
+`fe_logical` is unused for block devices. Completion order is unspecified,
+so callers must avoid overlapping write destinations within a request.
+
 The same pointed-to extent array is used for both operations. Regular-file
 writes use library preallocation followed by FIEMAP; direct ioctl callers
 are responsible for preparing allocated, stable mappings. Both directions
