@@ -98,6 +98,21 @@ static inline struct class *p2p_class_create(const char *name)
 
 #else
 
+/*
+ * Private prefix of Linux 6.6's struct nvme_request through status.
+ * Keep the field layout in sync with drivers/nvme/host/nvme.h.
+ */
+struct p2p_nvme_request {
+	struct nvme_command *cmd;
+	union nvme_result result;
+	u8 genctr;
+	u8 retries;
+	u8 flags;
+	u16 status;
+};
+
+#define P2P_NVME_REQ_CANCELLED (1 << 0)
+
 extern void nvme_init_request(struct request *req, struct nvme_command *cmd);
 
 typedef struct bdev_handle p2p_bdev_handle;
@@ -115,9 +130,19 @@ static inline struct request *p2p_alloc_nvme_request(struct request_queue *queue
 	return req;
 }
 
+static inline blk_status_t p2p_nvme_passthrough_status(struct request *req, blk_status_t status)
+{
+	struct p2p_nvme_request *nr = blk_mq_rq_to_pdu(req);
+
+	/* Batched passthrough completion reports block success even on NVMe errors. */
+	if (status == BLK_STS_OK && ((nr->flags & P2P_NVME_REQ_CANCELLED) || nr->status))
+		return BLK_STS_IOERR;
+	return status;
+}
+
 static inline enum rq_end_io_ret p2p_end_io(struct request *req, blk_status_t status)
 {
-	p2p_complete_io(req, status);
+	p2p_complete_io(req, p2p_nvme_passthrough_status(req, status));
 
 	return RQ_END_IO_FREE;
 }
