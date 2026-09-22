@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <linux/fs.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,7 +15,7 @@
 
 #include "file_p2p_api.h"
 
-#define PATTERN_SIZE (256U << 10)
+#define PATTERN_SIZE (1U << 20)
 #define SEED_OFFSET (8U << 20)
 #define SCRATCH_OFFSET (16U << 20)
 #define RAW_BASE (24U << 20)
@@ -32,6 +33,14 @@ static void pass(const char *name, long got, long want)
 	}
 	fprintf(stderr, "FAIL %s: got %ld, want %ld\n", name, got, want);
 	failures++;
+}
+
+static void pass_file_case(const char *kind, const char *step, long got, long want)
+{
+	char name[80];
+
+	snprintf(name, sizeof(name), "%s-%s", kind, step);
+	pass(name, got, want);
 }
 
 static void fill_pattern(unsigned char *buffer, size_t length, uint64_t seed)
@@ -159,6 +168,47 @@ static int query_fiemap(const char *path, off_t offset, off_t length, struct ext
 		}
 	}
 	return (int)buf.fm.fm_mapped_extents;
+}
+
+static int verify_unwritten(const char *path, size_t length)
+{
+	unsigned int max_extents = length / 512 + 1;
+	struct fiemap *fm = calloc(1, sizeof(*fm) + max_extents * sizeof(struct fiemap_extent));
+	size_t next = 0;
+	unsigned int i;
+	int fd;
+	int err = -ENOMEM;
+
+	if (!fm)
+		return err;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		err = -errno;
+		goto out;
+	}
+	fm->fm_length = length;
+	fm->fm_extent_count = max_extents;
+	err = ioctl(fd, FS_IOC_FIEMAP, fm) ? -errno : 0;
+	close(fd);
+	if (err)
+		goto out;
+	err = -ENODATA;
+	for (i = 0; i < fm->fm_mapped_extents && next < length; i++) {
+		const struct fiemap_extent *ex = &fm->fm_extents[i];
+
+		if (ex->fe_logical != next || !ex->fe_length)
+			goto out;
+		if (!(ex->fe_flags & FIEMAP_EXTENT_UNWRITTEN)) {
+			err = -EINVAL;
+			goto out;
+		}
+		next += ex->fe_length < length - next ? ex->fe_length : length - next;
+	}
+	if (next == length)
+		err = 0;
+out:
+	free(fm);
+	return err;
 }
 
 /* Independent oracle: read each FIEMAP mapping directly from the filesystem
@@ -303,48 +353,64 @@ static void verify_via_xds(int dev_fd, const char *file_path, const char *scratc
 	free(poison);
 }
 
-static void test_hole_write(int dev_fd, const char *dir, const char *target, unsigned long cmb_va)
+static void test_sparse_roundtrip(int dev_fd, const char *dir, const char *target,
+				  unsigned long cmb_va, bool truncate_file)
 {
-	char path[512];
+	const char *kind = truncate_file ? "truncate" : "empty";
+	char path[512], readback_case[80];
+	struct stat st;
 	unsigned char *pattern;
 	int fd;
 	int err;
 
-	snprintf(path, sizeof(path), "%s/xds-hole-write.dat", dir);
+	snprintf(path, sizeof(path), "%s/xds-%s-write.dat", dir, kind);
 	unlink(path);
 	fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
 	if (fd < 0) {
-		pass("hole-create", -errno, 0);
+		pass_file_case(kind, "create", -errno, 0);
 		return;
 	}
+	err = truncate_file && ftruncate(fd, PATTERN_SIZE) ? -errno : 0;
+	if (truncate_file)
+		pass_file_case(kind, "ftruncate", err, 0);
+	if (!err) {
+		err = fstat(fd, &st) ? -errno : 0;
+		pass_file_case(kind, "initial-stat", err, 0);
+		if (!err)
+			pass_file_case(kind, "initial-size", st.st_size,
+				       truncate_file ? PATTERN_SIZE : 0);
+	}
 	close(fd);
+	if (err)
+		goto unlink_file;
+	pass_file_case(kind, "initial-hole", query_fiemap(path, 0, PATTERN_SIZE, NULL), 0);
 
 	pattern = malloc(PATTERN_SIZE);
 	if (!pattern) {
-		pass("hole-alloc", -ENOMEM, 0);
-		unlink(path);
-		return;
+		pass_file_case(kind, "alloc", -ENOMEM, 0);
+		goto unlink_file;
 	}
-	fill_pattern(pattern, PATTERN_SIZE, 0x1111);
+	fill_pattern(pattern, PATTERN_SIZE, truncate_file ? 0x4444 : 0x1111);
 	err = seed_cmb(dev_fd, target, cmb_va, pattern, PATTERN_SIZE);
-	pass("hole-seed-cmb", err, 0);
+	pass_file_case(kind, "seed-cmb", err, 0);
 	if (!err) {
 		err = xds_rw(dev_fd, P2P_IO_WRITE, path, 0, cmb_va, PATTERN_SIZE);
-		pass("hole-write-fallocate", err, 0);
+		pass_file_case(kind, "xds-write", err, 0);
 		if (!err) {
-			struct stat st;
-
 			err = stat(path, &st) ? -errno : 0;
-			pass("empty-file-stat", err, 0);
+			pass_file_case(kind, "final-stat", err, 0);
 			if (!err)
-				pass("empty-file-growth", st.st_size, PATTERN_SIZE);
+				pass_file_case(kind, "final-size", st.st_size, PATTERN_SIZE);
 		}
 	}
-	if (!err)
-		verify_via_xds(dev_fd, path, target, cmb_va, pattern, PATTERN_SIZE,
-			       "hole-xds-readback");
+	if (!err) {
+		snprintf(readback_case, sizeof(readback_case), "%s-xds-readback", kind);
+		verify_via_xds(dev_fd, path, target, cmb_va, pattern, PATTERN_SIZE, readback_case);
+		pass_file_case(kind, "final-unwritten", verify_unwritten(path, PATTERN_SIZE), 0);
+	}
 
 	free(pattern);
+unlink_file:
 	unlink(path);
 }
 
@@ -396,7 +462,7 @@ static void test_unwritten_roundtrip(int dev_fd, const char *dir, const char *ta
 
 	err = query_fiemap(path, 0, PATTERN_SIZE, &ex);
 	pass("unwritten-post-mapped", err > 0 ? 0 : -ENODATA, 0);
-	pass("unwritten-after-write", !!(ex.flags & FIEMAP_EXTENT_UNWRITTEN), 1);
+	pass("unwritten-after-write", verify_unwritten(path, PATTERN_SIZE), 0);
 	free(pattern);
 	unlink(path);
 }
@@ -677,7 +743,8 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	test_hole_write(dev_fd, directory, scratch, cmb_va);
+	test_sparse_roundtrip(dev_fd, directory, scratch, cmb_va, false);
+	test_sparse_roundtrip(dev_fd, directory, scratch, cmb_va, true);
 	test_unwritten_roundtrip(dev_fd, directory, scratch, cmb_va);
 	test_fragmented_write(dev_fd, directory, scratch, cmb_va);
 	test_guarded_overwrite(dev_fd, directory, scratch, cmb_va);
@@ -692,6 +759,8 @@ int main(int argc, char **argv)
 		pass("regular-register-memory", err, 0);
 		if (!err) {
 			registered_handle = reg.mem_handle;
+			test_sparse_roundtrip(dev_fd, directory, scratch, cmb_va, false);
+			test_sparse_roundtrip(dev_fd, directory, scratch, cmb_va, true);
 			test_unwritten_roundtrip(dev_fd, directory, scratch, cmb_va);
 			test_guarded_overwrite(dev_fd, directory, scratch, cmb_va);
 			unreg.mem_handle = registered_handle;

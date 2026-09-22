@@ -165,8 +165,11 @@ write extents, logical gaps, insufficient coverage, and device capacity.
 
 Regular-file writes run on direct-NVMe ext4 filesystems with 1/2/4 KiB
 blocks, using the independent second namespace as raw seed/scratch storage.
-`file_raw_write_test` checks empty-file growth, unwritten readback,
-fragmented mappings, nonzero overwrites with guards, and registered memory.
+`file_raw_write_test` checks 1 MiB XDS write/read roundtrips for empty
+files and sparse files sized with `ftruncate`, in both transient and
+registered memory modes. Each roundtrip compares every byte and checks
+that all extents covering the final file remain unwritten. It also checks
+preallocated unwritten files, fragmented mappings, and guarded overwrites.
 It verifies payload through independent FIEMAP-based block-device reads
 and poisoned XDS readback. It also checks that unwritten metadata remains
 unwritten. Ordinary file reads are not the oracle for these raw writes.
