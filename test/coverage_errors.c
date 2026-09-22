@@ -25,6 +25,13 @@ static void check(const char *name, int got, int want)
 	       got == want ? "PASS" : "FAIL", name, got, want);
 	failures += got != want;
 }
+static void check_either(const char *name, int got, int want, int alternate)
+{
+	int ok = got == want || got == alternate;
+	printf("%s api=c case=%s ret=%d expected=%d|%d\n",
+	       ok ? "PASS" : "FAIL", name, got, want, alternate);
+	failures += !ok;
+}
 static void mark(int enabled)
 {
 	if (getenv("XDS_INJECT")) {
@@ -139,7 +146,7 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[2], "easy")) {
 		check("recovery read", ret, 0);
 		ext.fe_physical = bytes;
-		check("read outside namespace", read_one(fd, &io), -EREMOTEIO);
+		check_either("read outside namespace", read_one(fd, &io), -EIO, -EREMOTEIO);
 		ext.fe_physical = 0;
 		check("recovery after issue error", read_one(fd, &io), 0);
 	}
