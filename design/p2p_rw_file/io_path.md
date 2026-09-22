@@ -14,7 +14,7 @@ rw_file(P2P_IO_READ)
                                    shared extent-based I/O engine
                                   /
 rw_file(P2P_IO_WRITE)
-    regular file -> -EOPNOTSUPP
+    regular file -> fallocate -> FIEMAP extents
     block device -> one synthetic extent
 ```
 
@@ -50,7 +50,7 @@ The two operations differ only where the direction has real meaning:
 | Memory role | NVMe destination | NVMe source |
 | NVMe opcode | `nvme_cmd_read` | `nvme_cmd_write` |
 | Block request operation | `REQ_OP_DRV_IN` | `REQ_OP_DRV_OUT` |
-| Target type | Regular file or block device | Block device only |
+| Target type | File or block device | File or block device |
 | File access | Read-capable | Write-capable |
 | Buffer CRC and content dump | Optional after completion | Not performed |
 
@@ -73,6 +73,48 @@ synthetic extent.  XDS validates and maps that range but does not provide:
 - page-cache invalidation; or
 - coordination with mounted filesystem users.
 
-The caller is responsible for exclusive logical ownership of the destination
-range.  Rejecting regular-file writes is the boundary that prevents the first
-write implementation from implying filesystem semantics it cannot provide.
+The caller is responsible for exclusive logical ownership of the
+destination range. Regular-file support uses the separate raw storage
+contract below; it does not imply ordinary filesystem write semantics.
+
+## 5. Raw file-backed storage
+
+The library validates the operation, buffers, aligned logical range, and
+write access before `fallocate(fd, 0, offset, length)`. Mode zero grows the
+file when needed; KEEP_SIZE and ZERO_RANGE are not used. Allocation
+failures propagate without a truncate or host-copy fallback. Reads and
+block devices skip this step. The library then obtains FIEMAP extents and
+trims them to the exact request. Mappings must cover the range in logical
+order without holes or overlaps. Physical ranges retain the existing sector
+alignment constraints.
+
+Both directions accept UNWRITTEN extents. They expose raw device contents,
+not filesystem-synthesized zeroes. Only ranges successfully written by XDS
+are valid for XDS readback. A failed write can leave partial data. Ordinary
+file reads can still return zeros even after successful XDS writes because
+there is no unwritten-to-written conversion. fsync and FIEMAP_FLAG_SYNC do
+not perform that conversion. Normal file copying/backup is not a reliable
+way to preserve this raw payload.
+
+Only LAST, MERGED, UNWRITTEN, and SHARED extent flags are understood.
+SHARED is accepted for reads but rejected for writes to avoid bypassing
+COW. Unknown, delayed, encrypted, compressed, inline, tail-packed, and
+unaligned extents are rejected. The kernel repeats flag and file-range
+structural checks and checks capacity for every write extent. Raw
+block-device writes still use one synthetic extent. The ioctl does not
+allocate space or prove ownership of caller-supplied physical addresses; it
+remains a trusted raw-I/O interface.
+
+Callers must exclusively manage the file and keep its mapping stable from
+FIEMAP through completion. Do not mix buffered/mmap writes, truncate, hole
+punching, reflinking, snapshots that introduce sharing, or extent
+relocation with XDS access. Opening a file does not pin its extent mapping.
+The module provides no filesystem cache invalidation or mapping lock. Fresh
+files used only through XDS are the intended initial use case.
+
+Preparation is synchronous and may block on allocation or metadata I/O.
+nds_io_submit prepares a batch before kernel acceptance: even an unaccepted
+item can leave allocated space or a larger file. No automatic rollback is
+performed. Completion retains the existing non-atomic, non-durable
+contract. Large reusable files can be preallocated to amortize allocation
+work; this does not authorize caching stale mappings.

@@ -214,7 +214,7 @@ ssize_t nds_io_pwrite(struct nds_io_ctx *ctx, struct nds_io_obj *obj,
 | Unknown flags or unsupported opcode/obj type | `-EOPNOTSUPP` |
 | Inconsistent registered/one-shot fields | `-EINVAL` |
 | Inflight capacity exhausted at submit head | `-EAGAIN` |
-| Write to regular file | `-EOPNOTSUPP` |
+| File allocation failure | errno from fallocate; no I/O submitted |
 | Missing topology / unsupported layout | as returned by `add_topo` / kernel |
 | Stale or foreign `mem_handle` | as returned by kernel (`-ENOENT` / `-EPERM`, etc.) |
 

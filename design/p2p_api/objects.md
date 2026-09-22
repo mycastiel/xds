@@ -33,12 +33,13 @@ Unknown `type` values → `-EOPNOTSUPP`.
 | Opcode | Regular file | Block device |
 | --- | --- | --- |
 | `NDS_IO_OP_PREAD` / `PREADV` | supported | supported |
-| `NDS_IO_OP_PWRITE` / `PWRITEV` | `-EOPNOTSUPP` | supported |
+| `NDS_IO_OP_PWRITE` / `PWRITEV` | supported (raw semantics) | supported |
 
-This matches the authoritative kernel/userspace rules of `rw_file`: writes do
-not allocate file blocks or maintain page-cache coherency.
+As in `rw_file`, the library preallocates regular-file writes before
+FIEMAP. The kernel accesses raw extents without page-cache coherency or
+unwritten-extent conversion.
 
-`offset` is a byte offset: logical file offset for regular-file reads, raw
+`offset` is a byte offset: logical file offset for regular-file I/O, raw
 byte offset for block devices.
 
 ## 4. PATH vs FD resolution
@@ -46,12 +47,13 @@ byte offset for block devices.
 ### 4.1 `NDS_IO_OBJ_FD`
 
 - The descriptor must refer to a regular file or a block device.
-- Read opens are expected readable; write requires a writable block fd.
-- The library does not take ownership of the caller's fd; it may `dup` or pass
-  the fd number into the existing ioctl packing path as today's `file_fd`
-  field requires.  Prefer the same lifetime model as `rw_file`: the fd must
-  remain valid through accept; kernel `fget` holds it for the I/O context
-  until drain/retirement.
+- Read opens are expected readable; write requires a writable regular-file
+  or block-device fd.
+- The library does not take ownership of the caller's fd; it may `dup` or
+  pass the fd number into the existing ioctl packing path as today's
+  `file_fd` field requires.  Prefer the same lifetime model as `rw_file`:
+  the fd must remain valid through accept; kernel `fget` holds it for the
+  I/O context until drain/retirement.
 
 ### 4.2 `NDS_IO_OBJ_PATH`
 

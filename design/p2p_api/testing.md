@@ -62,14 +62,18 @@ reports cover both APIs.
 
 Mirror `basic_test.sh` intent at least for:
 
-- direct NVMe raw read/write pipelines (seed → HBM → writeback → host verify);
+- direct NVMe raw read/write pipelines (seed → HBM → writeback → host
+  verify);
 - both **registered** and **one-shot** HBM modes;
 - ext4 read coverage (1K/2K/4K) on the first namespace;
 - partition / dm-linear / RAID0 phases as the NDS facade matures (first
   landing may stage topology expansion, but the **target** is parity with
   basic_test’s topology set — not permanent direct-NVMe-only);
 - CRC + debugfs checks on reads when `CALC_CRC32` is enabled;
-- rejection: regular-file write → `-EOPNOTSUPP`; bad mem flags; `OBJ_ID`.
+- regular-file preallocation and raw XDS write/readback, including
+  unwritten extents;
+- rejection: read-only file write; shared-extent write; bad mem flags;
+  `OBJ_ID`.
 
 ### 3.2 NDS stress requirements
 

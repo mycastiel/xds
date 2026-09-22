@@ -255,12 +255,14 @@ struct nds_io_event {
 Notes:
 
 - For `PREAD`/`PWRITE`, `buf_addr`/`buf_len` describe one contiguous HBM
-  range.  For `PREADV`/`PWRITEV`, `buf_addr` points to an array of `{addr,len}`
-  pairs and `buf_len` is the count (v1 may implement *V by translating to the
-  existing multi-`p2p_iov` path).
-- Write to a regular file remains `-EOPNOTSUPP` (same rule as `rw_file`).
-- Memory mode is **explicit** on each I/O via `rw_flags` / `mem_handle` (see
-  section 3.4).  The library must **not** silently infer registered vs
+  range.  For `PREADV`/`PWRITEV`, `buf_addr` points to an array of
+  `{addr,len}` pairs and `buf_len` is the count (v1 may implement *V by
+  translating to the existing multi-`p2p_iov` path).
+- Regular-file writes preallocate before FIEMAP, then use raw XDS extent
+  I/O without filesystem coherence or unwritten-extent conversion (as
+  `rw_file`).
+- Memory mode is **explicit** on each I/O via `rw_flags` / `mem_handle`
+  (see section 3.4).  The library must **not** silently infer registered vs
   one-shot only from whether `buf_addr` falls in a previously registered
   range; that would hide which kernel path is used.
 
@@ -552,7 +554,7 @@ unknown rw_flags bits → -EOPNOTSUPP
 resolve obj:
   PATH → open; FD → use; ID → -EOPNOTSUPP
 if target is bdev → ensure add_topo(cached)
-if write && regular file → -EOPNOTSUPP
+if write && regular file → fallocate(mode 0), then FIEMAP (raw semantics)
 memory mode:
   if rw_flags & NDS_IO_F_REGISTERED_MEM:
     require mem_handle != 0

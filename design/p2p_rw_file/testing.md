@@ -2,10 +2,11 @@
 
 ## 1. Destructive test boundary
 
-Write testing uses only disposable block devices in the prepared XDS VM.  The
-test environment rejects mounted devices, active swap, and block devices with
-unexpected holders before allowing a write.  No write test targets a regular
-file, mounted filesystem, or production device.
+Write testing uses only disposable block devices in the prepared XDS VM.
+The test environment rejects mounted devices, active swap, and block
+devices with unexpected holders before allowing a raw block-device write.
+Regular-file cases use only files on disposable VM filesystems. No
+production device is a write target.
 
 The existing CMB-backed physical-memory environment remains the source-memory
 provider.  Every test source range and destination range is owned exclusively
@@ -87,8 +88,8 @@ mapping:
 - MD RAID0 mappings, including chunk boundaries, member order, and partition
   members.
 
-These targets remain raw and unmounted during write testing.  Filesystem phases
-remain read-only coverage and are not reused as write targets.
+Raw-device cases remain unmounted. Separate filesystem phases exercise
+regular-file writes on disposable filesystems.
 
 Within each topology, deterministic cases cover:
 
@@ -106,11 +107,12 @@ Both the C and Python bindings use `rw_file()` for reads and writes.  The test
 contract verifies that the operation field selects the direction and that the
 same IOV and registered-memory interfaces work in both directions.
 
-Negative cases are rejected before any NVMe command is submitted and leave the
-destination unchanged.  They cover:
+Negative cases are rejected before any NVMe command is submitted. Library
+preallocation may already have changed file size or allocated blocks.  They
+cover:
 
 - an unknown operation value;
-- a regular-file write;
+- a regular-file write through a read-only fd;
 - a block-device file descriptor without write access;
 - zero, unaligned, overflowing, or out-of-capacity ranges;
 - insufficient extent coverage;
@@ -147,3 +149,20 @@ After each phase, generic I/O accounting must show no inflight requests and the
 expected issue or completion failures.  Write-only kernel logs must contain no
 write CRC or PA-content dump.  Direction-tagged submission and error logs remain
 available for diagnosing a failed case.
+
+## 7. Regular-file write coverage
+
+Cover allocation of empty files, nonzero offsets and growth, initialized
+extent overwrites, unwritten readback, fragmented multiple extents, and
+registered as well as one-shot source memory. Wait for write completion
+before XDS readback. Also verify payload and guards through an independent
+uncached read of the mapped blocks in the isolated VM. Ordinary pread of
+unwritten extents may return zero and is not the payload oracle.
+
+Local preparation tests cover allocation-before-FIEMAP ordering, allocation
+failure propagation, read/bdev allocation bypass, signed offset overflow,
+read-only fds, shared-write rejection, unsupported flags, and missing,
+overlapping, unordered, or overflowing extent ranges. Kernel tests exercise
+multi-extent write capacity and structural checks without allowing invalid
+requests to reach NVMe submission. Batch tests distinguish preparation side
+effects from accepted I/O and completion counts.
