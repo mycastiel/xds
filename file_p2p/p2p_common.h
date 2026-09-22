@@ -23,15 +23,14 @@ int p2p_del_topo(int dev_fd, dev_t dev_id);
  * @dev_fd. Returns 0 or -errno. */
 int p2p_del_topo_fd(int dev_fd, int topo_fd);
 
-/* Build FIEMAP (or synthetic block-dev) extents covering [offset, size).
+/* Build extents covering [offset, offset + size), preallocating regular writes.
+ * Unwritten extents are raw storage: only previously XDS-written bytes are valid.
  * Caller frees *exts_out. Returns 0 or -errno. */
-int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat,
-			   unsigned long offset, unsigned long size,
-			   struct fiemap **exts_out, unsigned int *ext_num_out,
-			   unsigned long long *total_size_out);
+int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat, unsigned int op,
+			   unsigned long offset, unsigned long size, struct fiemap **exts_out,
+			   unsigned int *ext_num_out, unsigned long long *total_size_out);
 
 /* Sum iov[].size with sector-alignment checks. Returns 0 or -errno. */
-int p2p_get_iov_size(const struct p2p_iov *iov, unsigned int iov_nr,
-		     unsigned long *size_out);
+int p2p_get_iov_size(const struct p2p_iov *iov, unsigned int iov_nr, unsigned long *size_out);
 
 #endif

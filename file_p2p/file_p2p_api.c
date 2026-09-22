@@ -108,13 +108,8 @@ int rw_file(int dev_fd, const struct io_parameter *param)
 		goto close_fds_out;
 	}
 
-	if (param->op == P2P_IO_WRITE && !S_ISBLK(file_stat.st_mode)) {
-		err = S_ISREG(file_stat.st_mode) ? -EOPNOTSUPP : -EINVAL;
-		goto close_fds_out;
-	}
-
-	err = p2p_prepare_io_extents(file_fd, &file_stat, param->file_offset, io_size, &exts, &ext_num,
-				     &total_size);
+	err = p2p_prepare_io_extents(file_fd, &file_stat, param->op, param->file_offset, io_size,
+				     &exts, &ext_num, &total_size);
 	if (err) {
 		fprintf(stderr, "prepare extents failed, errno: %d\n", err);
 		goto close_fds_out;

@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,11 +27,6 @@
 #define P2P_SECTORS_PER_KB (1024U / P2P_SECTOR_SIZE)
 #define P2P_DM_CONTROL "/dev/mapper/control"
 #define P2P_DM_BUFFER_SIZE (16U << 10)
-#define P2P_UNSUPPORTED_FIEMAP_FLAGS \
-	(FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC | \
-	 FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED | \
-	 FIEMAP_EXTENT_NOT_ALIGNED | FIEMAP_EXTENT_DATA_INLINE | \
-	 FIEMAP_EXTENT_DATA_TAIL | FIEMAP_EXTENT_UNWRITTEN)
 
 struct raid0_member {
 	int slot;
@@ -712,55 +710,64 @@ static int is_sector_aligned(unsigned long long value)
 	return !(value & (P2P_SECTOR_SIZE - 1));
 }
 
-static int trim_fiemap_extents(struct fiemap_extent *extents,
-			       unsigned int ext_num, unsigned long offset,
-			       unsigned long size, unsigned int *trimmed_ext_num,
-			       unsigned long long *total_size)
+static int trim_fiemap_extents(struct fiemap_extent *extents, unsigned int ext_num, unsigned int op,
+			       unsigned long offset, unsigned long size,
+			       unsigned int *trimmed_ext_num, unsigned long long *total_size)
 {
 	unsigned long long request_start = offset;
 	unsigned long long request_end = request_start + size;
 	unsigned long long total = 0;
+	unsigned long long next = request_start;
 	unsigned int out = 0;
 	unsigned int i;
 
 	for (i = 0; i < ext_num; i++) {
 		struct fiemap_extent extent = extents[i];
 		unsigned long long extent_start = extent.fe_logical;
-		unsigned long long extent_end = extent_start + extent.fe_length;
+		unsigned long long extent_end;
 		unsigned long long trim_start;
 		unsigned long long trim_end;
 
+		if (!extent.fe_length ||
+		    __builtin_add_overflow(extent_start, extent.fe_length, &extent_end) ||
+		    extent.fe_physical > ULLONG_MAX - extent.fe_length)
+			return -EINVAL;
 		if (extent_end <= request_start || extent_start >= request_end)
 			continue;
-		if (extent.fe_flags & P2P_UNSUPPORTED_FIEMAP_FLAGS) {
-			fprintf(stderr,
-				"unsupported FIEMAP extent flags 0x%x at extent %u\n",
+		if ((extent.fe_flags & ~P2P_FIEMAP_SUPPORTED_FLAGS) ||
+		    (op == P2P_IO_WRITE && (extent.fe_flags & FIEMAP_EXTENT_SHARED))) {
+			fprintf(stderr, "unsupported FIEMAP extent flags 0x%x at extent %u\n",
 				extent.fe_flags, i);
 			return -EOPNOTSUPP;
 		}
 
-		trim_start = extent_start > request_start ?
-			     extent_start : request_start;
+		trim_start = extent_start > request_start ? extent_start : request_start;
 		trim_end = extent_end < request_end ? extent_end : request_end;
 		if (trim_end <= trim_start)
 			continue;
+		if (trim_start != next)
+			return -ENODATA;
 
 		extent.fe_physical += trim_start - extent_start;
 		extent.fe_logical = trim_start;
 		extent.fe_length = trim_end - trim_start;
+		if (!is_sector_aligned(extent.fe_physical) || !is_sector_aligned(extent.fe_length))
+			return -EINVAL;
 		extents[out++] = extent;
 		total += extent.fe_length;
+		next = trim_end;
 	}
 
+	if (next != request_end)
+		return -ENODATA;
 	*trimmed_ext_num = out;
 	*total_size = total;
 	return 0;
 }
 
-int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat,
-			   unsigned long offset, unsigned long size,
-			   struct fiemap **exts_out, unsigned int *ext_num_out,
-			   unsigned long long *total_size_out)
+int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat, unsigned int op,
+			   unsigned long offset, unsigned long size, struct fiemap **exts_out,
+			   unsigned int *ext_num_out, unsigned long long *total_size_out)
 {
 	struct fiemap *exts;
 	unsigned int block_size;
@@ -770,10 +777,14 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat,
 	unsigned long long query_length;
 	int err;
 
-	if (S_ISBLK(file_stat->st_mode)) {
-		if (!is_sector_aligned(offset) || !is_sector_aligned(size))
-			return -EINVAL;
+	if (op != P2P_IO_READ && op != P2P_IO_WRITE)
+		return -EINVAL;
+	if (!size || !is_sector_aligned(offset) || !is_sector_aligned(size))
+		return -EINVAL;
+	if (offset > ULONG_MAX - size)
+		return -EOVERFLOW;
 
+	if (S_ISBLK(file_stat->st_mode)) {
 		exts = alloc_fiemap(1);
 		if (!exts)
 			return -ENOMEM;
@@ -789,7 +800,14 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat,
 
 	if (!S_ISREG(file_stat->st_mode))
 		return -EINVAL;
+	/* fallocate uses signed file offsets; reject before changing the file. */
+	if (offset > INT64_MAX || size > INT64_MAX - offset ||
+	    (sizeof(off_t) < sizeof(int64_t) && (offset > INT32_MAX || size > INT32_MAX - offset)))
+		return -EOVERFLOW;
 
+	if (file_stat->st_blksize <= 0 || file_stat->st_blksize > UINT_MAX ||
+	    (file_stat->st_blksize & (file_stat->st_blksize - 1)))
+		return -EINVAL;
 	block_size = file_stat->st_blksize;
 	err = calc_fiemap_extent_count(offset, size, block_size, &max_num);
 	if (err)
@@ -808,26 +826,47 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat,
 	exts->fm_flags = 0;
 	exts->fm_extent_count = max_num;
 
+	if (op == P2P_IO_WRITE) {
+		int flags = fcntl(file_fd, F_GETFL);
+
+		if (flags < 0) {
+			err = -errno;
+			goto free_exts;
+		}
+		if ((flags & O_ACCMODE) == O_RDONLY) {
+			err = -EBADF;
+			goto free_exts;
+		}
+		if (fallocate(file_fd, 0, (off_t)offset, (off_t)size)) {
+			err = -errno;
+			goto free_exts;
+		}
+	}
+
 	err = ioctl(file_fd, FS_IOC_FIEMAP, exts);
 	if (err) {
 		err = -errno;
 		fprintf(stderr, "ioctl FS_IOC_FIEMAP failed, errno: %d\n", err);
-		free(exts);
-		return err;
+		goto free_exts;
+	}
+	if (exts->fm_mapped_extents > max_num) {
+		err = -EINVAL;
+		goto free_exts;
 	}
 
-	err = trim_fiemap_extents(exts->fm_extents, exts->fm_mapped_extents,
-				  offset, size, ext_num_out, total_size_out);
-	if (err) {
-		free(exts);
-		return err;
-	}
+	err = trim_fiemap_extents(exts->fm_extents, exts->fm_mapped_extents, op, offset, size,
+				  ext_num_out, total_size_out);
+	if (err)
+		goto free_exts;
 	*exts_out = exts;
 	return 0;
+
+free_exts:
+	free(exts);
+	return err;
 }
 
-int p2p_get_iov_size(const struct p2p_iov *iov, unsigned int iov_nr,
-		     unsigned long *size_out)
+int p2p_get_iov_size(const struct p2p_iov *iov, unsigned int iov_nr, unsigned long *size_out)
 {
 	unsigned long size = 0;
 	unsigned int i;
@@ -836,11 +875,9 @@ int p2p_get_iov_size(const struct p2p_iov *iov, unsigned int iov_nr,
 		return -EINVAL;
 
 	for (i = 0; i < iov_nr; i++) {
-		if (!iov[i].size || iov[i].reserved ||
-		    ((iov[i].addr | iov[i].size) &
-		     (P2P_SECTOR_SIZE - 1)) ||
-		    UINT64_MAX - iov[i].addr < iov[i].size ||
-		    ULONG_MAX - size < iov[i].size)
+		if (!iov[i].size || iov[i].size > (2U << 30) || iov[i].reserved ||
+		    ((iov[i].addr | iov[i].size) & (P2P_SECTOR_SIZE - 1)) ||
+		    UINT64_MAX - iov[i].addr < iov[i].size || ULONG_MAX - size < iov[i].size)
 			return -EINVAL;
 		size += iov[i].size;
 	}

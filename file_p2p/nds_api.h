@@ -104,7 +104,7 @@ struct nds_io_obj {
 };
 
 #define NDS_IO_OP_PREAD  0u	/* read one or more buffers */
-#define NDS_IO_OP_PWRITE 1u	/* write one or more buffers (block dev only) */
+#define NDS_IO_OP_PWRITE 1u /* write one or more buffers */
 
 /* Buffer was previously registered with nds_register_mem(). */
 #define NDS_IO_F_REGISTERED_MEM (1u << 0)
@@ -123,6 +123,12 @@ struct nds_io_vec {
  * With NDS_IO_F_REGISTERED_MEM, iov[0] selects a region previously passed to
  * nds_register_mem(); the kernel requires every vector to fit that region.
  * Otherwise buffers are one-shot.
+ *
+ * Regular writes preallocate before FIEMAP, even if later submission fails.
+ * File I/O accesses raw extents, including unwritten extents, without cache
+ * coherence or unwritten conversion. Only successfully XDS-written ranges
+ * are valid for raw readback; normal file reads may still return zeros.
+ * Callers must exclusively manage files and keep mappings stable through I/O.
  */
 struct nds_io_cb {
 	uint32_t opcode;		/* NDS_IO_OP_* */

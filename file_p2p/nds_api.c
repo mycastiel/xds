@@ -363,7 +363,9 @@ static int validate_nds_iov(const struct nds_io_cb *cb, unsigned long *io_size)
 	if (!cb->iov || !cb->iov_cnt || cb->iov_cnt > NDS_IO_MAX_IOV)
 		return -EINVAL;
 	for (i = 0; i < cb->iov_cnt; i++) {
-		if (!cb->iov[i].buf_len || cb->iov[i].reserved)
+		if (!cb->iov[i].buf_len || cb->iov[i].buf_len > (2U << 30) || cb->iov[i].reserved ||
+		    ((cb->iov[i].buf_addr | cb->iov[i].buf_len) & 511U) ||
+		    cb->iov[i].buf_addr > UINT64_MAX - cb->iov[i].buf_len)
 			return -EINVAL;
 		if (__builtin_add_overflow(size, (unsigned long)cb->iov[i].buf_len, &size))
 			return -EINVAL;
@@ -372,8 +374,7 @@ static int validate_nds_iov(const struct nds_io_cb *cb, unsigned long *io_size)
 	return 0;
 }
 
-static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
-				struct p2p_io_param *io,
+static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd, struct p2p_io_param *io,
 				struct fiemap **exts_out)
 {
 	struct fiemap *exts = NULL;
@@ -390,8 +391,7 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 	err = validate_nds_iov(cb, &io_size);
 	if (err)
 		return err;
-	if (cb->offset > ULONG_MAX ||
-	    io_size > ULONG_MAX - (unsigned long)cb->offset)
+	if (cb->offset > ULONG_MAX || io_size > ULONG_MAX - (unsigned long)cb->offset)
 		return -EOVERFLOW;
 
 	if (cb->rw_flags & NDS_IO_F_REGISTERED_MEM) {
@@ -406,20 +406,19 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 
 	if (fstat(file_fd, &file_stat) < 0) {
 		err = -errno;
-		fprintf(stderr, "nds: fstat fd %d failed, errno: %d\n",
-			file_fd, err);
+		fprintf(stderr, "nds: fstat fd %d failed, errno: %d\n", file_fd, err);
 		return err;
 	}
 
-	err = p2p_prepare_io_extents(file_fd, &file_stat, cb->offset, io_size,
-				     &exts, &ext_num, &total_size);
+	err = p2p_prepare_io_extents(file_fd, &file_stat,
+				     cb->opcode == NDS_IO_OP_PWRITE ? P2P_IO_WRITE : P2P_IO_READ,
+				     cb->offset, io_size, &exts, &ext_num, &total_size);
 	if (err) {
 		fprintf(stderr, "nds: prepare extents failed, errno: %d\n", err);
 		return err;
 	}
 	if (!ext_num || total_size < io_size) {
-		fprintf(stderr, "nds: extent size %llu < IOV size %lu\n",
-			total_size, io_size);
+		fprintf(stderr, "nds: extent size %llu < IOV size %lu\n", total_size, io_size);
 		free(exts);
 		return -ENODATA;
 	}
