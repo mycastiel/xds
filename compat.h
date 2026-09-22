@@ -17,6 +17,8 @@
 
 #define P2P_LEGACY_KERNEL
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+
 #define P2P_NVME_QID_ANY (-1)
 
 /*
@@ -30,10 +32,6 @@ struct p2p_nvme_request {
 struct request *nvme_alloc_request(struct request_queue *q,
 				   struct nvme_command *cmd,
 				   blk_mq_req_flags_t flags, int qid);
-
-typedef struct block_device p2p_bdev_handle;
-
-#define P2P_BDEV_READ_MODE FMODE_READ
 
 static inline struct request *p2p_alloc_nvme_request(struct request_queue *queue,
 						     struct nvme_command *cmd)
@@ -61,6 +59,31 @@ static inline void p2p_end_io(struct request *req, blk_status_t status)
 	blk_mq_free_request(req);
 }
 
+#else /* Ubuntu 22.04 / Linux 5.15 */
+
+struct request *nvme_alloc_request(struct request_queue *q,
+				  struct nvme_command *cmd,
+				  blk_mq_req_flags_t flags);
+
+static inline struct request *p2p_alloc_nvme_request(struct request_queue *queue,
+						     struct nvme_command *cmd)
+{
+	/* nvme_alloc_request() copies cmd into driver-owned request storage. */
+	return nvme_alloc_request(queue, cmd, 0);
+}
+
+static inline void p2p_end_io(struct request *req, blk_status_t status)
+{
+	p2p_complete_io(req, status);
+	blk_mq_free_request(req);
+}
+
+#endif
+
+typedef struct block_device p2p_bdev_handle;
+
+#define P2P_BDEV_READ_MODE FMODE_READ
+
 static inline p2p_bdev_handle *p2p_bdev_open_by_dev(dev_t dev)
 {
 	return blkdev_get_by_dev(dev, FMODE_READ, NULL);
@@ -78,7 +101,11 @@ static inline struct block_device *p2p_handle_to_bdev(p2p_bdev_handle *handle)
 
 static inline struct block_device *p2p_bdev_whole(struct block_device *bdev)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
 	return bdev->bd_contains;
+#else
+	return bdev_whole(bdev);
+#endif
 }
 
 static inline sector_t p2p_bdev_nr_sectors(struct block_device *bdev)
@@ -88,7 +115,11 @@ static inline sector_t p2p_bdev_nr_sectors(struct block_device *bdev)
 
 static inline void p2p_execute_rq_nowait(struct request *req, struct gendisk *disk)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
 	blk_execute_rq_nowait(req->q, disk, req, true, req->end_io);
+#else
+	blk_execute_rq_nowait(disk, req, true, req->end_io);
+#endif
 }
 
 static inline struct class *p2p_class_create(const char *name)
