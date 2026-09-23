@@ -805,7 +805,7 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat, unsigned i
 	    (sizeof(off_t) < sizeof(int64_t) && (offset > INT32_MAX || size > INT32_MAX - offset)))
 		return -EOVERFLOW;
 
-	if (file_stat->st_blksize <= 0 || file_stat->st_blksize > UINT_MAX ||
+	if (file_stat->st_blksize <= 0 || (uint64_t)file_stat->st_blksize > UINT_MAX ||
 	    (file_stat->st_blksize & (file_stat->st_blksize - 1)))
 		return -EINVAL;
 	block_size = file_stat->st_blksize;
