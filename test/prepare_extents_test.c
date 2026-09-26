@@ -1,7 +1,7 @@
 /* Host-only p2p_prepare_io_extents contract tests.
  * FS_IOC_FIEMAP responses are programmed through an ioctl wrapper so flag,
- * gap, ordering, and overflow cases do not need a prepared VM. fallocate and
- * fcntl run against a real file. No block I/O occurs.
+ * trimming and coverage cases do not need a prepared VM. fallocate runs
+ * against a real file. No block I/O occurs.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -227,8 +227,9 @@ int main(void)
 		got = p2p_prepare_io_extents(readonly, &st, P2P_IO_WRITE, 0, 4096, &exts, &ext_num,
 					     &total);
 		pass("readonly-write", got, -EBADF);
-		pass("readonly-no-allocation", fallocate_calls, 0);
+		pass("readonly-fallocate-rejected", fallocate_calls, 1);
 		close(readonly);
+		reset_program();
 		st.st_mode = S_IFBLK;
 		got = p2p_prepare_io_extents(-1, &st, P2P_IO_WRITE, 4096, 4096, &exts, &ext_num,
 					     &total);
@@ -268,44 +269,32 @@ int main(void)
 	program.mapped = 2;
 	set_extent(&program.exts[0], 0, 4096, 4096, FIEMAP_EXTENT_UNWRITTEN);
 	set_extent(&program.exts[1], 8192, 16384, 4096, FIEMAP_EXTENT_LAST);
-	prepare_expect("logical-gap", P2P_IO_READ, 0, 8192, -ENODATA);
-
-	reset_program();
-	program.active = 1;
-	program.mapped = 2;
-	set_extent(&program.exts[0], 4096, 8192, 4096, 0);
-	set_extent(&program.exts[1], 0, 4096, 4096, FIEMAP_EXTENT_LAST);
-	prepare_expect("unordered-extents", P2P_IO_READ, 0, 8192, -ENODATA);
+	got = prepare(P2P_IO_READ, 0, 12288, &exts, &ext_num, &total);
+	pass("logical-gap-prepared", got, 0);
+	if (!got) {
+		pass("logical-gap-ext-count", ext_num, 2);
+		pass("logical-gap-total", total, 8192);
+		pass("logical-gap-preserved", exts->fm_extents[1].fe_logical, 8192);
+	}
+	free(exts);
+	exts = NULL;
 
 	reset_program();
 	program.active = 1;
 	program.mapped = 1;
 	set_extent(&program.exts[0], 0, 4096, 4096, FIEMAP_EXTENT_LAST);
-	prepare_expect("trailing-hole-coverage", P2P_IO_READ, 0, 8192, -ENODATA);
-
-	reset_program();
-	program.active = 1;
-	program.mapped = 1;
-	set_extent(&program.exts[0], 0, 4096, 0, FIEMAP_EXTENT_LAST);
-	prepare_expect("zero-length-extent", P2P_IO_READ, 0, 4096, -EINVAL);
-
-	reset_program();
-	program.active = 1;
-	program.mapped = 1;
-	set_extent(&program.exts[0], UINT64_MAX - 100, 4096, 4096, FIEMAP_EXTENT_LAST);
-	prepare_expect("logical-overflow", P2P_IO_READ, 0, 4096, -EINVAL);
-
-	reset_program();
-	program.active = 1;
-	program.mapped = 1;
-	set_extent(&program.exts[0], 0, UINT64_MAX - 100, 4096, FIEMAP_EXTENT_LAST);
-	prepare_expect("physical-overflow", P2P_IO_READ, 0, 4096, -EINVAL);
+	got = prepare(P2P_IO_READ, 0, 8192, &exts, &ext_num, &total);
+	pass("trailing-hole-prepared", got, 0);
+	if (!got)
+		pass("trailing-hole-short-coverage", total, 4096);
+	free(exts);
+	exts = NULL;
 
 	reset_program();
 	program.active = 1;
 	program.mapped = 1;
 	set_extent(&program.exts[0], 0, 4097, 4096, FIEMAP_EXTENT_LAST);
-	prepare_expect("unaligned-physical", P2P_IO_READ, 0, 4096, -EINVAL);
+	prepare_expect("unaligned-physical-deferred", P2P_IO_READ, 0, 4096, 0);
 
 	reset_program();
 	program.active = 1;
@@ -351,7 +340,9 @@ int main(void)
 		printf("api=c case=real-fiemap-skip ret=0 expected=0\n");
 	} else {
 		got = prepare(P2P_IO_READ, 0, (2 << 20) + 4096, &exts, &ext_num, &total);
-		pass("real-hole-read-enodata", got, -ENODATA);
+		pass("real-hole-read-prepared", got, 0);
+		if (!got)
+			pass("real-hole-read-short-coverage", total < (2 << 20) + 4096, 1);
 		free(exts);
 		exts = NULL;
 

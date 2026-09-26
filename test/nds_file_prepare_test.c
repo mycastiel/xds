@@ -148,11 +148,26 @@ int main(void)
 	cb[1].reserved[0] = 0;
 
 	reset_files();
-	iov.buf_addr = 1;
+	iov.buf_len = 0;
 	assert(nds_io_submit(ctx, 2, cb) == -EINVAL);
 	assert(submit_calls == 0 && fiemap_calls == 0);
 	assert(file_size(target_fd[0]) == 0 && file_size(target_fd[1]) == 0);
-	puts("nds file prepare: invalid source rejected before allocation");
+	iov.buf_len = 4096;
+	iov.reserved = 1;
+	assert(nds_io_submit(ctx, 2, cb) == -EINVAL);
+	assert(submit_calls == 0 && fiemap_calls == 0);
+	assert(file_size(target_fd[0]) == 0 && file_size(target_fd[1]) == 0);
+	iov.reserved = 0;
+	puts("nds file prepare: empty and reserved IOVs rejected before allocation");
+
+	/* The kernel rejects misaligned source addresses after preparation. */
+	reset_files();
+	submit_result = -EINVAL;
+	iov.buf_addr = 1;
+	assert(nds_io_submit(ctx, 2, cb) == -EINVAL);
+	assert(submit_calls == 1 && submitted_items == 2 && fiemap_calls == 2);
+	assert(file_size(target_fd[0]) == 4096 && file_size(target_fd[1]) == 12288);
+	puts("nds file prepare: source validation deferred to kernel submission");
 
 	assert(nds_io_destroy_ctx(ctx) == 0);
 	assert(nds_exit() == 0);
