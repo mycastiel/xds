@@ -701,8 +701,7 @@ static int calc_fiemap_extent_count(unsigned long offset, unsigned long size,
 
 static struct fiemap *alloc_fiemap(unsigned int extent_count)
 {
-	return calloc(1, sizeof(struct fiemap) +
-		      extent_count * sizeof(struct fiemap_extent));
+	return calloc(1, sizeof(struct fiemap) + extent_count * sizeof(struct fiemap_extent));
 }
 
 static int is_sector_aligned(unsigned long long value)
@@ -717,21 +716,16 @@ static int trim_fiemap_extents(struct fiemap_extent *extents, unsigned int ext_n
 	unsigned long long request_start = offset;
 	unsigned long long request_end = request_start + size;
 	unsigned long long total = 0;
-	unsigned long long next = request_start;
 	unsigned int out = 0;
 	unsigned int i;
 
 	for (i = 0; i < ext_num; i++) {
 		struct fiemap_extent extent = extents[i];
 		unsigned long long extent_start = extent.fe_logical;
-		unsigned long long extent_end;
+		unsigned long long extent_end = extent_start + extent.fe_length;
 		unsigned long long trim_start;
 		unsigned long long trim_end;
 
-		if (!extent.fe_length ||
-		    __builtin_add_overflow(extent_start, extent.fe_length, &extent_end) ||
-		    extent.fe_physical > ULLONG_MAX - extent.fe_length)
-			return -EINVAL;
 		if (extent_end <= request_start || extent_start >= request_end)
 			continue;
 		if ((extent.fe_flags & ~P2P_FIEMAP_SUPPORTED_FLAGS) ||
@@ -745,21 +739,14 @@ static int trim_fiemap_extents(struct fiemap_extent *extents, unsigned int ext_n
 		trim_end = extent_end < request_end ? extent_end : request_end;
 		if (trim_end <= trim_start)
 			continue;
-		if (trim_start != next)
-			return -ENODATA;
 
 		extent.fe_physical += trim_start - extent_start;
 		extent.fe_logical = trim_start;
 		extent.fe_length = trim_end - trim_start;
-		if (!is_sector_aligned(extent.fe_physical) || !is_sector_aligned(extent.fe_length))
-			return -EINVAL;
 		extents[out++] = extent;
 		total += extent.fe_length;
-		next = trim_end;
 	}
 
-	if (next != request_end)
-		return -ENODATA;
 	*trimmed_ext_num = out;
 	*total_size = total;
 	return 0;
@@ -781,7 +768,8 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat, unsigned i
 		return -EINVAL;
 	if (!size || !is_sector_aligned(offset) || !is_sector_aligned(size))
 		return -EINVAL;
-	if (offset > ULONG_MAX - size)
+	/* File offsets are signed; reject overflow before changing the file. */
+	if (offset > INT64_MAX || size > INT64_MAX - offset)
 		return -EOVERFLOW;
 
 	if (S_ISBLK(file_stat->st_mode)) {
@@ -799,14 +787,6 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat, unsigned i
 	}
 
 	if (!S_ISREG(file_stat->st_mode))
-		return -EINVAL;
-	/* fallocate uses signed file offsets; reject before changing the file. */
-	if (offset > INT64_MAX || size > INT64_MAX - offset ||
-	    (sizeof(off_t) < sizeof(int64_t) && (offset > INT32_MAX || size > INT32_MAX - offset)))
-		return -EOVERFLOW;
-
-	if (file_stat->st_blksize <= 0 || (uint64_t)file_stat->st_blksize > UINT_MAX ||
-	    (file_stat->st_blksize & (file_stat->st_blksize - 1)))
 		return -EINVAL;
 	block_size = file_stat->st_blksize;
 	err = calc_fiemap_extent_count(offset, size, block_size, &max_num);
@@ -827,16 +807,6 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat, unsigned i
 	exts->fm_extent_count = max_num;
 
 	if (op == P2P_IO_WRITE) {
-		int flags = fcntl(file_fd, F_GETFL);
-
-		if (flags < 0) {
-			err = -errno;
-			goto free_exts;
-		}
-		if ((flags & O_ACCMODE) == O_RDONLY) {
-			err = -EBADF;
-			goto free_exts;
-		}
 		if (fallocate(file_fd, 0, (off_t)offset, (off_t)size)) {
 			err = -errno;
 			goto free_exts;
@@ -850,6 +820,8 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat, unsigned i
 		goto free_exts;
 	}
 	if (exts->fm_mapped_extents > max_num) {
+		fprintf(stderr, "FIEMAP mapped extent count %u exceeds buffer capacity %u\n",
+			exts->fm_mapped_extents, max_num);
 		err = -EINVAL;
 		goto free_exts;
 	}
