@@ -764,8 +764,6 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat, unsigned i
 	unsigned long long query_length;
 	int err;
 
-	if (op != P2P_IO_READ && op != P2P_IO_WRITE)
-		return -EINVAL;
 	if (!size || !is_sector_aligned(offset) || !is_sector_aligned(size))
 		return -EINVAL;
 	/* File offsets are signed; reject overflow before changing the file. */
@@ -788,6 +786,7 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat, unsigned i
 
 	if (!S_ISREG(file_stat->st_mode))
 		return -EINVAL;
+
 	block_size = file_stat->st_blksize;
 	err = calc_fiemap_extent_count(offset, size, block_size, &max_num);
 	if (err)
@@ -809,6 +808,8 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat, unsigned i
 	if (op == P2P_IO_WRITE) {
 		if (fallocate(file_fd, 0, (off_t)offset, (off_t)size)) {
 			err = -errno;
+			fprintf(stderr, "fallocate fd %d offset %lu size %lu failed, errno: %d\n",
+				file_fd, offset, size, err);
 			goto free_exts;
 		}
 	}
@@ -847,7 +848,7 @@ int p2p_get_iov_size(const struct p2p_iov *iov, unsigned int iov_nr, unsigned lo
 		return -EINVAL;
 
 	for (i = 0; i < iov_nr; i++) {
-		if (!iov[i].size || iov[i].size > (2U << 30) || iov[i].reserved ||
+		if (!iov[i].size || iov[i].reserved ||
 		    ((iov[i].addr | iov[i].size) & (P2P_SECTOR_SIZE - 1)) ||
 		    UINT64_MAX - iov[i].addr < iov[i].size || ULONG_MAX - size < iov[i].size)
 			return -EINVAL;
