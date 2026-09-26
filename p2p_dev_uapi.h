@@ -81,7 +81,7 @@ struct p2p_mem_unregister_param {
 };
 
 #define P2P_TOPO_NAME_LEN 32
-#define P2P_TOPO_MAX_BDEVS 4
+#define P2P_TOPO_MAX_BDEVS 16
 
 struct topo_user_bdev {
 	__u32 dev_id;
