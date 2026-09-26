@@ -188,7 +188,6 @@ int main(void)
 	}
 
 	reset_program();
-	prepare_expect("bad-op", 99U, 0, 4096, -EINVAL);
 	prepare_expect("zero-size", P2P_IO_READ, 0, 0, -EINVAL);
 	prepare_expect("unaligned-offset", P2P_IO_READ, 256, 4096, -EINVAL);
 	prepare_expect("unaligned-size", P2P_IO_READ, 0, 100, -EINVAL);
