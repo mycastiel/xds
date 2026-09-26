@@ -112,20 +112,17 @@ static int topo_get_nsid(struct block_device *bdev, u32 *nsid)
 		return -EINVAL;
 
 	ret = fops->ioctl(bdev, P2P_BDEV_READ_MODE, NVME_IOCTL_ID, 0);
-	if (ret < 0) {
+	if (ret <= 0) {
 		pr_err("NVME_IOCTL_ID failed for component %u:%u: %d\n",
 		       MAJOR(bdev->bd_dev), MINOR(bdev->bd_dev), ret);
-		return ret;
+		return ret ? ret : -EINVAL;
 	}
-	if (!ret)
-		return -EINVAL;
 
 	*nsid = ret;
 	return 0;
 }
 
-static int topo_open_component(struct topo_bdev *bdev,
-			       const struct topo_user_bdev *cfg)
+static int topo_open_component(struct topo_bdev *bdev, const struct topo_user_bdev *cfg)
 {
 	p2p_bdev_handle *input_handle;
 	struct block_device *input_bdev;
@@ -142,11 +139,13 @@ static int topo_open_component(struct topo_bdev *bdev,
 		       MAJOR(bdev->id), MINOR(bdev->id), err);
 		return err;
 	}
-	input_bdev = p2p_handle_to_bdev(input_handle);
 
-	if (check_add_overflow(bdev->start_sector, bdev->size_sector,
-			       &end_sector) ||
+	input_bdev = p2p_handle_to_bdev(input_handle);
+	if (check_add_overflow(bdev->start_sector, bdev->size_sector, &end_sector) ||
 	    end_sector > p2p_bdev_nr_sectors(input_bdev)) {
+		pr_err("component %u:%u range 0x%llx+0x%llx exceeds capacity 0x%llx sectors\n",
+		       MAJOR(bdev->id), MINOR(bdev->id), bdev->start_sector,
+		       bdev->size_sector, (u64)p2p_bdev_nr_sectors(input_bdev));
 		err = -EINVAL;
 		goto out;
 	}
@@ -318,67 +317,100 @@ void topo_put(struct topo *topo)
 	kref_put(&topo->refcnt, topo_ref_release);
 }
 
-static int topo_validate_linear(struct topo *topo,
-				const struct topo_user_cfg *cfg)
+static int topo_validate_linear(struct topo *topo, const struct topo_user_cfg *cfg)
 {
+	struct block_device *top_bdev;
 	u64 size = 0;
 	u32 i;
 
-	if (cfg->extra[0] || cfg->extra[1])
+	if (cfg->extra[0] || cfg->extra[1]) {
+		pr_err("linear topology extra fields must be zero: 0x%llx 0x%llx\n",
+		       cfg->extra[0], cfg->extra[1]);
 		return -EINVAL;
+	}
 
 	for (i = 0; i < topo->nr_bdevs; i++) {
-		if (check_add_overflow(size, topo->bdevs[i].size_sector, &size))
+		u64 sum;
+
+		if (check_add_overflow(size, topo->bdevs[i].size_sector, &sum)) {
+			pr_err("linear topology size overflows at component %u: 0x%llx + 0x%llx sectors\n",
+			       i, size, topo->bdevs[i].size_sector);
 			return -EINVAL;
+		}
+		size = sum;
 	}
-	if (size != p2p_bdev_nr_sectors(p2p_handle_to_bdev(topo->top_handle)))
+	top_bdev = p2p_handle_to_bdev(topo->top_handle);
+	if (size != p2p_bdev_nr_sectors(top_bdev)) {
+		pr_err("linear topology size 0x%llx differs from top device capacity 0x%llx sectors\n",
+		       size, (u64)p2p_bdev_nr_sectors(top_bdev));
 		return -EINVAL;
+	}
 
 	topo->size_sector = size;
 	topo->ops = &linear_ops;
 	return 0;
 }
 
-static int topo_validate_nvme(struct topo *topo,
-			      const struct topo_user_cfg *cfg)
+static int topo_validate_nvme(struct topo *topo, const struct topo_user_cfg *cfg)
 {
 	struct block_device *top_bdev = p2p_handle_to_bdev(topo->top_handle);
 	struct topo_bdev *bdev = &topo->bdevs[0];
 	struct block_device *component = p2p_handle_to_bdev(bdev->handle);
+	struct block_device *whole = p2p_bdev_whole(top_bdev);
 	u64 start = bdev_is_partition(top_bdev) ? get_start_sect(top_bdev) : 0;
 	u64 size = p2p_bdev_nr_sectors(top_bdev);
 
 	if (cfg->extra[0] || cfg->extra[1] ||
-	    component != p2p_bdev_whole(top_bdev) ||
-	    bdev->start_sector != start || bdev->size_sector != size)
+	    component != whole ||
+	    bdev->start_sector != start || bdev->size_sector != size) {
+		pr_err("invalid NVMe topology: extra 0x%llx 0x%llx, component %u:%u expected %u:%u, range 0x%llx+0x%llx expected 0x%llx+0x%llx\n",
+		       cfg->extra[0], cfg->extra[1], MAJOR(component->bd_dev),
+		       MINOR(component->bd_dev), MAJOR(whole->bd_dev),
+		       MINOR(whole->bd_dev), bdev->start_sector,
+		       bdev->size_sector, start, size);
 		return -EINVAL;
+	}
 
 	topo->size_sector = size;
 	topo->ops = &nvme_ops;
 	return 0;
 }
 
-static int topo_validate_raid0(struct topo *topo,
-			       const struct topo_user_cfg *cfg)
+static int topo_validate_raid0(struct topo *topo, const struct topo_user_cfg *cfg)
 {
+	struct block_device *top_bdev;
 	u64 chunk_sectors;
 	u64 size;
 	u32 i;
 
-	if (topo->nr_bdevs < 2 || cfg->extra[1] || cfg->extra[0] >= 32)
+	if (topo->nr_bdevs < 2 || cfg->extra[1] || cfg->extra[0] >= 32) {
+		pr_err("invalid raid0 topology: components %u, chunk shift %llu, extra[1] 0x%llx\n",
+		       topo->nr_bdevs, cfg->extra[0], cfg->extra[1]);
 		return -EINVAL;
+	}
 
 	chunk_sectors = 1ULL << cfg->extra[0];
 	for (i = 0; i < topo->nr_bdevs; i++) {
 		if (cfg->bdevs[i].size_sector != cfg->bdevs[0].size_sector ||
-		    topo->bdevs[i].size_sector % chunk_sectors)
+		    topo->bdevs[i].size_sector % chunk_sectors) {
+			pr_err("raid0 component %u size 0x%llx must match 0x%llx and align to chunk 0x%llx sectors\n",
+			       i, topo->bdevs[i].size_sector,
+			       topo->bdevs[0].size_sector, chunk_sectors);
 			return -EINVAL;
+		}
 	}
 	if (check_mul_overflow(topo->bdevs[0].size_sector,
-			       (u64)topo->nr_bdevs, &size))
+			       (u64)topo->nr_bdevs, &size)) {
+		pr_err("raid0 topology size overflows: %u components of 0x%llx sectors\n",
+		       topo->nr_bdevs, topo->bdevs[0].size_sector);
 		return -EINVAL;
-	if (size != p2p_bdev_nr_sectors(p2p_handle_to_bdev(topo->top_handle)))
+	}
+	top_bdev = p2p_handle_to_bdev(topo->top_handle);
+	if (size != p2p_bdev_nr_sectors(top_bdev)) {
+		pr_err("raid0 topology size 0x%llx differs from top device capacity 0x%llx sectors\n",
+		       size, (u64)p2p_bdev_nr_sectors(top_bdev));
 		return -EINVAL;
+	}
 
 	topo->size_sector = size;
 	topo->priv.chunk_sectors_shift = cfg->extra[0];
@@ -410,7 +442,23 @@ static int topo_validate_cfg(const struct topo_user_cfg *cfg)
 				return -EINVAL;
 		}
 	}
+
 	return 0;
+}
+
+static void topo_debug_cfg(const struct topo_user_cfg *cfg)
+{
+	u32 i;
+
+	pr_debug("cfg name: %.*s top_dev: 0x%x nr_devs: %u extra: 0x%llx 0x%llx\n",
+		 P2P_TOPO_NAME_LEN, cfg->name, cfg->top_dev, cfg->nr_devs,
+		 cfg->extra[0], cfg->extra[1]);
+	for (i = 0; i < cfg->nr_devs; i++) {
+		const struct topo_user_bdev *bdev = &cfg->bdevs[i];
+
+		pr_debug("cfg bdev[%u]: dev_id: 0x%x reserved: 0x%x size_sector: 0x%llx start_sector: 0x%llx\n",
+			 i, bdev->dev_id, bdev->reserved, bdev->size_sector, bdev->start_sector);
+	}
 }
 
 static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
@@ -426,8 +474,12 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 	topo->top_dev = new_decode_dev(cfg->top_dev);
 	topo->nr_bdevs = cfg->nr_devs;
 	err = topo_validate_cfg(cfg);
-	if (err)
+	if (err) {
+		pr_err("invalid topology configuration for %u:%u: %d\n",
+		       MAJOR(topo->top_dev), MINOR(topo->top_dev), err);
+		topo_debug_cfg(cfg);
 		goto free_topo;
+	}
 
 	topo->bdevs = kcalloc(topo->nr_bdevs, sizeof(*topo->bdevs),
 			      GFP_KERNEL);
@@ -451,6 +503,8 @@ static struct topo *topo_alloc_candidate(const struct topo_user_cfg *cfg)
 	    (!strcmp(topo->name, "raid0") &&
 	     !topo_sysfs_path_exists(topo->top_dev, "md"))) {
 		err = -EOPNOTSUPP;
+		pr_err("top device %u:%u does not support %s topology\n",
+		       MAJOR(topo->top_dev), MINOR(topo->top_dev), topo->name);
 		goto free_topo;
 	}
 

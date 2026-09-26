@@ -1776,10 +1776,11 @@ static int p2p_add_topo(struct p2p_batch *batch, void __user *arg)
 
 	if (copy_from_user(&header, arg, sizeof(header)))
 		return -EFAULT;
-	if (!header.nr_devs)
+	if (!header.nr_devs || header.nr_devs > P2P_TOPO_MAX_BDEVS) {
+		pr_err("invalid topology component count %u, expected 1..%u\n",
+		       header.nr_devs, P2P_TOPO_MAX_BDEVS);
 		return -EINVAL;
-	if (header.nr_devs > P2P_TOPO_MAX_BDEVS)
-		return -E2BIG;
+	}
 	size = sizeof(header) +
 	       header.nr_devs * sizeof(header.bdevs[0]);
 
