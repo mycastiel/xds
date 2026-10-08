@@ -1,6 +1,6 @@
 KSRC ?= /lib/modules/$(shell uname -r)/build
 
-.PHONY: all mod lib clean test
+.PHONY: all mod lib binding clean test
 
 all: mod lib
 
@@ -9,6 +9,9 @@ mod:
 
 lib:
 	$(MAKE) -C file_p2p
+
+binding:
+	$(MAKE) -C file_p2p binding
 
 obj-m := stub.o
 obj-m += p2p_dev.o

@@ -13,9 +13,12 @@ NDS_SRCS := nds_api.c p2p_common.c
 NDS_OBJS := $(NDS_SRCS:.c=.o)
 NDS_DEPS := $(addprefix .,$(NDS_OBJS:.o=.d))
 
-.PHONY: all clean
+.PHONY: all binding clean
 
 all: $(NDS_LIB)
+
+binding:
+	python3 setup.py build_ext --inplace
 
 $(NDS_LIB): $(NDS_OBJS)
 	$(CC) -shared -Wl,-soname,$(NDS_SONAME) -o $@ $(NDS_OBJS) -lpthread
