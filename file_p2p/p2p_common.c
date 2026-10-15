@@ -675,7 +675,8 @@ found:
 }
 
 static int append_loop_extent(struct topo_user_cfg *cfg, uint32_t dev_index,
-			      uint64_t start_sector, uint64_t size_sector)
+			      uint64_t start_sector, uint64_t size_sector,
+			      uint32_t flags)
 {
 	struct topo_user_extent *extents = topo_user_loop_extents(cfg);
 	struct topo_user_extent *previous;
@@ -688,6 +689,7 @@ static int append_loop_extent(struct topo_user_cfg *cfg, uint32_t dev_index,
 					    previous->size_sector,
 					    &previous_end) &&
 		    previous->dev_index == dev_index &&
+		    previous->reserved == flags &&
 		    previous_end == start_sector) {
 			if (__builtin_add_overflow(previous->size_sector,
 					   size_sector,
@@ -699,17 +701,46 @@ static int append_loop_extent(struct topo_user_cfg *cfg, uint32_t dev_index,
 	if (count >= P2P_TOPO_MAX_EXTENTS)
 		return -E2BIG;
 	extents[count].dev_index = dev_index;
+	extents[count].reserved = flags;
 	extents[count].size_sector = size_sector;
 	extents[count].start_sector = start_sector;
 	cfg->extra[0]++;
 	return 0;
 }
 
+static int append_striped_loop_extent(struct topo_user_cfg *cfg,
+				      const struct topo_user_cfg *underlying,
+				      uint64_t physical_sector,
+				      uint64_t size_sector, uint32_t flags)
+{
+	uint64_t raid_sectors;
+	uint64_t end;
+
+	/*
+	 * Keep this as one logical range on the RAID0 set. Splitting every
+	 * chunk into its own extent makes mapping walk the whole prefix.
+	 */
+	if (underlying->nr_devs < 2 || underlying->extra[0] >= 32)
+		return -EINVAL;
+	if (__builtin_mul_overflow(underlying->bdevs[0].size_sector,
+				   (uint64_t)underlying->nr_devs,
+				   &raid_sectors) ||
+	    __builtin_add_overflow(physical_sector, size_sector, &end) ||
+	    end > raid_sectors)
+		return -EINVAL;
+	return append_loop_extent(cfg, 0, physical_sector, size_sector, flags);
+}
+
 static int flatten_loop_extent(struct topo_user_cfg *cfg,
 			       const struct topo_user_cfg *underlying,
 			       uint64_t physical_sector,
-			       uint64_t size_sector)
+			       uint64_t size_sector, uint32_t flags)
 {
+	if (!strcmp(underlying->name, "raid0"))
+		return append_striped_loop_extent(cfg, underlying,
+						  physical_sector, size_sector,
+						  flags);
+
 	while (size_sector) {
 		uint64_t component_sector;
 		uint64_t mapped;
@@ -720,7 +751,8 @@ static int flatten_loop_extent(struct topo_user_cfg *cfg,
 					  &dev_index, &component_sector, &mapped);
 		if (err)
 			return err;
-		err = append_loop_extent(cfg, dev_index, component_sector, mapped);
+		err = append_loop_extent(cfg, dev_index, component_sector, mapped,
+					 flags);
 		if (err)
 			return err;
 		physical_sector += mapped;
@@ -800,7 +832,9 @@ static int discover_loop_extents(int backing_fd, uint64_t backing_offset,
 		}
 		err = flatten_loop_extent(cfg, underlying,
 					  physical / P2P_SECTOR_SIZE,
-					  length / P2P_SECTOR_SIZE);
+					  length / P2P_SECTOR_SIZE,
+					  (extent->fe_flags & FIEMAP_EXTENT_UNWRITTEN) ?
+					  P2P_TOPO_EXTENT_UNWRITTEN : 0);
 		if (err)
 			goto out;
 		expected = logical_end;
@@ -889,6 +923,14 @@ static int discover_loop(dev_t top_dev,
 	cfg->nr_devs = underlying->nr_devs;
 	cfg->extra[0] = 0;
 	cfg->extra[1] = 0;
+	if (!strcmp(underlying->name, "raid0")) {
+		if (underlying->extra[0] >= 32) {
+			err = -EINVAL;
+			goto out;
+		}
+		/* 0 means component extents. A RAID0 shift of 0 is stored as 1. */
+		cfg->extra[1] = underlying->extra[0] + 1;
+	}
 	err = discover_loop_extents(backing_fd, backing_offset, loop_size,
 				    underlying, cfg);
 out:
@@ -915,28 +957,41 @@ static void print_topo_cfg(const struct topo_user_cfg *cfg)
 		       (unsigned long long)bdev->start_sector,
 		       (unsigned long long)bdev->size_sector);
 	}
-	if (!strcmp(cfg->name, "loop"))
-               printf("  loop extents: %llu\n",
-                      (unsigned long long)cfg->extra[0]);
+	if (!strcmp(cfg->name, "loop")) {
+		const struct topo_user_extent *extents = topo_user_loop_extents(
+			(struct topo_user_cfg *)cfg);
+		unsigned long long unwritten = 0;
+
+		for (i = 0; i < cfg->extra[0]; i++) {
+			if (extents[i].reserved & P2P_TOPO_EXTENT_UNWRITTEN)
+				unwritten++;
+		}
+		if (cfg->extra[1])
+			printf("  loop extents: %llu unwritten: %llu "
+			       "raid0 chunk_shift: %llu\n",
+			       (unsigned long long)cfg->extra[0], unwritten,
+			       (unsigned long long)cfg->extra[1] - 1);
+		else
+			printf("  loop extents: %llu unwritten: %llu\n",
+			       (unsigned long long)cfg->extra[0], unwritten);
+	}
 }
 
 int p2p_add_topo(int dev_fd, dev_t dev_id)
 {
 	struct topo_user_cfg *cfg = NULL;
-	struct stat st;
 	size_t cfg_size;
 	topo_discover_fn discover;
 	int err;
 
-	if (fstat(dev_fd, &st) < 0)
-                return -errno;
-        if (!S_ISBLK(st.st_mode))
-                return -EINVAL;
-	if (path_exists(st.st_rdev, "loop/backing_file"))
-               discover = discover_loop;
-        else
-               discover = select_discover(st.st_rdev);
-        if (!discover)
+	/* dev_fd is /dev/p2p_device. The block device to describe is dev_id. */
+	if (!path_exists(dev_id, "dev"))
+		return -EINVAL;
+	if (path_exists(dev_id, "loop/backing_file"))
+		discover = discover_loop;
+	else
+		discover = select_discover(dev_id);
+	if (!discover)
 		return -EOPNOTSUPP;
 
 	cfg_size = sizeof(*cfg) +

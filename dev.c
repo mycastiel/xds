@@ -151,6 +151,7 @@ struct p2p_io_context {
 	int io_err;
 	int issue_err;
 	struct p2p_batch *batch;
+	u8 topo_kind;
 #if defined(CALC_CRC32) || defined(DUMP_CONTENT)
 	struct work_struct finalize_work;
 #endif
@@ -1124,8 +1125,13 @@ static void p2p_publish_io_done(struct p2p_io_context *io_ctx)
 void p2p_complete_io(struct request *req, blk_status_t status)
 {
 	struct p2p_io_context *io_ctx = req->end_io_data;
+	u64 now;
 
 	p2p_stats_io_complete(io_ctx->op, status);
+	now = ktime_get_ns();
+	if (req->start_time_ns && now >= req->start_time_ns)
+		p2p_stats_lat_add(io_ctx->topo_kind, P2P_LAT_DEV,
+				  now - req->start_time_ns, 0);
 	if (status)
 		cmpxchg(&io_ctx->io_err, 0, status);
 
@@ -1135,6 +1141,27 @@ void p2p_complete_io(struct request *req, blk_status_t status)
 static const char *p2p_io_op_name(u32 op)
 {
 	return op == P2P_IO_WRITE ? "write" : "read";
+}
+
+static int p2p_zero_pa(u64 pa, u32 nr_sectors)
+{
+	/* Keep each mapping modest; one iov segment can be up to 2 GiB. */
+	const u32 chunk = (1U << 20) >> SECTOR_SHIFT;
+
+	while (nr_sectors) {
+		u32 n = min(nr_sectors, chunk);
+		size_t len = (size_t)n << SECTOR_SHIFT;
+		void *addr;
+
+		addr = ioremap(pa, len);
+		if (!addr)
+			return -ENOMEM;
+		memset(addr, 0, len);
+		iounmap(addr);
+		pa += len;
+		nr_sectors -= n;
+	}
+	return 0;
 }
 
 static int do_io(struct p2p_io_context *io_ctx, struct block_device *bdev, unsigned int nsid,
@@ -1171,6 +1198,7 @@ static int do_io(struct p2p_io_context *io_ctx, struct block_device *bdev, unsig
 	req->end_io = p2p_end_io;
 	atomic_inc(&io_ctx->io_ref);
 	p2p_stats_io_issued(io_ctx->op, (u64)sector_nr << SECTOR_SHIFT);
+	req->start_time_ns = ktime_get_ns();
 
 	p2p_execute_rq_nowait(req, disk);
 
@@ -1202,11 +1230,49 @@ static int do_ios(struct p2p_io_context *io_ctx, struct topo *topo, struct fiema
 			struct topo_bdev *topo_bdev;
 			struct block_device *to_bdev;
 			u64 to_sector;
+			u64 t0;
 			u32 topo_limit = left;
+			u32 disk_nr = left;
+			u32 zero_nr = 0;
 
+			if (io_ctx->op == P2P_IO_READ) {
+				err = topo_loop_read_span(topo, sector, left,
+							  &disk_nr, &zero_nr);
+				if (err)
+					goto out;
+				if (zero_nr) {
+					to_submit = min_t(u32, zero_nr,
+							  p2p_iov_iter_single_seg_sectors(&iter));
+					if (!to_submit) {
+						pr_err("zero %s ext %u sectors 0x%x iov bytes 0x%llx\n",
+						       p2p_io_op_name(io_ctx->op), i, left,
+						       p2p_iov_iter_count(&iter));
+						err = -EINVAL;
+						goto out;
+					}
+					err = p2p_zero_pa(p2p_iov_iter_addr(&iter),
+							  to_submit);
+					if (err)
+						goto out;
+					sector += to_submit;
+					left -= to_submit;
+					p2p_iov_iter_advance(&iter,
+							     (u64)to_submit << SECTOR_SHIFT);
+					continue;
+				}
+				if (!disk_nr) {
+					err = -EIO;
+					goto out;
+				}
+				topo_limit = disk_nr;
+			}
+
+			t0 = ktime_get_ns();
 			err = topo->ops->map_sector(topo, sector, topo_limit,
 						     &topo_bdev, &to_sector,
 						     &topo_limit);
+			p2p_stats_lat_add(topo->kind, P2P_LAT_MAP,
+					  ktime_get_ns() - t0, 0);
 			if (err)
 				goto out;
 			to_bdev = p2p_handle_to_bdev(topo_bdev->handle);
@@ -1220,10 +1286,21 @@ static int do_ios(struct p2p_io_context *io_ctx, struct topo *topo, struct fiema
 				err = -EINVAL;
 				goto out;
 			}
+			if (io_ctx->op == P2P_IO_WRITE) {
+				err = topo_loop_prepare_write(topo, sector, to_submit);
+				if (err)
+					goto out;
+			}
+			t0 = ktime_get_ns();
 			err = do_io(io_ctx, to_bdev, topo_bdev->nsid, to_sector, to_submit,
 				    p2p_iov_iter_addr(&iter));
+			p2p_stats_lat_add(topo->kind, P2P_LAT_ISSUE,
+					  ktime_get_ns() - t0,
+					  err ? 0 : (u64)to_submit << SECTOR_SHIFT);
 			if (err)
 				goto out;
+			if (io_ctx->op == P2P_IO_WRITE)
+				topo_loop_mark_written(topo, sector, to_submit);
 			sector += to_submit;
 			left -= to_submit;
 
@@ -1496,6 +1573,7 @@ static int p2p_submit_one(struct p2p_batch *batch, const struct p2p_io_param *pa
 	struct p2p_pinned_io_mem pinned_mem;
 	struct topo *topo = NULL;
 	u64 data_size;
+	u64 prep_t0 = ktime_get_ns();
 	unsigned int pa_iov_nr;
 	int err;
 
@@ -1556,6 +1634,7 @@ static int p2p_submit_one(struct p2p_batch *batch, const struct p2p_io_param *pa
 	pa_iov = NULL;
 
 	io_ctx->batch = batch;
+	io_ctx->topo_kind = topo->kind;
 	if (atomic_inc_return(&batch->io_cnt) > P2P_CQ_SIZE) {
 		if (atomic_dec_and_test(&batch->io_cnt))
 			p2p_wake_batch_waiters(batch);
@@ -1565,6 +1644,7 @@ static int p2p_submit_one(struct p2p_batch *batch, const struct p2p_io_param *pa
 	}
 	atomic_inc(&batch->outstanding_events);
 
+	p2p_stats_lat_add(topo->kind, P2P_LAT_PREP, ktime_get_ns() - prep_t0, 0);
 	io_ctx->issue_err = do_ios(io_ctx, topo, extents, param->ext_nr);
 	if (io_ctx->issue_err)
 		p2p_stats_io_issue_failed(io_ctx->op);
@@ -1777,40 +1857,55 @@ static int p2p_add_topo(struct p2p_batch *batch, void __user *arg)
 
 	if (copy_from_user(&header, arg, sizeof(header)))
 		return -EFAULT;
-	if (!header.nr_devs)
+	if (!header.nr_devs) {
+		pr_info("add topo err 1\n");
 		return -EINVAL;
+	}
 	if (header.nr_devs > P2P_TOPO_MAX_BDEVS)
 		return -E2BIG;
-	if (!memchr(header.name, '\0', sizeof(header.name)))
+	if (!memchr(header.name, '\0', sizeof(header.name))) {
+		pr_info("add topo err 2\n");
 		return -EINVAL;
+	}
 	if (!strcmp(header.name, "loop")) {
-		if (!header.extra[0])
+		if (!header.extra[0]) {
+			pr_info("add topo err 3\n");
 			return -EINVAL;
+		}
 		if (header.extra[0] > P2P_TOPO_MAX_EXTENTS)
 			return -E2BIG;
-		if (header.extra[1] ||
+		if (header.extra[1] > 32 ||
 		    check_mul_overflow((size_t)header.extra[0],
 				       sizeof(struct topo_user_extent),
-				       &extent_size))
+				       &extent_size)) {
+			pr_info("add topo err 4\n");
 			return -EINVAL;
+		}
 	}
 	size = sizeof(header) +
 	       header.nr_devs * sizeof(header.bdevs[0]);
-	if (check_add_overflow(size, extent_size, &size))
+	if (check_add_overflow(size, extent_size, &size)) {
+		pr_info("add topo err 5\n");
 		return -EINVAL;
+	}
 
 	cfg = memdup_user(arg, size);
-	if (IS_ERR(cfg))
+	if (IS_ERR(cfg)) {
+		pr_info("add topo err 6\n");
 		return PTR_ERR(cfg);
+	}
 	if (cfg->nr_devs != header.nr_devs ||
 	    memcmp(cfg->name, header.name, sizeof(cfg->name)) ||
 	    cfg->extra[0] != header.extra[0] ||
 	    cfg->extra[1] != header.extra[1]) {
 		kfree(cfg);
+		pr_info("add topo err 7\n");
 		return -EINVAL;
 	}
 
 	err = topo_add(cfg, &batch->shared_topos);
+	if (err)
+		pr_info("add topo err 8\n");
 	kfree(cfg);
 	return err;
 }

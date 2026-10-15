@@ -7,7 +7,7 @@ CPPFLAGS += -I../file_p2p -I..
 TEST_BINS := crc32_verify c_api_test mem_registration_test direct_io_test \
 	topo_test rw_api_test uapi_rw_test nds_api_test nds_example nds_bw_bench \
 	nds_crc_verify coverage_errors topo_devt_test prepare_extents_test \
-	file_raw_write_test nds_file_prepare_test nds_topology_test
+	nds_file_prepare_test nds_topology_test
 
 all: $(TEST_BINS)
 

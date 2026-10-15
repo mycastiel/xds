@@ -82,7 +82,7 @@ struct p2p_mem_unregister_param {
 
 #define P2P_TOPO_NAME_LEN 32
 #define P2P_TOPO_MAX_BDEVS 4
-#define P2P_TOPO_MAX_EXTENTS 8192
+#define P2P_TOPO_MAX_EXTENTS 81920
 
 struct topo_user_bdev {
 	__u32 dev_id;
@@ -93,13 +93,21 @@ struct topo_user_bdev {
 };
 
 /*
- * A loop topology maps consecutive sectors of the loop device onto extents
- * in one of the registered NVMe components.  start_sector is relative to the
- * corresponding topo_user_bdev start_sector.
+ * Extents are consecutive in loop-device sector order.
+ *
+ * extra[1] == 0: the extent is a range on bdevs[dev_index]. start_sector is
+ * relative to that component's start_sector.
+ *
+ * extra[1] == chunk_sectors_shift + 1: bdevs[] is a RAID0 set. The extent is
+ * a logical range on that set, dev_index is 0, and the kernel stripes it
+ * onto a component at I/O time.
  */
+/* Read as zeros. A write through this topology clears the range. */
+#define P2P_TOPO_EXTENT_UNWRITTEN 1U
+
 struct topo_user_extent {
 	__u32 dev_index;
-	__u32 reserved;
+	__u32 reserved;		/* P2P_TOPO_EXTENT_UNWRITTEN or 0 */
 	__u64 size_sector;
 	__u64 start_sector;
 };
@@ -110,6 +118,11 @@ struct topo_user_cfg {
 	 * topology, it may be a whole namespace or a partition. Components may
 	 * also be partitions, but their whole devices must be direct,
 	 * non-multipath NVMe namespaces.
+	 *
+	 * nvme and linear require extra[] == 0. raid0 stores
+	 * chunk_sectors_shift in extra[0] and requires extra[1] == 0. loop
+	 * stores the extent count in extra[0]; extra[1] selects the loop
+	 * extent encoding documented on topo_user_extent.
 	 */
 	char name[P2P_TOPO_NAME_LEN];
 	__u32 top_dev;
