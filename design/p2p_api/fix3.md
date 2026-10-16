@@ -44,8 +44,9 @@ layer (`p2p_common.h` / `p2p_common.c`) for `p2p_open_dev` /
      bookkeeping fd for `IOCTL_ADD_TOPO`.
    - Applications call `nds_register_fs` for the initial set and call it again
      whenever another underlying filesystem becomes available. A multi-fd call
-     is processed in array order; if a later descriptor fails, topologies from
-     the successful prefix remain registered.
+     is processed in array order. If a later descriptor fails, the topologies
+     registered by the successful prefix are removed again on a best-effort
+     basis before the error is returned.
    - All `p2p_fd` I/O contexts created afterwards share the registered topology.
      The per-ctx topo cache from `fix1.md` is removed.
    - Any `add_topo` error is propagated; the current topology path does not
@@ -54,7 +55,9 @@ layer (`p2p_common.h` / `p2p_common.c`) for `p2p_open_dev` /
      `NDS_API_VERSION` when initialization succeeds.
    - `nds_unregister_fs` issues `IOCTL_DEL_TOPO` for each descriptor on the
      topology fd. Deletion removes one matching topology pin from that fd;
-     the topology remains active while another pin exists.
+     the topology remains active while another pin exists. Like registration,
+     a failed call best-effort restores the topologies removed by the
+     successful prefix before the error is returned.
 
 2. **FD-only object surface**
    - Object-type constants are removed. `nds_io_obj` contains only an fd plus
