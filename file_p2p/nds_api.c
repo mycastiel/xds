@@ -137,6 +137,14 @@ int nds_register_fs(const struct nds_fs_desc *desc)
 		if (ret) {
 			fprintf(stderr, "nds: add topology for fd %d failed %d\n",
 				desc->fs_fd[i], ret);
+			if (i) {
+				const struct nds_fs_desc done = {
+					.fs_fd = desc->fs_fd,
+					.fs_fd_cnt = i,
+				};
+
+				nds_unregister_fs(&done);
+			}
 			return ret;
 		}
 	}
@@ -156,6 +164,14 @@ int nds_unregister_fs(const struct nds_fs_desc *desc)
 		if (ret) {
 			fprintf(stderr, "nds: delete topology for fd %d failed %d\n",
 				desc->fs_fd[i], ret);
+			if (i) {
+				const struct nds_fs_desc done = {
+					.fs_fd = desc->fs_fd,
+					.fs_fd_cnt = i,
+				};
+
+				nds_register_fs(&done);
+			}
 			return ret;
 		}
 	}
