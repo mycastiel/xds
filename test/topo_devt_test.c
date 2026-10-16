@@ -23,6 +23,7 @@
 #define FILE_FD 103
 #define BLOCK_FD 104
 #define PIPE_FD 105
+#define FILE_FD2 106
 
 static const char *size_text = "8388609\n";
 static const char *read_text;
@@ -31,9 +32,13 @@ static int add_count;
 static int del_count;
 static int add_errno;
 static int del_errno;
+static int add_fail_at;
+static int del_fail_at;
 static int deleting;
 static dev_t expected_dev;
+static dev_t expected_dev2;
 static unsigned long long expected_size;
+static unsigned long long expected_size2;
 
 /* The partition has a different size from its parent namespace. */
 static const char *sysfs_text(const char *path)
@@ -78,7 +83,7 @@ int __wrap_stat(const char *path, struct stat *st)
 int __wrap_fstat(int fd, struct stat *st)
 {
 	memset(st, 0, sizeof(*st));
-	if (fd == FILE_FD) {
+	if (fd == FILE_FD || fd == FILE_FD2) {
 		st->st_mode = S_IFREG;
 		st->st_dev = makedev(259, 0);
 	} else if (fd == BLOCK_FD) {
@@ -148,27 +153,31 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
 		const struct topo_user_cfg *cfg = arg;
 
 		assert(!strcmp(cfg->name, "nvme"));
-		assert(cfg->top_dev == expected_dev);
+		assert(cfg->top_dev == expected_dev ||
+		       cfg->top_dev == expected_dev2);
 		assert(cfg->nr_devs == 1);
 		assert(!cfg->extra[0] && !cfg->extra[1]);
-		assert(cfg->bdevs[0].dev_id == expected_dev);
+		assert(cfg->bdevs[0].dev_id == cfg->top_dev);
 		assert(!cfg->bdevs[0].reserved);
 		assert(!cfg->bdevs[0].start_sector);
-		assert(cfg->bdevs[0].size_sector == expected_size);
+		assert(cfg->bdevs[0].size_sector ==
+		       (cfg->top_dev == expected_dev ? expected_size
+						     : expected_size2));
 		add_count++;
-		if (add_errno) {
-			errno = add_errno;
+		if (add_errno || (add_fail_at && add_count == add_fail_at)) {
+			errno = add_errno ? add_errno : EIO;
 			return -1;
 		}
 	} else {
 		const struct topo_del_cfg *cfg = arg;
 
 		assert(request == IOCTL_DEL_TOPO);
-		assert(cfg->top_dev == expected_dev);
+		assert(cfg->top_dev == expected_dev ||
+		       cfg->top_dev == expected_dev2);
 		assert(!cfg->reserved);
 		del_count++;
-		if (del_errno) {
-			errno = del_errno;
+		if (del_errno || (del_fail_at && del_count == del_fail_at)) {
+			errno = del_errno ? del_errno : EIO;
 			return -1;
 		}
 	}
@@ -179,8 +188,16 @@ int main(void)
 {
 	struct nds_init_param init = { 0 };
 	int32_t fd = FILE_FD;
+	int32_t two_fds[2] = { FILE_FD, FILE_FD2 };
+	int32_t mixed_fds[2] = { FILE_FD, BLOCK_FD };
+	int32_t triple_fds[3] = { FILE_FD, FILE_FD2, BLOCK_FD };
 	struct nds_fs_desc fs = { .fs_fd = &fd, .fs_fd_cnt = 1 };
+	struct nds_fs_desc fs2 = { .fs_fd = two_fds, .fs_fd_cnt = 2 };
+	struct nds_fs_desc fs3 = { .fs_fd = mixed_fds, .fs_fd_cnt = 2 };
+	struct nds_fs_desc fs4 = { .fs_fd = triple_fds, .fs_fd_cnt = 3 };
 	int before;
+	int add_before;
+	int del_before;
 
 	expected_dev = makedev(259, 0);
 	expected_size = 8388609;
@@ -254,6 +271,67 @@ int main(void)
 	assert(nds_unregister_fs(&fs) == -EBADF);
 	assert(add_count == before);
 	assert(del_count == 6);
+
+	/* Half-failure: register undoes the prefix. */
+	expected_dev = makedev(259, 0);
+	expected_size = 8388609;
+	deleting = 0;
+	add_before = add_count;
+	del_before = del_count;
+	add_fail_at = add_count + 2;
+	assert(nds_register_fs(&fs2) == -EIO);
+	assert(add_count == add_before + 2);
+	assert(del_count == del_before + 1);
+	add_fail_at = 0;
+
+	/* Half-failure: unregister re-adds the prefix. */
+	assert(nds_register_fs(&fs2) == 0);
+	add_before = add_count;
+	del_before = del_count;
+	del_fail_at = del_count + 2;
+	assert(nds_unregister_fs(&fs2) == -EIO);
+	assert(del_count == del_before + 2);
+	assert(add_count == add_before + 1);
+	del_fail_at = 0;
+	assert(nds_unregister_fs(&fs2) == 0);
+
+	/* Distinct topologies: register undoes the registered prefix. */
+	expected_dev = makedev(259, 0);
+	expected_dev2 = makedev(259, 1);
+	expected_size = 8388609;
+	expected_size2 = 2049;
+	add_before = add_count;
+	del_before = del_count;
+	add_fail_at = add_count + 2;
+	assert(nds_register_fs(&fs3) == -EIO);
+	assert(add_count == add_before + 2);
+	assert(del_count == del_before + 1);
+	add_fail_at = 0;
+
+	/* Distinct topologies: unregister re-adds the removed prefix. */
+	assert(nds_register_fs(&fs3) == 0);
+	add_before = add_count;
+	del_before = del_count;
+	del_fail_at = del_count + 2;
+	assert(nds_unregister_fs(&fs3) == -EIO);
+	assert(del_count == del_before + 2);
+	assert(add_count == add_before + 1);
+	del_fail_at = 0;
+	assert(nds_unregister_fs(&fs3) == 0);
+
+	/* A rollback whose own ioctl fails still terminates: the nested
+	 * register rollback runs and the original error is returned. */
+	add_before = add_count;
+	del_before = del_count;
+	add_fail_at = add_count + 3;
+	del_fail_at = del_count + 2;
+	assert(nds_register_fs(&fs4) == -EIO);
+	assert(add_count == add_before + 4);
+	assert(del_count == del_before + 2);
+	add_fail_at = 0;
+	del_fail_at = 0;
+	assert(nds_unregister_fs(&fs2) == 0);
+
 	assert(nds_exit() == 0);
 	puts("topo_devt_test: PASS");
 	return 0;
