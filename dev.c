@@ -475,7 +475,7 @@ static void p2p_revoke_all_registered_mem(struct p2p_batch *batch,
 	list_for_each_entry_safe(mem, next, &batch->owned_mems, owner_node) {
 		xa_erase(&registered_mems, mem->handle);
 		list_move_tail(&mem->owner_node, revoked);
-		pr_info("unregister memory handle 0x%llx through p2p fd release\n",
+		pr_debug("unregister memory handle 0x%llx through p2p fd release\n",
 			mem->handle);
 	}
 
@@ -534,7 +534,7 @@ static int p2p_register_mem(struct p2p_batch *batch, void __user *arg)
 	if (err)
 		goto put_pinned_pa;
 
-	pr_info("registered memory handle 0x%llx addr 0x%llx size 0x%llx\n",
+	pr_debug("registered memory handle 0x%llx addr 0x%llx size 0x%llx\n",
 		mem->handle, mem->addr, mem->size);
 	return 0;
 
@@ -568,7 +568,7 @@ static int p2p_unregister_mem(struct p2p_batch *batch, void __user *arg)
 	percpu_ref_kill(&mem->io_refs);
 	p2p_destroy_registered_mem(mem);
 
-	pr_info("unregistered memory handle 0x%llx\n", param.mem_handle);
+	pr_debug("unregistered memory handle 0x%llx\n", param.mem_handle);
 	return 0;
 }
 
