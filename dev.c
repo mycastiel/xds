@@ -675,8 +675,8 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov, unsigned int iov_
 
 		page_size = p2p_mem_get_page_size(&pinned_pa->process_id, iov[i].addr, iov[i].size);
 		if (page_size < P2P_MIN_PAGE_SIZE || !is_power_of_2(page_size)) {
-			pr_err("invalid page size %d for addr 0x%llx, iov %u\n",
-			       page_size, iov[i].addr, i);
+			pr_err_ratelimited("invalid page size %d for addr 0x%llx, iov %u\n",
+					   page_size, iov[i].addr, i);
 			err = -EINVAL;
 			goto put_pinned_pa;
 		}
@@ -720,9 +720,9 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov, unsigned int iov_
 					  maps[i].aligned_size,
 					  maps[i].pa_list, maps[i].pa_num);
 		if (err) {
-			pr_err("PA list addr 0x%llx size 0x%llx num %u iov %u err %d\n",
-			       maps[i].aligned_addr, maps[i].aligned_size,
-			       maps[i].pa_num, i, err);
+			pr_err_ratelimited("PA list addr 0x%llx size 0x%llx num %u iov %u err %d\n",
+					   maps[i].aligned_addr, maps[i].aligned_size,
+					   maps[i].pa_num, i, err);
 			goto free_pa_iov;
 		}
 		pinned_pa->pinned_map_nr++;
@@ -733,8 +733,9 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov, unsigned int iov_
 			new_pa_iov[new_pa_iov_idx].addr = maps[i].pa_list[j] + offset;
 			new_pa_iov[new_pa_iov_idx].len = len;
 			if ((new_pa_iov[new_pa_iov_idx].addr | len) & (SECTOR_SIZE - 1)) {
-				pr_err("unaligned PA IOV addr 0x%llx, len 0x%x, iov %u\n",
-				       new_pa_iov[new_pa_iov_idx].addr, len, i);
+				pr_err_ratelimited(
+					"unaligned PA IOV addr 0x%llx, len 0x%x, iov %u\n",
+					new_pa_iov[new_pa_iov_idx].addr, len, i);
 				err = -EINVAL;
 				break;
 			}
@@ -746,8 +747,8 @@ static int get_pa_iov(int host_pid, const struct p2p_iov *iov, unsigned int iov_
 		if (err)
 			goto free_pa_iov;
 		if (remaining) {
-			pr_err("PA list leaves 0x%x bytes for iov %u\n",
-			       remaining, i);
+			pr_err_ratelimited("PA list leaves 0x%x bytes for iov %u\n",
+					   remaining, i);
 			err = -EINVAL;
 			goto free_pa_iov;
 		}
@@ -1162,8 +1163,8 @@ static int do_io(struct p2p_io_context *io_ctx, struct block_device *bdev, unsig
 
 	req = p2p_alloc_nvme_request(queue, &cmd);
 	if (IS_ERR(req)) {
-		pr_err("%s failed to allocate request: %ld\n", p2p_io_op_name(io_ctx->op),
-		       PTR_ERR(req));
+		pr_err_ratelimited("%s failed to allocate request: %ld\n",
+				   p2p_io_op_name(io_ctx->op), PTR_ERR(req));
 		return PTR_ERR(req);
 	}
 
@@ -1214,9 +1215,9 @@ static int do_ios(struct p2p_io_context *io_ctx, struct topo *topo, struct fiema
 			to_submit = min3(topo_limit, p2p_queue_max_sectors(to_bdev),
 					 p2p_iov_iter_single_seg_sectors(&iter));
 			if (!to_submit) {
-				pr_err("zero %s ext %u sectors 0x%x iov bytes 0x%llx\n",
-				       p2p_io_op_name(io_ctx->op), i, left,
-				       p2p_iov_iter_count(&iter));
+				pr_err_ratelimited("zero %s ext %u sectors 0x%x iov bytes 0x%llx\n",
+						   p2p_io_op_name(io_ctx->op), i, left,
+						   p2p_iov_iter_count(&iter));
 				err = -EINVAL;
 				goto out;
 			}
@@ -1231,8 +1232,8 @@ static int do_ios(struct p2p_io_context *io_ctx, struct topo *topo, struct fiema
 		}
 	}
 	if (p2p_iov_iter_count(&iter)) {
-		pr_err("%s extents leave 0x%llx IOV bytes unprocessed\n",
-		       p2p_io_op_name(io_ctx->op), p2p_iov_iter_count(&iter));
+		pr_err_ratelimited("%s extents leave 0x%llx IOV bytes unprocessed\n",
+				   p2p_io_op_name(io_ctx->op), p2p_iov_iter_count(&iter));
 		err = -EINVAL;
 	}
 
@@ -1259,8 +1260,8 @@ static void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
 
 		addr = ioremap(iov->addr, iov->len);
 		if (!addr) {
-			pr_err("crc32 failed file=%pD length=0x%llx err=%d\n",
-			       io_ctx->file, io_ctx->data_size, -ENOMEM);
+			pr_err_ratelimited("crc32 failed file=%pD length=0x%llx err=%d\n",
+					   io_ctx->file, io_ctx->data_size, -ENOMEM);
 			return;
 		}
 
@@ -1270,8 +1271,8 @@ static void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
 	}
 
 	crc ^= ~0U;
-	pr_info("crc32 file=%pD length=0x%llx crc32=0x%08x\n",
-		io_ctx->file, io_ctx->data_size, crc);
+	pr_info_ratelimited("crc32 file=%pD length=0x%llx crc32=0x%08x\n",
+			    io_ctx->file, io_ctx->data_size, crc);
 }
 #else
 static inline void dump_io_ctx_crc32(const struct p2p_io_context *io_ctx)
@@ -1330,8 +1331,8 @@ static void p2p_io_ctx_put(struct p2p_io_context *io_ctx)
 
 	/* Log once per io_ctx when NVMe completion carried a blk error. */
 	if (io_ctx->io_err && !io_ctx->issue_err)
-		pr_err("I/O error status %d errno %d\n", io_ctx->io_err,
-		       blk_status_to_errno(io_ctx->io_err));
+		pr_err_ratelimited("I/O error status %d errno %d\n", io_ctx->io_err,
+				   blk_status_to_errno(io_ctx->io_err));
 
 	p2p_publish_io_done(io_ctx);
 }
